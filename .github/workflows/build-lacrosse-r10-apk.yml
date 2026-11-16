@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'tools/integrate_and_build_r10.py'
+      - 'tools/integrate_and_build_r9.py'
       - 'tools/integrate_and_build_r8.py'
       - 'tools/integrate_and_build_r7.py'
       - 'src/**'
@@ -17,7 +18,7 @@ permissions:
 
 jobs:
   adversarial-review:
-    name: One-tap and safe fallback review
+    name: Source FPS negotiation and receiver-cap review
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -28,7 +29,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           s = Path('tools/integrate_and_build_r10.py').read_text()
-          assert 'r8.integrate_r8 = with_r10' in s
+          assert 'r9.quick_connect = with_r10' in s
           assert 'stateMachine.requestVideoInit(width, height, requestedVideoFps)' in s
           assert 'CarLifeProtocol.videoInitPayload(width, height, fps)' in s
           assert 'SourceFpsPolicy.effective(' in s
