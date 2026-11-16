@@ -15,6 +15,7 @@ UPSTREAM = Path("upstream")
 SENDER = Path("app/src/main/java/com/mcarplay/app/video/VideoSender.kt")
 METER = Path("app/src/main/java/com/mcarplay/app/video/VideoFrameCadenceMeter.kt")
 TEST = Path("app/src/test/java/com/mcarplay/app/video/R5ForwardCadenceTest.kt")
+TEST_R6 = Path("app/src/test/java/com/mcarplay/app/video/R6ForwardCadenceTest.kt")
 APK = Path("app/build/outputs/apk/standard/debug/app-standard-debug.apk")
 
 
@@ -47,7 +48,7 @@ def integrate(src):
             "        val s = r5Cadence.snapshot()\n"
             "        return \"outFps=${s.forwardedFps} p95GapMs=${s.p95IntervalMs} \" +\n"
             "            \"longGaps=${s.longGaps} idleMs=${s.idleMs} \" +\n"
-            "            \"ptsRegressions=${s.nonMonotonicPts} stalled=${s.stalled}\"\n"
+            "            \"ptsRegressions=${s.nonMonotonicPts} ptsRepeats=${s.repeatedPts} stalled=${s.stalled}\"\n"
             "    }\n"
             "\n"
             "    private fun maybeReportR5Stall() {\n"
@@ -143,7 +144,7 @@ def main():
     if not src.is_file():
         raise Blocked("expected upstream VideoSender missing")
     modified = integrate(src.read_text(encoding="utf-8"))
-    if (base / METER).exists() or (base / TEST).exists():
+    if (base / METER).exists() or (base / TEST).exists() or (base / TEST_R6).exists():
         raise Blocked("upstream has conflicting cadence files")
     sdk = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
     if not sdk or not (Path(sdk) / "platforms/android-35/android.jar").is_file():
@@ -151,10 +152,13 @@ def main():
     if not shutil.which("java"):
         raise Blocked("Java runtime missing")
     src.write_text(modified, encoding="utf-8")
-    for relative, name in [(METER, "VideoFrameCadenceMeter.kt"), (TEST, "R5ForwardCadenceTest.kt")]:
+    for relative, name in [(METER, "VideoFrameCadenceMeter.kt"), (TEST, "R5ForwardCadenceTest.kt"),
+                           (TEST_R6, "R6ForwardCadenceTest.kt")]:
         destination = base / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(kit / "src" / name, destination)
+
+    subprocess.run([sys.executable, str(kit / "tools" / "apply_r6_ui.py"), str(base)], check=True)
 
     cmd = ["bash", "./gradlew", "--no-daemon", "spotlessApply", "spotlessCheck",
            ":app:testStandardDebugUnitTest", ":app:lintStandardDebug", ":app:assembleStandardDebug"]
@@ -170,7 +174,7 @@ def main():
         if file.testzip() is not None:
             raise Blocked("APK checksum/ZIP failed")
     out.mkdir(parents=True, exist_ok=True)
-    target = out / "mcarplay-LaCrosse-R5-sender-cadence-debug.apk"
+    target = out / "mcarplay-LaCrosse-R6-ios-cadence-debug.apk"
     if target.exists():
         raise Blocked("APK destination already exists")
     shutil.copy2(apk, target)
@@ -178,7 +182,7 @@ def main():
     (out / "SHA256SUMS.txt").write_text(checksum + "  " + target.name + "\n")
     (out / "SCOPE.txt").write_text(
         "DEBUG APK. Pinned upstream at " + PINNED +
-        ". R5 sender cadence instrumentation only. NOT vehicle-tested; NOT certified 60 FPS.\n"
+        ". R6 cadence accuracy + iOS-style home screen polish only. Not all R3 features; NOT vehicle-tested; NOT certified 60 FPS.\n"
     )
     print("APK CREATED:", target, "SHA256:", checksum, flush=True)
 

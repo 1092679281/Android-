@@ -1,8 +1,8 @@
-name: LaCrosse R5 guarded APK
+name: LaCrosse R6 iOS + cadence APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, r6-ios-stability-hardening]
   workflow_dispatch:
 
 permissions:
@@ -43,6 +43,8 @@ jobs:
           test -f "$SDK_ROOT/platforms/android-35/android.jar"
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+      - name: Unit-test R6 UI patch functions
+        run: python3 -m unittest discover -s kit/tools -p 'test_r6_*.py' -v
       - name: Integrate and build guarded debug APK
         env:
           R5_UPSTREAM: ${{ github.workspace }}/upstream
@@ -51,7 +53,7 @@ jobs:
       - name: Upload verified APK
         uses: actions/upload-artifact@v4
         with:
-          name: LaCrosse-R5-debug-apk
+          name: LaCrosse-R6-debug-apk
           path: ${{ runner.temp }}/r5-apk/
           if-no-files-found: error
           retention-days: 14

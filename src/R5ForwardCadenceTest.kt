@@ -35,7 +35,8 @@ class R5ForwardCadenceTest {
         meter.recordForwardedFrame(300, 1_033_334_000L)
         val stats = meter.snapshot(1_033_334_000L)
         assertEquals(1, stats.nonMonotonicClock)
-        assertEquals(1, stats.nonMonotonicPts)
+        // The PTS from a rolled-back clock sample is not a valid data point.
+        assertEquals(0, stats.nonMonotonicPts)
         assertEquals(2, stats.samples)
         meter.reset()
         assertEquals(0, meter.snapshot(1_033_334_000L).samples)
