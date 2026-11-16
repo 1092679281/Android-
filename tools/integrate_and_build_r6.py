@@ -150,11 +150,8 @@ def apply_ui(base: Path):
     if src.count(anchor) != 1:
         raise Blocked("settings back button changed")
     settings.write_text(src.replace(anchor, 'android:layout_width="48dp"\n            android:layout_height="48dp"'), encoding="utf-8")
-    src = main.read_text(encoding="utf-8")
-    anchor = 'android:textSize="11.5sp"\n                    android:text="@string/main_device_detecting"'
-    if src.count(anchor) != 1:
-        raise Blocked("main header changed")
-    main.write_text(src.replace(anchor, 'android:textSize="12sp"\n                    android:text="@string/main_device_detecting"'), encoding="utf-8")
+    if not main.is_file():
+        raise Blocked("main layout missing")
     print("R6 UI: improved", len(names), "segmented tap targets", flush=True)
 
 
