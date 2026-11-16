@@ -18,6 +18,13 @@ class TouchMappingR8Test {
         assertNull(mapCarLifeTouch(0, 0, 0, 720, 1280, 480))
     }
 
+    @Test fun outOfBoundsReleaseStillClosesGesture() {
+        assertEquals(
+            0 to 479,
+            mapCarLifeTouch(-30, 900, 1920, 720, 1280, 480, allowOutside = true),
+        )
+    }
+
     @Test fun supportsLargeCoordinatesWithoutMultiplicationOverflow() {
         assertEquals(9999 to 9999, mapCarLifeTouch(99999, 99999, 100000, 100000, 10000, 10000))
     }
