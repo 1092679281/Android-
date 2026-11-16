@@ -132,7 +132,7 @@ def improve_touch(base: Path, kit: Path) -> None:
     data = checked(
         data,
         "    targetHeight: Int,\n): Pair<Int, Int>? {",
-        "    targetHeight: Int,\n    allowOutside: Boolean = false,\n): Pair<Int, Int>? {",
+        "    targetHeight: Int,\n    allowOutside: Boolean = true,\n): Pair<Int, Int>? {",
         "release input parameter",
     )
     data = checked(
