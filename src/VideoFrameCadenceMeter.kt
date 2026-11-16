@@ -7,8 +7,14 @@ import kotlin.math.ceil
  * Measures successfully forwarded video frames only.
  * NOT actual head-unit display / VSYNC fps.
  */
-class VideoFrameCadenceMeter(private val windowSize: Int = 300) {
-    init { require(windowSize in 2..3600) }
+class VideoFrameCadenceMeter(
+    private val windowSize: Int = 300,
+    private val nominalFps: Int = 30,
+) {
+    init {
+        require(windowSize in 2..3600)
+        require(nominalFps in 1..120)
+    }
 
     data class Snapshot(
         val samples: Int,
@@ -30,7 +36,7 @@ class VideoFrameCadenceMeter(private val windowSize: Int = 300) {
     @Synchronized
     fun recordForwardedFrame(ptsUs: Long, clockNs: Long) {
         val previousPts = lastPtsUs
-        if (previousPts != null && ptsUs <= previousPts) nonMonotonicPts++
+        if (previousPts != null && ptsUs < previousPts) nonMonotonicPts++
         lastPtsUs = ptsUs
         val previousClock = lastClockNs
         if (previousClock != null && clockNs <= previousClock) {
@@ -59,7 +65,7 @@ class VideoFrameCadenceMeter(private val windowSize: Int = 300) {
             intervalsMs.size,
             if (stalled) 0.0 else fps,
             sorted[p95Index],
-            intervalsMs.count { it > 25.0 },
+            intervalsMs.count { it > 1_500.0 / nominalFps },
             nonMonotonicPts,
             nonMonotonicClock,
             idleMs,
