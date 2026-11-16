@@ -12,10 +12,14 @@ class TouchMappingR8Test {
     }
 
     @Test fun rejectsOutOfViewportTouchesInsteadOfGhostEdgeClicks() {
-        assertNull(mapCarLifeTouch(-1, 10, 1920, 720, 1280, 480))
-        assertNull(mapCarLifeTouch(1920, 0, 1920, 720, 1280, 480))
-        assertNull(mapCarLifeTouch(0, 720, 1920, 720, 1280, 480))
+        assertNull(mapCarLifeTouch(-1, 10, 1920, 720, 1280, 480, allowOutside = false))
+        assertNull(mapCarLifeTouch(1920, 0, 1920, 720, 1280, 480, allowOutside = false))
+        assertNull(mapCarLifeTouch(0, 720, 1920, 720, 1280, 480, allowOutside = false))
         assertNull(mapCarLifeTouch(0, 0, 0, 720, 1280, 480))
+    }
+
+    @Test fun legacyMapperStillClampsForUnmodifiedCallers() {
+        assertEquals(1279 to 479, mapCarLifeTouch(9999, 9999, 1920, 720, 1280, 480))
     }
 
     @Test fun outOfBoundsReleaseStillClosesGesture() {
