@@ -1,0 +1,49 @@
+name: LaCrosse R5 guarded APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout build sources
+        uses: actions/checkout@v4
+        with:
+          path: kit
+      - name: Checkout exact mcarplay upstream
+        uses: actions/checkout@v4
+        with:
+          repository: wangxso/mcarplay
+          ref: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
+          path: upstream
+          persist-credentials: false
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install SDK 35
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Integrate and build guarded debug APK
+        env:
+          R5_UPSTREAM: ${{ github.workspace }}/upstream
+          R5_OUTPUT: ${{ runner.temp }}/r5-apk
+        run: python3 kit/tools/integrate_and_build.py
+      - name: Upload verified APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LaCrosse-R5-debug-apk
+          path: ${{ runner.temp }}/r5-apk/
+          if-no-files-found: error
+          retention-days: 14
