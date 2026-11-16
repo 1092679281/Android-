@@ -160,7 +160,7 @@ def improve_touch(base: Path, kit: Path) -> None:
 
 def verify_same_ids(before: str, after: str, label: str) -> None:
     import re
-    pattern = r'android:id="@\\+id/([A-Za-z0-9_]+)"'
+    pattern = r'android:id="@\+id/([A-Za-z0-9_]+)"'
     ids_before = re.findall(pattern, before)
     ids_after = re.findall(pattern, after)
     if sorted(ids_before) != sorted(ids_after):
