@@ -1,0 +1,86 @@
+name: Cleanup duplicate obsolete CarPlay build artifacts
+
+on:
+  push:
+    branches:
+      - feature/r18-buick-bluetooth-identity-snapshot
+    paths:
+      - .github/workflows/cleanup-duplicate-artifacts.yml
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  prune_duplicate_debug_apks:
+    if: github.repository == '1092679281/Android-'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Keep latest build of every version, delete ONLY duplicate Debug APK artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 }
+            );
+
+            const groups = new Map();
+            const pattern = /^LaCrosse-R[0-9]+-.*-debug$/;
+            for (const artifact of artifacts) {
+              if (artifact.expired || !pattern.test(artifact.name)) continue;
+              if (!groups.has(artifact.name)) groups.set(artifact.name, []);
+              groups.get(artifact.name).push(artifact);
+            }
+
+            // Preserve precisely these verified rollback/build artifacts even
+            // if name ordering changes unexpectedly.
+            const protectedIds = new Set([
+              14309870469, // R18: currently newest tested version
+              14306858909, // R16: last known stable rollback
+              14305367923, // R14: earlier stable rollback
+            ]);
+
+            const deletable = [];
+            for (const [name, group] of groups.entries()) {
+              group.sort((a, b) => {
+                const time = String(b.created_at).localeCompare(String(a.created_at));
+                return time !== 0 ? time : b.id - a.id;
+              });
+              // Always keep one newest artifact PER exact name/version.
+              for (const artifact of group.slice(1)) {
+                if (!protectedIds.has(artifact.id)) deletable.push(artifact);
+              }
+              core.info('Preserving newest ' + name + ' #' + group[0].id);
+            }
+
+            if (deletable.length > 80) {
+              throw new Error('Fail closed: more than 80 duplicate artifacts selected');
+            }
+
+            let deleted = 0;
+            let bytes = 0;
+            const details = [];
+            for (const artifact of deletable) {
+              await github.rest.actions.deleteArtifact({
+                owner, repo, artifact_id: artifact.id
+              });
+              deleted++;
+              bytes += artifact.size_in_bytes || 0;
+              const row = artifact.name + ' #' + artifact.id;
+              core.info('Deleted duplicate: ' + row);
+              details.push(row);
+            }
+
+            const savedMb = (bytes / 1048576).toFixed(2);
+            await core.summary
+              .addHeading('Safe cleanup: duplicate Debug APK artifacts')
+              .addRaw('Deleted: ' + deleted + '; reclaimed artifact storage: about ' + savedMb + ' MiB.')
+              .addBreak()
+              .addRaw('One latest artifact per name retained. R18, R16 and R14 protected. Source, branches, commits, PRs and logs unchanged.')
+              .addBreak()
+              .addRaw(details.length ? details.join('\n') : 'No duplicate artifacts to delete.')
+              .write();
