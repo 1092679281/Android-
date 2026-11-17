@@ -203,6 +203,57 @@ def patch(base: Path, kit: Path) -> None:
             '    <string name="ma_r12_wifi_observed_other">Connected Wi-Fi: %1$s (differs from car-provided SSID)</string>\n'
         )
         change(f"app/src/main/res/{lang}/strings_ma.xml","</resources>",content+"</resources>","strings "+lang)
+    # A peer MFi reply and a locally sent AA05 are different evidence.
+    # Preserve the legacy interoperability fallback, but do not report an
+    # authenticated peer when there was no AA03 response or the link died.
+    iap = "app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt"
+    change(iap,
+        "        runMfiChallenge(\n",
+        "        val peerMfiResponseObserved = runMfiChallenge(\n",
+        "capture MFi reply evidence")
+    change(iap,
+        "        log(\"iap2 tx=0xaa05 authentication-succeeded（自报）\")\n"
+        "        reached(ConnectionMilestone.IAP2_AUTHENTICATED)\n",
+        "        log(\"iap2 tx=0xaa05 authentication-succeeded（本地声明，不证明车机接受）\")\n"
+        "        if (peerMfiResponseObserved) {\n"
+        "            log(\"iap2 MFi: 收到车机 AA03 响应（签名仍未校验），继续确认端点与 AirPlay\")\n"
+        "            reached(ConnectionMilestone.IAP2_AUTHENTICATED)\n"
+        "        } else {\n"
+        "            log(\"iap2 MFi: 未收到 AA03，已发 AA05 仅为兼容路径；不得视为已通过车机认证\")\n"
+        "        }\n",
+        "do not mark unanswered MFi as authenticated")
+    change(iap,
+        "        pinnedLength: Int? = null,\n"
+        "    ) {\n"
+        "        val baselineLengths =\n",
+        "        pinnedLength: Int? = null,\n"
+        "    ): Boolean {\n"
+        "        val baselineLengths =\n",
+        "return observed MFi reply status")
+    change(iap,
+        "                        receiverKey?.let { MfiLengthMemory.recordHardRejected(context, it, size) }\n"
+        "                        return\n",
+        "                        receiverKey?.let { MfiLengthMemory.recordHardRejected(context, it, size) }\n"
+        "                        return false\n",
+        "MFi peer disconnected is not success")
+    change(iap,
+        "                if (position == 0) receiverKey?.let { MfiLengthMemory.recordSuccess(context, it, size) }\n"
+        "                return\n",
+        "                if (position == 0) receiverKey?.let { MfiLengthMemory.recordSuccess(context, it, size) }\n"
+        "                return true\n",
+        "AA03 is observable response")
+    change(iap,
+        "                log(\"iap2 MFi 挑战全部无应答——跳过校验直接发 0xaa05（由 0x5702 判定车机是否放行）\")\n"
+        "            }\n"
+        "        }\n"
+        "    }\n",
+        "                log(\"iap2 MFi 挑战全部无应答——跳过校验直接发 0xaa05（由后续端点判定车机是否放行）\")\n"
+        "            }\n"
+        "        }\n"
+        "        return false\n"
+        "    }\n",
+        "MFi retries exhausted is not authenticated")
+
     print("R12 safe single-WiFi detection + passive auto-sync UI + optional identity read",flush=True)
 
 def main() -> None:
