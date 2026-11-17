@@ -1,0 +1,86 @@
+name: LaCrosse R12 safe auto Wi-Fi sync guarded APK
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/integrate_and_build_r12.py'
+      - 'tools/integrate_and_build_r10.py'
+      - 'tools/integrate_and_build_r9.py'
+      - 'tools/integrate_and_build_r8.py'
+      - 'tools/integrate_and_build_r7.py'
+      - 'src/**'
+      - '.github/workflows/build-lacrosse-r12-apk.yml'
+      - 'README-R12.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adversarial-review:
+    name: Car Wi-Fi isolation and protocol regression review
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit R12 integration and tests
+        run: |
+          python3 -m py_compile tools/integrate_and_build_r7.py tools/integrate_and_build_r8.py tools/integrate_and_build_r9.py tools/integrate_and_build_r10.py tools/integrate_and_build_r12.py
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('tools/integrate_and_build_r12.py').read_text()
+          assert 'r10.improve_fps=with_r12' in s
+          assert 'connectivityManager.allNetworks.toList()' in s
+          assert 'WifiCarPlayConnector.kt' in s
+          assert 'optionalWifiPermission.launch' in s
+          assert 'observedWifiSsid(): String? = liveWifiSsid()' in s
+          for name in ('R12WifiNetworkSelectionTest.kt', 'R12WifiHandoffIsolationTest.kt'):
+              assert Path('src', name).is_file()
+          assert 'WifiHandoffAction.WAIT' in Path('src/R12WifiHandoffIsolationTest.kt').read_text()
+          print('R12 static review passed')
+          PY
+
+  build:
+    name: JVM tests, Android lint, formatter, APK and checksum
+    needs: adversarial-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - uses: actions/checkout@v4
+        with:
+          repository: wangxso/mcarplay
+          ref: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK 35
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if [ ! -d "$SDK_ROOT/cmdline-tools" ]; then SDK_ROOT=/usr/local/lib/android/sdk; fi
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install 'platforms;android-35' 'build-tools;35.0.0'
+          test -f "$SDK_ROOT/platforms/android-35/android.jar"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Integrate R5-R12; verify unit regression, lint and build
+        env:
+          R7_UPSTREAM: ${{ github.workspace }}/upstream
+          R12_OUTPUT: ${{ runner.temp }}/r12-apk
+        run: python3 kit/tools/integrate_and_build_r12.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LaCrosse-R12-safe-auto-wifi-sync-debug
+          path: ${{ runner.temp }}/r12-apk/
+          if-no-files-found: error
+          retention-days: 14
