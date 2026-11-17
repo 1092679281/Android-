@@ -9,6 +9,8 @@ def patch(base: Path, kit: Path) -> None:
     for name, dst in (
         ("R12WifiNetworkSelectionTest.kt", "app/src/test/java/com/mcarplay/app/net/R12WifiNetworkSelectionTest.kt"),
         ("R12WifiHandoffIsolationTest.kt", "app/src/test/java/com/mcarplay/app/iap2/R12WifiHandoffIsolationTest.kt"),
+        ("PendingWifiCandidatePolicy.kt", "app/src/main/java/com/mcarplay/app/net/PendingWifiCandidatePolicy.kt"),
+        ("PendingWifiCandidatePolicyTest.kt", "app/src/test/java/com/mcarplay/app/net/PendingWifiCandidatePolicyTest.kt"),
     ):
         copy(kit, base, name, dst)
 
@@ -49,11 +51,26 @@ def patch(base: Path, kit: Path) -> None:
 
     controller="app/src/main/java/com/mcarplay/app/SessionController.kt"
     change(controller,
+        "import com.mcarplay.app.net.EndpointHosts\\n",
+        "import com.mcarplay.app.net.EndpointHosts\\nimport com.mcarplay.app.net.PendingWifiCandidatePolicy\\n",
+        "candidate prompt import")
+    change(controller,
         "    private fun liveWifiSsid(): String? =\n",
         "    /** Read-only current WLAN name for UI; never grants pairing or network ownership. */\n"
         "    fun observedWifiSsid(): String? = liveWifiSsid()\n\n"
         "    private fun liveWifiSsid(): String? =\n",
         "expose passive UI observation")
+    change(controller,
+        "                if (ssid.isNullOrEmpty() && !hasRecentUnverifiedInvite()) continue\\n",
+        "                // Unknown SSID is allowed to PROMPT (never auto-bind) only when\\n"
+        "                // the user selected one car and there is exactly one Wi-Fi Network.\\n"
+        "                if (!PendingWifiCandidatePolicy.mayPrompt(\\n"
+        "                        readableSsid = !ssid.isNullOrEmpty(),\\n"
+        "                        freshInvite = hasRecentUnverifiedInvite(),\\n"
+        "                        selectedTarget = appContext?.let(TargetDevicePrefs::get) != null,\\n"
+        "                        uniqueWifi = wifiConnector?.singleWifiNetwork() == network,\\n"
+        "                    )) continue\\n",
+        "unknown WLAN must require explicit consent")
 
     main="app/src/main/java/com/mcarplay/app/MainActivity.kt"
     change(main,"    private lateinit var ssidInput: EditText\n",
