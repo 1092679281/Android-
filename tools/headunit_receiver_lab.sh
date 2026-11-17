@@ -34,13 +34,17 @@ ffprobe -v error -f h264 -count_frames \
  "$REPORT/synthetic60.h264" > "$REPORT/video-source.txt"
 
 echo "[HEADUNIT] H264 software decode / letterbox / displayed screenshot"
-timeout 70s xvfb-run -a -s "-screen 0 1920x1080x24" \
+R11_RGB_DUMP="$REPORT/decoded-before-sdl.ppm" timeout 70s xvfb-run -a -s "-screen 0 1920x1080x24" \
  ./build/video_probe --h264 "$REPORT/synthetic60.h264" --fps 60 \
  --frames 180 --window 1920x720 --dump "$REPORT/car-screen.ppm" \
  > "$REPORT/video-probe.txt" 2>&1
 grep -q 'decoded first frame' "$REPORT/video-probe.txt"
 grep -q 'decoder OK' "$REPORT/video-probe.txt"
 test -s "$REPORT/car-screen.ppm"
+echo "[HEADUNIT] Validate decoder RGB bytes before SDL texture and collect comparison screenshot"
+test -s "$REPORT/decoded-before-sdl.ppm"
+python3 "$GITHUB_WORKSPACE/kit/tools/r11_validate_car_screen.py" "$REPORT/decoded-before-sdl.ppm" "$REPORT/decoded-rgb-report.json"
+ffmpeg -hide_banner -loglevel error -y -i "$REPORT/decoded-before-sdl.ppm" "$REPORT/decoded-before-sdl.png"
 echo "[HEADUNIT] Enforce pixel-validity gate: no green/flat screenshot allowed"
 python3 "$GITHUB_WORKSPACE/kit/tools/r11_validate_car_screen.py" "$REPORT/car-screen.ppm" "$REPORT/car-screen-color-report.json"
 ffmpeg -hide_banner -loglevel error -y -i "$REPORT/car-screen.ppm" "$REPORT/car-screen.png"
