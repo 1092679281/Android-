@@ -1,0 +1,62 @@
+name: R11 CarPlay HEAD UNIT receiver simulation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/headunit_receiver_lab.sh'
+      - 'tools/r11_patch_allplay_snapshot.py'
+      - 'tools/r11_validate_car_screen.py'
+      - 'tools/r11_patch_allplay_rgb.py'
+      - '.github/workflows/r11-headunit-receiver.yml'
+      - 'README-R11-HEADUNIT.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  virtual-headunit:
+    name: CarPlay receiver — 1920x720 H264 at 60fps + RTSP + touch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - name: Checkout pinned real CarPlay receiver implementation
+        uses: actions/checkout@v4
+        with:
+          repository: UnmetDecade/AllPlay
+          ref: 9086b0d52c22e3cde3ff8e80872d9fba4590fb71
+          path: allplay
+          persist-credentials: false
+      - name: Install Linux receiver, video decoder, virtual display dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libssl-dev libusb-1.0-0-dev \
+            libdbus-1-dev libbluetooth-dev bluez libavahi-client-dev \
+            libsdl2-dev libsdl2-ttf-dev libavcodec-dev libavformat-dev \
+            libswscale-dev libavutil-dev libx264-dev ffmpeg xvfb fonts-dejavu-core
+      - name: Fix upstream headless screenshot readback before SDL Present
+        run: python3 kit/tools/r11_patch_allplay_snapshot.py allplay/tools/video_probe.cpp
+      - name: Fix SDL software YUV green-screen renderer in temporary receiver checkout
+        run: python3 kit/tools/r11_patch_allplay_rgb.py allplay/host/media/sdl_video_sink.cpp
+      - name: Build AllPlay receiver and RTSP/video tests
+        run: |
+          cmake -S allplay -B allplay/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build allplay/build --parallel 4
+          test -x allplay/build/allplay_host
+          test -x allplay/build/video_probe
+          test -x allplay/build/fake_phone
+      - name: Synthetic 60fps head-unit decoding and mock CarPlay stream
+        run: bash kit/tools/headunit_receiver_lab.sh "$GITHUB_WORKSPACE/allplay" "$RUNNER_TEMP/headunit-report"
+      - name: Upload car-side screen, FPS counts, RTSP + touch logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: R11-Virtual-CarPlay-HeadUnit-Report
+          path: ${{ runner.temp }}/headunit-report/
+          if-no-files-found: warn
+          retention-days: 14
