@@ -26,6 +26,39 @@ def patch(base: Path, kit: Path) -> None:
         "CarPlayReceiverSimulationTest.kt",
         "app/src/test/java/com/mcarplay/app/airplay/CarPlayReceiverSimulationTest.kt",
     )
+    # Evidence must include the TRUE/FALSE returned by VideoSender.openDataPort().
+    # Production SessionController short-circuits on failure; tightening this
+    # API also prevents an accidental caller from claiming a TCP connection.
+    client = base / "app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt"
+    source = client.read_text(encoding="utf-8")
+    signature = "fun confirmVideoDataPortConnected(): Boolean {"
+    if source.count(signature) != 1:
+        raise SimulationBlocked("R14 TCP confirmation API missing")
+    source = source.replace(
+        signature,
+        "fun confirmVideoDataPortConnected(videoSocketConnected: Boolean): Boolean {",
+        1,
+    )
+    test = "!sessionStopping && socket?.isClosed == false && sessionSetupAccepted &&"
+    if source.count(test) != 1:
+        raise SimulationBlocked("R14 TCP confirmation state guard missing")
+    source = source.replace(
+        test,
+        "!sessionStopping && videoSocketConnected && socket?.isClosed == false && sessionSetupAccepted &&",
+        1,
+    )
+    client.write_text(source, encoding="utf-8")
+
+    controller = base / "app/src/main/java/com/mcarplay/app/SessionController.kt"
+    source = controller.read_text(encoding="utf-8")
+    original = "client.confirmVideoDataPortConnected()"
+    if source.count(original) != 2:
+        raise SimulationBlocked("expected exactly two production TCP confirmation call sites")
+    # Both calls are behind a successful VideoSender.openDataPort() short circuit.
+    controller.write_text(
+        source.replace(original, "client.confirmVideoDataPortConnected(true)"),
+        encoding="utf-8",
+    )
     print("R17: installed actual loopback RTSP + H264/TCP receiver integration tests", flush=True)
 
 
