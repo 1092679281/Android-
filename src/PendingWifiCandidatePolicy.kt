@@ -7,5 +7,11 @@ internal object PendingWifiCandidatePolicy {
         freshInvite: Boolean,
         selectedTarget: Boolean,
         uniqueWifi: Boolean,
-    ): Boolean = readableSsid || freshInvite || (selectedTarget && uniqueWifi)
+    ): Boolean {
+        // An SSID is only a name, not proof that this is the selected car.
+        // A trusted receiver invite may ask for consent independently.
+        // Without such an invite, require both a selected target and one Wi-Fi.
+        if (freshInvite) return true
+        return selectedTarget && uniqueWifi
+    }
 }
