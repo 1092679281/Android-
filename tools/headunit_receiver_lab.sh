@@ -11,6 +11,10 @@ export ALLPLAY_STATE_DIR="$REPORT/state"
 mkdir -p "$ALLPLAY_STATE_DIR"
 
 echo "[HEADUNIT] pinned AllPlay receiver: $(git rev-parse HEAD)"
+echo "[HEADUNIT] Generate ephemeral SELF-SIGNED identity for mock tests only (never OEM/MFi)"
+bash scripts/make-test-identity.sh "$ALLPLAY/identity" > "$REPORT/identity-generation.txt" 2>&1
+test -s "$ALLPLAY/identity/identity.pk8"
+test -s "$ALLPLAY/identity/certificate.p7b"
 echo "[HEADUNIT] Cryptography + iAP2 protocol tests"
 ./build/iap2_test > "$REPORT/iap2.txt" 2>&1
 ./build/m3_test > "$REPORT/m3.txt" 2>&1
