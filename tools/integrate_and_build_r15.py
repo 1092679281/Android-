@@ -77,8 +77,8 @@ def patch(base: Path, kit: Path) -> None:
             "请停车并断开车机后操作。仅从 CarPlay-Updates 公开发行页下载正式签名的 APK；校验 SHA-256、包名、版本和签名后调用 Android 系统安装界面。不会自动卸载或清除数据。",
         ),
         "values-en/strings.xml": (
-            "Only download from this repository's GitHub Releases",
-            "Only download from the CarPlay-Updates public GitHub Releases",
+            "Updates are downloaded only from this repository\\'s GitHub Releases",
+            "Updates are downloaded only from the public CarPlay-Updates GitHub Releases",
         ),
     }
     for path, (old, new) in strings.items():
