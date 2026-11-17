@@ -20,12 +20,13 @@ def patch(base: Path, kit: Path) -> None:
          "app/src/main/java/com/mcarplay/app/util/BluetoothIdentitySessionPolicy.kt")
     copy(kit, base, "BluetoothIdentitySessionPolicyTest.kt",
          "app/src/test/java/com/mcarplay/app/util/BluetoothIdentitySessionPolicyTest.kt")
-    subprocess.run(
-        ["git", "apply", "--whitespace=error", str(kit / "tools" / "r18-connection-identity.patch")],
-        cwd=base,
-        check=True,
-    )
-    print("R18: iAP2, ctrl and AirPlay share one Bluetooth identity per connection", flush=True)
+    for name in ("r18-connection-identity.patch", "r18-identity-preflight.patch"):
+        subprocess.run(
+            ["git", "apply", "--whitespace=error", str(kit / "tools" / name)],
+            cwd=base,
+            check=True,
+        )
+    print("R18: gate vehicle startup on a shared Bluetooth identity", flush=True)
 
 
 def main() -> None:
@@ -54,7 +55,8 @@ def main() -> None:
     (output / "SHA256SUMS.txt").write_text(f"{digest}  {target.name}\n", encoding="utf-8")
     (output / "SCOPE.txt").write_text(
         "R18 resolves the Bluetooth MAC before transport startup and uses one snapshot for "
-        "iAP2, ctrl TXT and AirPlay SETUP. Buick E2LB session acceptance requires vehicle testing. "
+        "iAP2, ctrl TXT and AirPlay SETUP. Vehicle startup requires a real Bluetooth address. "
+        "Buick E2LB session acceptance requires vehicle testing. "
         "Debug APK uses a debug signing certificate.\n",
         encoding="utf-8",
     )

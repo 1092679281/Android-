@@ -6,6 +6,12 @@ package com.mcarplay.app.util
  * the already-sent 0x4300 or 0x4e0e.
  */
 internal object BluetoothIdentitySessionPolicy {
+    fun canStart(
+        mac: String,
+        automatic: Boolean,
+        allowPlaceholder: Boolean,
+    ): Boolean = !sessionUsedPlaceholder(mac) || (!automatic && allowPlaceholder)
+
     fun requiresReconnect(sessionMac: String?, savedMac: String): Boolean =
         sessionMac != null && !sessionMac.equals(savedMac, ignoreCase = true)
 

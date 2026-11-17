@@ -1,0 +1,336 @@
+diff --git a/app/src/main/java/com/mcarplay/app/MainActivity.kt b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+index cbec49aa77a34ab0e9ddd23f8c725f2ead261434..8bfd06fee15a212f462947fdbc8b64fc1941ea3a 100644
+--- a/app/src/main/java/com/mcarplay/app/MainActivity.kt
++++ b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+@@ -643,7 +643,7 @@ class MainActivity : AppCompatActivity() {
+     private fun startConnectionNow() {
+         runOnUiThread {
+             if (btIdentityPrecheckInFlight) return@runOnUiThread
+-            if (!needsBtAddressPrompt()) {
++            if (DeviceIdentity.peek(this).source != DeviceIdentity.Source.NONE) {
+                 continueAfterBtIdentityCheck()
+                 return@runOnUiThread
+             }
+@@ -655,8 +655,8 @@ class MainActivity : AppCompatActivity() {
+                 runOnUiThread update@{
+                     btIdentityPrecheckInFlight = false
+                     if (isFinishing || isDestroyed) return@update
+-                    if (needsBtAddressPrompt()) {
+-                        log("IDENTITY: 未获取本机真实蓝牙地址（Shizuku 未就绪且未手动填写）——提示手动填写")
++                    if (DeviceIdentity.peek(this).source == DeviceIdentity.Source.NONE) {
++                        log("IDENTITY: 未获取本机真实蓝牙地址——提示一次性设置")
+                         showBtAddressGuidance()
+                     } else {
+                         continueAfterBtIdentityCheck()
+@@ -666,14 +666,6 @@ class MainActivity : AppCompatActivity() {
+         }
+     }
+ 
+-    /**
+-     * 不用 Shizuku 时读不到真实蓝牙地址：WinPlay 等接收端会拒绝占位地址（SETUP 403 / 不邀请）。
+-     * Shizuku 就绪时连接过程会实时读取，不需要提示；已手动填写或保存过也不提示。
+-     */
+-    private fun needsBtAddressPrompt(): Boolean =
+-        ShizukuGate.state(this) != ShizukuGate.State.READY &&
+-            DeviceIdentity.peek(this).source == DeviceIdentity.Source.NONE
+-
+     private fun showBtAddressGuidance() {
+         DarkMessageDialog.show(
+             activity = this,
+@@ -681,7 +673,6 @@ class MainActivity : AppCompatActivity() {
+             message = getString(R.string.ma_bt_address_body),
+             actions =
+                 listOf(
+-                    DarkMessageDialog.Action(getString(R.string.action_connect_anyway)) { continueAfterBtIdentityCheck() },
+                     DarkMessageDialog.Action(getString(R.string.ma_enter_manually), DarkMessageDialog.Emphasis.PRIMARY) {
+                         BtIdentityDialog.show(this) {
+                             updateReadyRow()
+@@ -692,17 +683,21 @@ class MainActivity : AppCompatActivity() {
+                             if (DeviceIdentity.peek(this).source != DeviceIdentity.Source.NONE) continueAfterBtIdentityCheck()
+                         }
+                     },
++                    DarkMessageDialog.Action(getString(R.string.ma_bt_test_placeholder)) {
++                        continueAfterBtIdentityCheck(allowPlaceholderIdentity = true)
++                    },
+                 ),
+         )
+     }
+ 
+-    private fun continueAfterBtIdentityCheck() {
++    private fun continueAfterBtIdentityCheck(allowPlaceholderIdentity: Boolean = false) {
+         runOnUiThread {
++            val next = { continueAfterBackgroundStartCheck(allowPlaceholderIdentity) }
+             if (CarLifeLauncher.isAvailable(this) && CarLifeLauncher.backgroundStartAllowed(this) == false) {
+                 log("CARLIFE: 未允许「后台弹出界面」，CarPlay 会话建立后可能无法打开 CarWith 入口")
+-                showBackgroundStartGuidance()
++                showBackgroundStartGuidance(next)
+             } else {
+-                continueAfterBackgroundStartCheck()
++                next()
+             }
+         }
+     }
+@@ -711,27 +706,28 @@ class MainActivity : AppCompatActivity() {
+     private var batteryPromptShown = false
+ 
+     /** 未豁免电池优化时锁屏会被系统冻结断网（见 [BatteryExemption]）：连接前提示一次，用户仍可继续。 */
+-    private fun continueAfterBackgroundStartCheck() {
++    private fun continueAfterBackgroundStartCheck(allowPlaceholderIdentity: Boolean) {
+         runOnUiThread {
++            val connect = { startConnectionUnchecked(allowPlaceholderIdentity) }
+             val exempt = BatteryExemption.isExempt(this)
+             if (BatteryExemption.shouldPrompt(exempt, batteryPromptShown)) {
+                 batteryPromptShown = true
+                 log("POWER: 未豁免电池优化——锁屏后系统可能冻结 mcarplay 并断网，提示用户设置")
+-                showBatteryExemptionGuidance()
++                showBatteryExemptionGuidance(connect)
+             } else {
+-                startConnectionUnchecked()
++                connect()
+             }
+         }
+     }
+ 
+-    private fun showBatteryExemptionGuidance() {
++    private fun showBatteryExemptionGuidance(connect: () -> Unit) {
+         DarkMessageDialog.show(
+             activity = this,
+             title = getString(R.string.ma_battery_title),
+             message = getString(R.string.ma_battery_body),
+             actions =
+                 listOf(
+-                    DarkMessageDialog.Action(getString(R.string.action_connect_anyway)) { startConnectionUnchecked() },
++                    DarkMessageDialog.Action(getString(R.string.action_connect_anyway), onClick = connect),
+                     DarkMessageDialog.Action(getString(R.string.action_go_grant), DarkMessageDialog.Emphasis.PRIMARY) {
+                         if (!BatteryExemption.openSettings(this)) {
+                             log("POWER: 无法打开电池优化设置，请到 设置 → 应用 → mcarplay → 省电策略 手动设为无限制")
+@@ -741,14 +737,14 @@ class MainActivity : AppCompatActivity() {
+         )
+     }
+ 
+-    private fun showBackgroundStartGuidance() {
++    private fun showBackgroundStartGuidance(next: () -> Unit) {
+         DarkMessageDialog.show(
+             activity = this,
+             title = getString(R.string.ma_background_title),
+             message = getString(R.string.ma_background_body),
+             actions =
+                 listOf(
+-                    DarkMessageDialog.Action(getString(R.string.action_connect_anyway)) { continueAfterBackgroundStartCheck() },
++                    DarkMessageDialog.Action(getString(R.string.action_connect_anyway), onClick = next),
+                     DarkMessageDialog.Action(getString(R.string.action_go_grant), DarkMessageDialog.Emphasis.PRIMARY) {
+                         if (!CarLifeLauncher.openBackgroundStartSettings(this)) {
+                             log("CARLIFE: 无法打开权限页，请到 设置 → 应用 → mcarplay → 权限 手动开启")
+@@ -759,7 +755,7 @@ class MainActivity : AppCompatActivity() {
+     }
+ 
+     /** 「启动连接」主体（权限检查留在这里；会话启动交给 [SessionController]，幂等不双开）。 */
+-    private fun startConnectionUnchecked() {
++    private fun startConnectionUnchecked(allowPlaceholderIdentity: Boolean) {
+         runOnUiThread {
+             if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) !=
+                 PackageManager.PERMISSION_GRANTED
+@@ -787,7 +783,7 @@ class MainActivity : AppCompatActivity() {
+                 snack(getString(R.string.ma_detection_not_started))
+                 return@runOnUiThread
+             }
+-            SessionController.startConnection(this)
++            SessionController.startConnection(this, allowPlaceholderIdentity = allowPlaceholderIdentity)
+             if (detectionTarget != null) showReceiverDetection()
+         }
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index 6f42909e5f192deb053f28c6cf227bf979ddf5d2..90470627f230a4f6d2dd8da20f239f7f25751781 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -1269,6 +1269,8 @@ object SessionController {
+         automatic: Boolean = false,
+         /** 自动启动时可带的 ACL 对端地址；未选定目标车机时用它隔离熔断。 */
+         automaticPeerAddress: String? = null,
++        allowPlaceholderIdentity: Boolean = false,
++        onMissingBluetoothIdentity: (() -> Unit)? = null,
+     ) {
+         if (automatic && AutoConnectPrefs.isManualStopCoolingDown(context)) {
+             appendLog("AUTO: 手动断开后的 30 秒冷却期——丢弃已排队的自动连接")
+@@ -1293,7 +1295,9 @@ object SessionController {
+                     return@run
+                 }
+                 synchronized(this) {
+-                    if (userStopGeneration == stopGeneration) startConnection(context, automatic, automaticPeerAddress)
++                    if (userStopGeneration == stopGeneration) {
++                        startConnection(context, automatic, automaticPeerAddress, allowPlaceholderIdentity, onMissingBluetoothIdentity)
++                    }
+                 }
+             }
+             return
+@@ -1321,9 +1325,6 @@ object SessionController {
+             } else {
+                 ConnectionDiagnostics.begin("user_start")
+             }
+-        if (ConnectionDiagnostics.timeline.snapshot()?.stage == ConnectionStage.PRECHECK) {
+-            ConnectionDiagnostics.timeline.stage(diagnosticAttempt, ConnectionStage.BLUETOOTH)
+-        }
+         if (!alreadyRunning) {
+             bluetoothDiagnostics.begin(diagnosticAttempt)
+             ReceiverDetectionRuntime.connectionStarted(diagnosticAttempt)
+@@ -1349,8 +1350,6 @@ object SessionController {
+             ShizukuGate.State.NOT_INSTALLED ->
+                 appendLog("SHIZUKU: 未安装（隐形屏模式需要）")
+         }
+-        CarPlayService
+-            .start(context)
+         // 能力发布先于连接（catplay 的做法：CarPlayCtrlServer 在会话一开始就常驻广播
+         // `_carplay-ctrl._tcp`，之后每 1s force_announce，收到车机邀请才建 AirPlay）。
+         // 我们此前要等 0x5703 才注册，导致「车机发现手机」这一步总落在热点绑定之后，
+@@ -1374,6 +1373,7 @@ object SessionController {
+             appendLog("SESSION: 会话已在运行——沿用当前会话，不清零邀请与要帧计数")
+         }
+         if (alreadyRunning) {
++            if (!automatic) CarPlayService.start(context)
+             bluetoothIdentityAtStart?.let { identity ->
+                 Bg.run("resume-transports") {
+                     synchronized(this) {
+@@ -1394,6 +1394,19 @@ object SessionController {
+                     if (bluetoothIdentityPreparation !== preparation) return@run
+                     // 每轮使用独立快照，即使底层缓存返回相同对象也能识别迟到的回调。
+                     val identity = DeviceIdentity.peek(app).copy()
++                    if (!BluetoothIdentitySessionPolicy.canStart(identity.mac, automatic, allowPlaceholderIdentity)) {
++                        val code = DiagnosticCode.BT_IDENTITY_REQUIRED
++                        phaseHint = t(R.string.dc_bt_identity_required)
++                        appendLog("IDENTITY: 未获得真实蓝牙地址，暂停连接（automatic=$automatic），请先填写一次本机地址或启动 Shizuku")
++                        ConnectionDiagnostics.timeline.finish(diagnosticAttempt, code, failed = true)
++                        ReceiverDetectionRuntime.stop(code.name)
++                        bluetoothDiagnostics.finish()
++                        uiHintSink?.invoke(t(R.string.dc_bt_identity_required))
++                        onMissingBluetoothIdentity?.invoke()
++                        return@run
++                    }
++                    if (!automatic) CarPlayService.start(app)
++                    ConnectionDiagnostics.timeline.stage(diagnosticAttempt, ConnectionStage.BLUETOOTH)
+                     bluetoothIdentityAtStart = identity
+                     appendLog(
+                         "IDENTITY: 本轮固定地址 source=${DeviceIdentity.sourceLabel(identity.source)} " +
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
+index ff461ebee6805c8dcd200b2006ef88e1349b8613..0f05dcf4c562b7f42fa02b1e4eacd62eda862420 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
+@@ -21,6 +21,7 @@ enum class DiagnosticCode(
+     val advice: String,
+ ) {
+     BT_PERMISSION("请允许附近设备/蓝牙权限后重试"),
++    BT_IDENTITY_REQUIRED("请在连接准备中填写一次本机蓝牙地址，或启动 Shizuku 读取"),
+     BT_DISABLED("请开启蓝牙，并确认已与接收端配对"),
+     BT_LINK_CLOSED("建立会话前蓝牙控制链路已结束，请检查接收端状态后重连"),
+     ENDPOINT_PENDING("蓝牙已连接，仍在等待接收端提供热点和地址信息"),
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt b/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
+index 2fcb62f241e46ed978344520a8c8528576871615..fb9ff988d2e3912bea5771c6e4b57885c0517f2d 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
+@@ -15,6 +15,7 @@ object DiagnosticText {
+         context.getString(
+             when (code) {
+                 DiagnosticCode.BT_PERMISSION -> R.string.dc_bt_permission
++                DiagnosticCode.BT_IDENTITY_REQUIRED -> R.string.dc_bt_identity_required
+                 DiagnosticCode.BT_DISABLED -> R.string.dc_bt_disabled
+                 DiagnosticCode.BT_LINK_CLOSED -> R.string.dc_bt_link_closed
+                 DiagnosticCode.ENDPOINT_PENDING -> R.string.dc_endpoint_pending
+diff --git a/app/src/main/java/com/mcarplay/app/service/CarPlayService.kt b/app/src/main/java/com/mcarplay/app/service/CarPlayService.kt
+index 767323579726f9f1802b4bccdce2740fc7664d56..9317cd11689dcd3d2552df91efd789e2fc7a8ed5 100644
+--- a/app/src/main/java/com/mcarplay/app/service/CarPlayService.kt
++++ b/app/src/main/java/com/mcarplay/app/service/CarPlayService.kt
+@@ -167,6 +167,9 @@ class CarPlayService : Service() {
+                     app,
+                     automatic = true,
+                     automaticPeerAddress = intent?.getStringExtra(EXTRA_PEER_ADDRESS)?.takeIf { it.isNotBlank() },
++                    onMissingBluetoothIdentity = {
++                        if (!CarLifeDiagnostics.isRunning() && mediaProjection == null) stopSelfResult(startId)
++                    },
+                 )
+             }
+         } else if (intent?.action == ACTION_START_DIAGNOSTIC) {
+diff --git a/app/src/main/res/values-en/strings_diag.xml b/app/src/main/res/values-en/strings_diag.xml
+index 15907fada68e2308b7c724ab0193fbfc613b7134..2fe3cde53b621ccd7c3b204abcd0e60d1ac65118 100644
+--- a/app/src/main/res/values-en/strings_diag.xml
++++ b/app/src/main/res/values-en/strings_diag.xml
+@@ -91,4 +91,5 @@
+     <string name="blocker_record">SETUP accepted; waiting for RECORD to activate the session</string>
+     <string name="blocker_carwith_frame">Session active; waiting for the first CarWith frame</string>
+     <string name="language_note">Logs and diagnostic reports stay in Chinese so developers can compare them.</string>
++    <string name="dc_bt_identity_required">Tap Connect and enter the phone Bluetooth address once, or read it with Shizuku</string>
+ </resources>
+diff --git a/app/src/main/res/values-en/strings_ma.xml b/app/src/main/res/values-en/strings_ma.xml
+index 790ec49e5f88aa6603a91f15bd3235ef62a2575b..f250275cdb86d043a400a673a11cc53273c5abc0 100644
+--- a/app/src/main/res/values-en/strings_ma.xml
++++ b/app/src/main/res/values-en/strings_ma.xml
+@@ -33,8 +33,8 @@
+     <string name="ma_open_shizuku">Open Shizuku</string>
+     <string name="ma_request_permission">Request permission</string>
+     <string name="ma_bt_address_title">Enter this phone\'s real Bluetooth address</string>
+-    <string name="ma_bt_address_body">Shizuku is not ready, so mcarplay cannot read the phone\'s real Bluetooth address. Receivers such as WinPlay check this address and refuse the connection or send no invitation when they see the system placeholder.\n\nFind Bluetooth address under Settings → My device → All specs, or Status, and enter it; or start Shizuku and reconnect so mcarplay reads it automatically.</string>
+-    <string name="ma_enter_manually">Enter manually</string>
++    <string name="ma_bt_address_body">The phone Bluetooth address is unavailable. Enter it once to save it for future automatic connections.\n\nLook for Bluetooth address under Settings → My device → All specs or Status, or start and authorize Shizuku before trying again.</string>
++    <string name="ma_enter_manually">Enter phone address and continue</string>
+     <string name="ma_background_title">Allow \"Display pop-up windows while running in the background\"</string>
+     <string name="ma_background_body">When the CarPlay session starts, mcarplay is usually behind the system Wi-Fi settings and has to open CarWith from the background. Without this permission Xiaomi silently blocks it and the car shows no picture.\n\nAllow \"Display pop-up windows while running in the background\" on the permissions page, then come back and tap Connect again.</string>
+     <string name="ma_battery_title">Locking will disconnect: turn off battery optimization</string>
+@@ -162,4 +162,5 @@
+     <string name="ma_r12_wifi_observed_candidate">Connected Wi-Fi: %1$s (not yet verified as car hotspot)</string>
+     <string name="ma_r12_wifi_observed_match">Connected Wi-Fi: %1$s (matches car-provided SSID)</string>
+     <string name="ma_r12_wifi_observed_other">Connected Wi-Fi: %1$s (differs from car-provided SSID)</string>
++    <string name="ma_bt_test_placeholder">Test bench: use placeholder</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings_diag.xml b/app/src/main/res/values/strings_diag.xml
+index 5c9a6e59792b9a7c3ef24197f72994e3f18ba197..5db3baac7a9736d32df0243b58b454b6069fd6d4 100644
+--- a/app/src/main/res/values/strings_diag.xml
++++ b/app/src/main/res/values/strings_diag.xml
+@@ -91,4 +91,5 @@
+     <string name="blocker_record">SETUP 已接受，等待 RECORD 激活会话</string>
+     <string name="blocker_carwith_frame">会话已激活，等待 CarWith 首帧</string>
+     <string name="language_note">日志和诊断报告保持中文，便于开发者对照。</string>
++    <string name="dc_bt_identity_required">点「启动连接」填写一次本机蓝牙地址，或启动 Shizuku 读取</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings_ma.xml b/app/src/main/res/values/strings_ma.xml
+index f60ae3c2066d59e50b363c7656985915853234e8..291dd788c71823708c06728607677a55904b0bea 100644
+--- a/app/src/main/res/values/strings_ma.xml
++++ b/app/src/main/res/values/strings_ma.xml
+@@ -33,8 +33,8 @@
+     <string name="ma_open_shizuku">打开 Shizuku</string>
+     <string name="ma_request_permission">请求授权</string>
+     <string name="ma_bt_address_title">请填写本机真实蓝牙地址</string>
+-    <string name="ma_bt_address_body">Shizuku 未就绪，mcarplay 读不到手机的真实蓝牙地址。WinPlay 等接收端会核对这个地址，用系统占位地址时会拒绝连接或不发邀请。\n\n请在手机「设置 → 我的设备 → 全部参数与信息」或「状态信息」中查到「蓝牙地址」后填写；也可以启动 Shizuku 后重新连接，由 mcarplay 自动读取。</string>
+-    <string name="ma_enter_manually">手动填写</string>
++    <string name="ma_bt_address_body">还没读到手机的蓝牙地址。填写一次后会自动保存，后续自动连接时直接复用。\n\n在手机「设置 → 我的设备 → 全部参数与信息」或「状态信息」中找「蓝牙地址」；也可启动并授权 Shizuku 后再点连接。</string>
++    <string name="ma_enter_manually">填写手机地址并继续</string>
+     <string name="ma_background_title">需要允许「后台弹出界面」</string>
+     <string name="ma_background_body">CarPlay 会话建立时 mcarplay 通常已在系统 WLAN 设置之后，此时需要从后台打开 CarWith。小米未授权时系统会静默拒绝，车机将没有画面。\n\n请在权限页把「后台弹出界面」设为允许，返回后重新点「启动连接」。</string>
+     <string name="ma_battery_title">锁屏会断开：请关闭电池优化</string>
+@@ -162,4 +162,5 @@
+     <string name="ma_r12_wifi_observed_candidate">已连接 Wi-Fi：%1$s（待确认是否为车机热点）</string>
+     <string name="ma_r12_wifi_observed_match">已连接 Wi-Fi：%1$s（与车机下发的网络名称一致）</string>
+     <string name="ma_r12_wifi_observed_other">已连接 Wi-Fi：%1$s（与车机下发的网络名称不同）</string>
++    <string name="ma_bt_test_placeholder">测试台：使用占位地址</string>
+ </resources>
+diff --git a/docs/DIAGNOSTICS.md b/docs/DIAGNOSTICS.md
+index 04a8c058a734c5db744d34c4af3feaf5212f7323..61d04788c7bf1e1f494209fc609b98ca057d7185 100644
+--- a/docs/DIAGNOSTICS.md
++++ b/docs/DIAGNOSTICS.md
+@@ -297,6 +297,7 @@ vehicle compatibility; the affected user's phone/head unit must still be reteste
+ | Code | Next check |
+ | --- | --- |
+ | `BT_PERMISSION`, `BT_DISABLED` | Bluetooth permission denied, or Bluetooth switched off. |
++| `BT_IDENTITY_REQUIRED` | Enter the phone Bluetooth address once or read it with Shizuku before starting a vehicle connection. |
+ | `WIFI_PERMISSION` | Android 13+ nearby-WLAN-devices permission denied. |
+ | `LOCATION_REQUIRED` | Android 12 WLAN permission/location-service prerequisite. |
+ | `ENDPOINT_PENDING` | Awaiting receiver information; not a terminal failure. |
+diff --git a/tools/logbot/rules.py b/tools/logbot/rules.py
+index eb2d472458f553bbac723aae04d862fc9ef27b11..4d2b5fcd67bf4288ccc590ce64bc548b9f67ce50 100644
+--- a/tools/logbot/rules.py
++++ b/tools/logbot/rules.py
+@@ -20,6 +20,7 @@ STAGE_LABELS = {
+ # code -> (结论, 建议)。结论只说日志能证明的事。
+ CODE_ADVICE: dict[str, tuple[str, str]] = {
+     "BT_PERMISSION": ("附近设备/蓝牙权限被拒绝。", "在系统设置里允许 mcarplay 的「附近设备」权限后重试。"),
++    "BT_IDENTITY_REQUIRED": ("未取得本机蓝牙地址。", "在连接准备中填写一次手机蓝牙地址，或启动 Shizuku 读取。"),
+     "BT_DISABLED": ("蓝牙处于关闭状态。", "开启蓝牙，确认手机已与接收端配对后重连。"),
+     "BT_LINK_CLOSED": (
+         "会话建立前蓝牙控制链路已结束。",
