@@ -237,22 +237,22 @@ def patch(base: Path, kit: Path) -> None:
     record_test = base / "app/src/test/java/com/mcarplay/app/airplay/AirPlayRecordLifecycleTest.kt"
     replace_once(
         record_test,
-        "    @Test\\n    fun observedCheryStackSendsOnlyOneRecordPerSession() {\\n",
-        "    @Test\\n"
-        "    fun productionActivationGateRefusesPrematureRecordOnLiveRtspSocket() {\\n"
-        "        Peer().use { peer ->\\n"
-        "            val client = client(peer.port)\\n"
-        "            try {\\n"
-        "                client.enableActivationGate()\\n"
-        "                assertTrue(client.reconnect())\\n"
-        "                assertFalse(client.record())\\n"
-        "                assertNull(peer.next(300)) // RECORD must not reach the receiver\\n"
-        "            } finally {\\n"
-        "                client.close()\\n"
-        "            }\\n"
-        "        }\\n"
-        "    }\\n\\n"
-        "    @Test\\n    fun observedCheryStackSendsOnlyOneRecordPerSession() {\\n",
+        "    @Test\n    fun observedCheryStackSendsOnlyOneRecordPerSession() {\n",
+        "    @Test\n"
+        "    fun productionActivationGateRefusesPrematureRecordOnLiveRtspSocket() {\n"
+        "        Peer().use { peer ->\n"
+        "            val client = client(peer.port)\n"
+        "            try {\n"
+        "                client.enableActivationGate()\n"
+        "                assertTrue(client.reconnect())\n"
+        "                assertFalse(client.record())\n"
+        "                assertNull(peer.next(300)) // RECORD must not reach the receiver\n"
+        "            } finally {\n"
+        "                client.close()\n"
+        "            }\n"
+        "        }\n"
+        "    }\n\n"
+        "    @Test\n    fun observedCheryStackSendsOnlyOneRecordPerSession() {\n",
         "strict client gate rejects RECORD before SETUP without wire activity",
     )
 
