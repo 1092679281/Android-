@@ -14,6 +14,7 @@ import sys
 
 p=Path(sys.argv[1])
 s=p.read_text(encoding="utf-8")
+s=s.replace("#include <algorithm>", "#include <algorithm>\n#include <cstdio>\n#include <cstdlib>", 1)
 old="""bool SdlVideoSink::upload(SDL_Renderer* r, const AVFrame* f)
 {
     Uint32 fmt = 0;"""
@@ -43,6 +44,19 @@ new="""bool SdlVideoSink::upload(SDL_Renderer* r, const AVFrame* f)
             LOG_ERROR("%s: RGB conversion failed, rows=%d (expected %d)",
                       kTag, rows, f->height);
             return false;
+        }
+        // Test-only proof of RGB pixels BEFORE SDL texture upload.
+        if (presented_ == 0) {
+            const char* dump = std::getenv("R11_RGB_DUMP");
+            if (dump) {
+                FILE* fp = std::fopen(dump, "wb");
+                if (fp) {
+                    std::fprintf(fp, "P6\\n%d %d\\n255\\n", f->width, f->height);
+                    std::fwrite(scratch_.data(), 1, scratch_.size(), fp);
+                    std::fclose(fp);
+                    LOG_INFO("%s: wrote software-decoded RGB sample before SDL upload", kTag);
+                }
+            }
         }
         if (!tex_ || texW_ != f->width || texH_ != f->height ||
             texFmt_ != SDL_PIXELFORMAT_RGB24) {
