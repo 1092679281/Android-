@@ -62,7 +62,7 @@ index f13162ddfe9e8b8424bcea90f8d19a89bab3728b..cbec49aa77a34ab0e9ddd23f8c725f2e
  
          // ---- Shizuku 状态行：辅助能力，不阻止 CarWith 连接 ----
 diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
-index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8fa091f46 100644
+index 80c19f4274f5339051b72d221b505142ecc90736..6f42909e5f192deb053f28c6cf227bf979ddf5d2 100644
 --- a/app/src/main/java/com/mcarplay/app/SessionController.kt
 +++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
 @@ -88,6 +88,8 @@ import com.mcarplay.app.shizuku.Shell
@@ -149,7 +149,7 @@ index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8
          val alreadyRunning = isSessionRunning()
          if (automatic && !alreadyRunning) {
              audioEnabledForSession = QuickConnectMode.forAutomatic(QuickConnectPrefs.lastAudioEnabled(context))
-@@ -1342,17 +1373,49 @@ object SessionController {
+@@ -1342,17 +1373,51 @@ object SessionController {
          } else {
              appendLog("SESSION: 会话已在运行——沿用当前会话，不清零邀请与要帧计数")
          }
@@ -172,10 +172,10 @@ index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8
 +        bluetoothIdentityPreparation = preparation
 +        val app = context.applicationContext
 +        Bg.run("connection-bt-identity") {
-+            DeviceIdentity.resolve(app, forceRetry = true)
-+            synchronized(this) {
-+                if (bluetoothIdentityPreparation !== preparation) return@run
-+                try {
++            try {
++                DeviceIdentity.resolve(app, forceRetry = true)
++                synchronized(this) {
++                    if (bluetoothIdentityPreparation !== preparation) return@run
 +                    // 每轮使用独立快照，即使底层缓存返回相同对象也能识别迟到的回调。
 +                    val identity = DeviceIdentity.peek(app).copy()
 +                    bluetoothIdentityAtStart = identity
@@ -185,7 +185,9 @@ index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8
 +                            "（iAP2、ctrl 和 AirPlay SETUP 共用）",
 +                    )
 +                    startBluetoothTransports(app)
-+                } finally {
++                }
++            } finally {
++                synchronized(this) {
 +                    if (bluetoothIdentityPreparation === preparation) bluetoothIdentityPreparation = null
 +                }
 +            }
@@ -206,7 +208,7 @@ index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8
              appendLog(
                  "BT-PROFILE: 连接前「${target.name}」的蓝牙配置文件状态=" +
                      (connected.takeIf { it.isNotEmpty() }?.joinToString("/") ?: "未连接"),
-@@ -1377,6 +1440,8 @@ object SessionController {
+@@ -1377,6 +1442,8 @@ object SessionController {
          // “看到 disconnectCompletion=null” 后重新 begin 并清掉 connectCancelled。
          handoffOwnership.blockNewHandoffs()
          connectCancelled = true
@@ -215,7 +217,7 @@ index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8
          // 先读本轮 attempt：retireSession 后时间线仍保留结果，但这里尽早固定标识
          val autoAttempt = ConnectionDiagnostics.timeline.snapshot()?.id
          if (reason == DiagnosticCode.USER_STOP) {
-@@ -4135,7 +4200,14 @@ object SessionController {
+@@ -4135,7 +4202,14 @@ object SessionController {
              return
          }
  
@@ -231,7 +233,7 @@ index 80c19f4274f5339051b72d221b505142ecc90736..40a0d3651b5dddbe2521eae4883288d8
  
          fun wasCancelled(): Boolean = connectCancelled || !ownsConnection()
          // 熔断按实际发起本轮的控制链路对端隔离；未选定目标车机时也不会误拦其它车机。
-@@ -4371,6 +4443,7 @@ object SessionController {
+@@ -4371,6 +4445,7 @@ object SessionController {
                              effectiveEndpoint,
                              log = { line -> appendLog(line) },
                              context = context.applicationContext,
@@ -402,7 +404,7 @@ index fd6b0019408c3b99249e103e976d6869b525e17b..3d71aacdac7ae5b395e7cb6ecda19af6
          // 后续（Phase 2）：加入热点 → mDNS 解析 _airplay._tcp → AirPlay 主会话。
          // 0x5703 缺席时 AP 信息来自 0x4301（已并入 endpoint）——保活期车机重发
 diff --git a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
-index fa0fc0c46f4772fa92c9657a1b829a20d28f8bac..8575aa5629b92a6fca23361b8d9c99c96eea95ca 100644
+index fa0fc0c46f4772fa92c9657a1b829a20d28f8bac..9f81830df3a6fdf4e1f309d95df2914f429db46f 100644
 --- a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
 +++ b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
 @@ -24,6 +24,7 @@ import java.net.Socket
@@ -413,15 +415,18 @@ index fa0fc0c46f4772fa92c9657a1b829a20d28f8bac..8575aa5629b92a6fca23361b8d9c99c9
      private val log: (String) -> Unit,
  ) {
      companion object {
-@@ -196,6 +197,7 @@ class CarPlayCtrlAdvertiser(
+@@ -196,7 +197,9 @@ class CarPlayCtrlAdvertiser(
  
      @Synchronized
      fun start(): Boolean {
+-        if (registered) return true
 +        val mac = connectionIdentity()?.mac ?: return false
-         if (registered) return true
++        if (registered && registeredWithMac == mac) return true
++        if (registered) unregisterServiceOnly()
          return try {
              // 端口在整个 advertiser 生命周期内固定：重注册只换 mDNS 注册、复用同一个
-@@ -209,15 +211,6 @@ class CarPlayCtrlAdvertiser(
+             // socket 与 accept 线程（见 ensureForNetwork 的注释）。
+@@ -209,15 +212,6 @@ class CarPlayCtrlAdvertiser(
                          start()
                      }
                  }
@@ -437,7 +442,7 @@ index fa0fc0c46f4772fa92c9657a1b829a20d28f8bac..8575aa5629b92a6fca23361b8d9c99c9
              val info =
                  NsdServiceInfo().apply {
                      serviceName = SERVICE_NAME
-@@ -244,11 +237,6 @@ class CarPlayCtrlAdvertiser(
+@@ -244,11 +238,6 @@ class CarPlayCtrlAdvertiser(
                      "name=$SERVICE_NAME id=$mac srcvers=$SENDER_SRCVERS" +
                      if (mac == DeviceIdentity.PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "",
              )
@@ -449,7 +454,7 @@ index fa0fc0c46f4772fa92c9657a1b829a20d28f8bac..8575aa5629b92a6fca23361b8d9c99c9
              true
          } catch (error: Exception) {
              log("$TAG: 启动失败 - ${error.message}")
-@@ -256,24 +244,6 @@ class CarPlayCtrlAdvertiser(
+@@ -256,24 +245,6 @@ class CarPlayCtrlAdvertiser(
          }
      }
  
