@@ -16,3 +16,7 @@
 ## 绿屏缺陷修复（R11 补充验收）
 
 旧测试用的 AllPlay `video_probe` 在 `SDL_RenderPresent` 后才调用 `dumpRender`，在 Linux/Xvfb 软件渲染下会读到无效后缓冲，产生全绿假截图。之前只检查 PNG 大小和解码计数，没有检查实际像素，因此误报通过。测试现在对 *CI 的 AllPlay 源码检出* 进行严格匹配的截图时序修正，把最终帧截图移到 Present 前；截图仍从真实 SDL 渲染输出获取。新增 `r11_validate_car_screen.py` 验证 1920x720 PPM 实际像素的 RGB 色彩对比度，防止全绿、全黑、纯色错误通过。报告另附 `car-screen-color-report.json`。这不修改用户手机 APK 或君越原厂车机。
+
+## 严格像素验收发现真实 SDL 软件纹理绿屏
+
+截图移到 `SDL_RenderPresent()` 前后仍产生 RGB≈(0,135,0)，证明不只是取帧时序问题，软件渲染路径还存在 YUV 空纹理/色彩输出异常。现在在 CI 检出的固定 AllPlay 版本中为 **SDL 软件渲染器**使用 FFmpeg libswscale 将真实解码 AVFrame 转换为 `RGB24`，再通过 `SDL_UpdateTexture` 上传，保留硬件渲染器原有快速路径。`r11_validate_car_screen.py` 继续检查最终截图的 RGB 分布，只有彩色画面确实呈现才允许通过。此变更是模拟车机端的实验修正，不会修改安卓 APK、君越原厂系统或宣称原厂 60FPS。
