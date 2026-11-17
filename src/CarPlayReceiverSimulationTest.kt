@@ -68,7 +68,7 @@ class CarPlayReceiverSimulationTest {
                     )
                 assertTrue("Actual VideoSender socket must connect", sender.openDataPort())
                 assertTrue("Fake receiver must observe TCP accept", receiver.videoConnected.await(2, TimeUnit.SECONDS))
-                assertTrue(client.confirmVideoDataPortConnected())
+                assertTrue(client.confirmVideoDataPortConnected(true))
                 assertTrue("RECORD 200 should activate the local simulated session", client.record())
 
                 assertTrue(sender.start {})
@@ -159,7 +159,7 @@ class CarPlayReceiverSimulationTest {
                 sender = VideoSender("127.0.0.1", stream!!.dataPort, stream.cipher, 1280, 720, log = {})
                 try {
                     assertFalse("Closed data listener should fail socket connect", sender.openDataPort())
-                    assertFalse("Never signal a TCP connection that did not happen", client.confirmVideoDataPortConnected())
+                    assertFalse("Never signal a TCP connection that did not happen", client.confirmVideoDataPortConnected(false))
                     assertFalse("RECORD cannot follow failed video socket", client.record())
                     assertEquals(
                         listOf("SETUP /setup", "GET /info", "SETUP /"),
