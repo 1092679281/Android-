@@ -135,7 +135,7 @@ def patch(base: Path, kit: Path) -> None:
         "                // but precise location is still needed to read the connected SSID.\n"
         "                prefs.edit().putBoolean(\"r12_wifi_ssid_permission_asked\", true).apply()\n"
         "                afterOptionalWifiPermission = onReady\n"
-        "                optionalWifiPermission.launch(Manifest.permission.ACCESS_FINE_LOCATION)\n"
+        "                optionalWifiPermission.launch(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))\n"
         "                return\n"
         "            }\n"
         "            onReady()\n            return\n        }\n        val granted =\n",
@@ -144,7 +144,8 @@ def patch(base: Path, kit: Path) -> None:
         "    /** 位置权限授权后自动继续启动连接（仅 Android 12/12L）。 */\n",
         "    private var afterOptionalWifiPermission: (() -> Unit)? = null\n"
         "    private val optionalWifiPermission =\n"
-        "        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->\n"
+        "        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->\n"
+        "            val granted = result[Manifest.permission.ACCESS_FINE_LOCATION] == true\n"
         "            log(\"WIFI: 可选 SSID 读取权限 granted=\" + granted)\n"
         "            val next = afterOptionalWifiPermission\n"
         "            afterOptionalWifiPermission = null\n"
