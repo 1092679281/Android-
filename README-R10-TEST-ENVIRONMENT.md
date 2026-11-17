@@ -6,3 +6,7 @@
 bash tools/emulator_r10_smoke.sh /path/to/R10.apk /path/to/report
 
 该环境 **没有小米专有 CarWith、CarLife 或车机端无线 CarPlay 接收器**，不能测试真实车机配对与 7 路 TCP、真实 H.264 60 帧解码、物理车机触控/音频端到端延迟、原生 iOS 界面。源端 30/60FPS 协商链路另有 Kotlin 单测；最终呈现 FPS 仍需停车状态实车测试与视频/日志证据。
+
+## 第二阶段 UI 可用性验证
+
+在测试用模拟器中授权蓝牙等运行时权限，实际滑动免责声明至底部并经过 10 秒倒计时，点击接受后检查主页与三个底部标签（Connect/Settings/Diagnostics）是否显示与可切换。保存无系统弹窗遮挡的主页/设置/诊断截图。此流程只操作一次性模拟器，不绕过真实用户设备上的免责声明。完整代码在 `tools/emulator_r10_ui.py`。

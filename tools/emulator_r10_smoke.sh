@@ -34,6 +34,10 @@ sha256sum "$APK" | tee "$REPORT/apk-sha256.txt"
 
 note "Install the same R10 APK built by this workflow"
 adb install -r -t "$APK"
+# Test-only pregrant: exercise the app UI instead of stopping at a system permission prompt.
+for p in android.permission.BLUETOOTH_CONNECT android.permission.BLUETOOTH_SCAN android.permission.NEARBY_WIFI_DEVICES android.permission.POST_NOTIFICATIONS; do
+  adb shell pm grant com.mcarplay.app "$p" || true
+done
 adb shell pm path com.mcarplay.app | tee "$REPORT/installed-package.txt"
 grep -q 'com.mcarplay.app' "$REPORT/installed-package.txt"
 
@@ -43,7 +47,10 @@ adb shell settings put system user_rotation 0
 adb shell wm user-rotation lock 0 || true
 adb logcat -c || true
 adb shell am start -W -n com.mcarplay.app/.MainActivity | tee "$REPORT/launch-portrait.txt"
-sleep 10
+sleep 4
+assert_alive
+# Complete the actual first-use disclaimer and exercise all three UI tabs.
+python3 kit/tools/emulator_r10_ui.py "$REPORT"
 assert_alive
 adb exec-out screencap -p > "$REPORT/portrait.png"
 assert_png "$REPORT/portrait.png"
