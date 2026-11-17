@@ -49,16 +49,30 @@ timeout 65s xvfb-run -a -s "-screen 0 1920x1080x24" \
  bash -c '
  set -Eeuo pipefail
  host="$1"; phone="$2"; report="$3"; h264="$4"
- "$host" --port 17094 --screen 1920x720 --no-avahi --no-audio \
-    --statusbar --inject-touch 0.5,0.5 --frames 700 \
+ stdbuf -oL -eL "$host" --port 17094 --screen 1920x720 --no-avahi --no-audio \
+    --statusbar --font /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf \
+    --inject-touch 0.5,0.5 \
     > "$report/receiver-session.txt" 2>&1 &
  pid=$!
  trap "kill $pid 2>/dev/null || true" EXIT
- sleep 2
+ # Never use a fixed sleep or render-loop frame count to decide when RTSP is ready:
+ # Xvfb's synthetic vsync can be much faster than a real car screen.
+ python3 - <<'"'"'PY'"'"'
+import socket,time
+deadline=time.monotonic()+25
+while time.monotonic()<deadline:
+    try:
+        with socket.create_connection(("127.0.0.1",17094),timeout=0.5): pass
+        print("[receiver] RTSP socket ready",flush=True)
+        break
+    except OSError: time.sleep(0.2)
+else: raise SystemExit("receiver RTSP port 17094 not available")
+PY
  "$phone" --host 127.0.0.1 --port 17094 --h264 "$h264" \
     --fps 60 --frames 180 --loop --seconds 4 \
     > "$report/fake-phone.txt" 2>&1
- wait "$pid"
+ kill "$pid" 2>/dev/null || true
+ wait "$pid" 2>/dev/null || true
  ' bash "$ALLPLAY/build/allplay_host" "$ALLPLAY/build/fake_phone" \
  "$REPORT" "$REPORT/synthetic60.h264"
 rc="$?"
