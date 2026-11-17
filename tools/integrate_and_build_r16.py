@@ -95,6 +95,26 @@ def patch(base: Path, kit: Path) -> None:
         "                            // 会话级 SETUP 被拒（典型：接收端按设备过滤回 403，见\n",
         "R16 retry only after fresh receiver invite on guessed endpoint",
     )
+    # The old snackbar singled out deviceID for ALL RTSP errors, but this
+    # vehicle returned 500 with no 0x4301 or ctrl invite. Keep the UI neutral.
+    for language, original, message in (
+        (
+            "values",
+            "接收端拒绝了会话建立（SETUP）——请查看日志中的 deviceID 提示",
+            "车机拒绝了 SETUP——请查看日志中的响应码、端点来源、ctrl 邀请与 deviceID 诊断",
+        ),
+        (
+            "values-en",
+            "The receiver rejected the session (SETUP); see the deviceID hint in the log",
+            "The receiver rejected SETUP; inspect the status code, endpoint, ctrl invite and deviceID diagnostics",
+        ),
+    ):
+        replace_once(
+            base / "app/src/main/res" / language / "strings_sc.xml",
+            original,
+            message,
+            "R16 actionable SETUP UI diagnostic wording",
+        )
     print("R16: exact SETUP500 and placeholder ID evidence, invitation-bounded retry installed", flush=True)
 
 
