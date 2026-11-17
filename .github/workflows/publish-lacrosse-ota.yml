@@ -1,0 +1,109 @@
+name: Publish signed LaCrosse update to public APK channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Signed stable version tag matching app/build.gradle.kts (currently v0.1.8)'
+        required: true
+        default: 'v0.1.8'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      CHANNEL_REPOSITORY: 1092679281/CarPlay-Updates
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - uses: actions/checkout@v4
+        with:
+          repository: wangxso/mcarplay
+          ref: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK 35
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Verify release prerequisites and persistent signing inputs
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
+          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          UPDATE_PUBLISH_TOKEN: ${{ secrets.UPDATE_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "${{ inputs.release_tag }}" = "v0.1.8" || {
+            echo "::error::Update R15 base version and update tests before publishing another tag."
+            exit 1
+          }
+          for key in RELEASE_KEYSTORE_B64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD UPDATE_PUBLISH_TOKEN; do
+            test -n "${!key}" || { echo "::error::Missing required GitHub Actions secret: $key"; exit 1; }
+          done
+          echo "$RELEASE_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/carplay-release.keystore"
+          chmod 600 "$RUNNER_TEMP/carplay-release.keystore"
+          test -s "$RUNNER_TEMP/carplay-release.keystore"
+          echo "MCARPLAY_KEYSTORE_FILE=$RUNNER_TEMP/carplay-release.keystore" >> "$GITHUB_ENV"
+      - name: Build, test and sign release APK
+        env:
+          R7_UPSTREAM: ${{ github.workspace }}/upstream
+          R15_OUTPUT: ${{ runner.temp }}/r15-signed-release
+          R15_SIGNED_RELEASE: '1'
+          R15_RELEASE_TAG: ${{ inputs.release_tag }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 -m py_compile kit/tools/integrate_and_build_r15.py
+          python3 kit/tools/integrate_and_build_r15.py
+      - name: Upload signed release for audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: LaCrosse-R15-signed-v0.1.8
+          path: ${{ runner.temp }}/r15-signed-release/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish signed APK and SHA256SUMS to public GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.UPDATE_PUBLISH_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh repo view "$CHANNEL_REPOSITORY" --json visibility --jq '.visibility' | grep -qx PUBLIC || {
+            echo "::error::Create a public $CHANNEL_REPOSITORY repository before publishing."
+            exit 1
+          }
+          if gh release view "$RELEASE_TAG" --repo "$CHANNEL_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Refusing to overwrite an existing published release."
+            exit 1
+          fi
+          OUT="$RUNNER_TEMP/r15-signed-release"
+          test -f "$OUT/mcarplay-0.1.8.apk" && test -f "$OUT/SHA256SUMS.txt"
+          cd "$OUT"
+          sha256sum --check SHA256SUMS.txt
+          gh release create "$RELEASE_TAG" \
+            "$OUT/mcarplay-0.1.8.apk" "$OUT/SHA256SUMS.txt" \
+            --repo "$CHANNEL_REPOSITORY" \
+            --target main \
+            --title "LaCrosse CarPlay v0.1.8" \
+            --notes "R15: project-owned in-app update channel. Signed APK with SHA-256, Android package and certificate verification. Installation requires user confirmation."
