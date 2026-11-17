@@ -50,6 +50,15 @@ def patch(base: Path, kit: Path) -> None:
         f'"https://github.com/{CHANNEL_REPOSITORY}/releases/tag/v0.1.2-test.1"',
         "adapt upstream release URL regression",
     )
+    # The upstream URL rejection test replaces the original owner name.
+    # Once the repository changes, it must mutate the NEW owner, or the
+    # "invalid" URL is identical to the valid URL and produces a false failure.
+    replace_once(
+        base / "app/src/test/java/com/mcarplay/app/update/UpdateHttpTest.kt",
+        'release.apk.url.replace("wangxso", "other")',
+        'release.apk.url.replace("1092679281", "other")',
+        "adapt repository-owner spoofing regression to public update channel",
+    )
     # Explicitly reject the original upstream and other untrusted release
     # locations; accepting a foreign URL would break checksum trust binding.
     release_test = base / "app/src/test/java/com/mcarplay/app/update/GitHubReleaseTest.kt"
