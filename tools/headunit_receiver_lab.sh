@@ -57,7 +57,7 @@ timeout 65s xvfb-run -a -s "-screen 0 1920x1080x24" \
  trap "kill $pid 2>/dev/null || true" EXIT
  # Never use a fixed sleep or render-loop frame count to decide when RTSP is ready:
  # Xvfb's synthetic vsync can be much faster than a real car screen.
- python3 - <<'"'"'PY'"'"'
+ python3 - <<PY
 import socket,time
 deadline=time.monotonic()+25
 while time.monotonic()<deadline:
