@@ -41,6 +41,8 @@ timeout 70s xvfb-run -a -s "-screen 0 1920x1080x24" \
 grep -q 'decoded first frame' "$REPORT/video-probe.txt"
 grep -q 'decoder OK' "$REPORT/video-probe.txt"
 test -s "$REPORT/car-screen.ppm"
+echo "[HEADUNIT] Enforce pixel-validity gate: no green/flat screenshot allowed"
+python3 "$GITHUB_WORKSPACE/kit/tools/r11_validate_car_screen.py" "$REPORT/car-screen.ppm" "$REPORT/car-screen-color-report.json"
 ffmpeg -hide_banner -loglevel error -y -i "$REPORT/car-screen.ppm" "$REPORT/car-screen.png"
 
 echo "[HEADUNIT] RTSP encrypted H264 and touch: fake CarPlay phone -> receiver"
@@ -94,6 +96,7 @@ decoded,dropped,presented,state,elapsed=match.groups()
 assert state.strip()=="decoder OK" and int(decoded)>0 and int(presented)>0
 data=(p/"car-screen.ppm").read_bytes()
 assert data.startswith(b"P6\n") and len(data)>100000
+assert json.loads((p/"car-screen-color-report.json").read_text())["rendered_content_valid"], "RGB screenshot failed visual gate"
 rates=re.search(r"decode ([\d.]+) fps .*?present ([\d.]+) fps",log)
 summary={
  "target":"AllPlay Linux virtual CarPlay head unit, NOT OEM 2023 Buick LaCrosse",

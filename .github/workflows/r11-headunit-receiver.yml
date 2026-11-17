@@ -5,6 +5,8 @@ on:
     branches: [main]
     paths:
       - 'tools/headunit_receiver_lab.sh'
+      - 'tools/r11_patch_allplay_snapshot.py'
+      - 'tools/r11_validate_car_screen.py'
       - '.github/workflows/r11-headunit-receiver.yml'
       - 'README-R11-HEADUNIT.md'
   workflow_dispatch:
@@ -36,6 +38,8 @@ jobs:
             libdbus-1-dev libbluetooth-dev bluez libavahi-client-dev \
             libsdl2-dev libsdl2-ttf-dev libavcodec-dev libavformat-dev \
             libswscale-dev libavutil-dev libx264-dev ffmpeg xvfb fonts-dejavu-core
+      - name: Fix upstream headless screenshot readback before SDL Present
+        run: python3 kit/tools/r11_patch_allplay_snapshot.py allplay/tools/video_probe.cpp
       - name: Build AllPlay receiver and RTSP/video tests
         run: |
           cmake -S allplay -B allplay/build -DCMAKE_BUILD_TYPE=Release
