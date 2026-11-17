@@ -37,7 +37,8 @@ def patch(base: Path, kit: Path) -> None:
     c(
         "    @Volatile\n    private var screenStreamUuid: String? = null\n",
         "    @Volatile\n    private var screenStreamUuid: String? = null\n"
-        "\n    private val activation = AirPlayActivationState()\n",
+        "\n    private val activation = AirPlayActivationState()\n"
+        "    @Volatile private var activationGateEnabled = false\n",
         "activation state field",
     )
     c(
@@ -85,7 +86,7 @@ def patch(base: Path, kit: Path) -> None:
         "    ): ScreenStreamInfo? {\n"
         "        // 对照 catplay（真车验证）：streamConnectionID = 随机 u64（+1 保证非零）\n",
         "    ): ScreenStreamInfo? {\n"
-        "        if (!sessionSetupAccepted || !activation.canSetupScreen()) {\n"
+        "        if (activationGateEnabled && (!sessionSetupAccepted || !activation.canSetupScreen())) {\n"
         '            log("AIRPLAY: 初始 SETUP 尚未确认——拒绝提前发送屏幕流 SETUP")\n'
         "            return null\n"
         "        }\n"
@@ -108,7 +109,7 @@ def patch(base: Path, kit: Path) -> None:
         "        screenStreamUuid = streamUuid\n"
         "        return ScreenStreamInfo(connectionId, dataPort, cipher)\n",
         "        screenStreamUuid = streamUuid\n"
-        "        if (!activation.screenSetupAccepted()) {\n"
+        "        if (activationGateEnabled && !activation.screenSetupAccepted()) {\n"
         '            log("AIRPLAY: 屏幕流 SETUP 时序冲突——拒绝后续 RECORD")\n'
         "            return null\n"
         "        }\n"
@@ -137,6 +138,11 @@ def patch(base: Path, kit: Path) -> None:
     )
     c(
         "    fun record(\n        timeoutMillis: Int = 10_000,\n",
+        "    /** Activate strict SETUP/RECORD gating for the real SessionController pipeline. */\n"
+        "    fun enableActivationGate() {\n"
+        "        activationGateEnabled = true\n"
+        "        activation.reset()\n"
+        "    }\n\n"
         "    /** Called only when VideoSender.openDataPort() actually succeeded for THIS screen stream. */\n"
         "    fun confirmVideoDataPortConnected(): Boolean {\n"
         "        val confirmed = synchronized(this) {\n"
@@ -152,8 +158,9 @@ def patch(base: Path, kit: Path) -> None:
     c(
         "            if (sessionStopping || socket?.isClosed != false) return false\n"
         "            epoch = connectionEpoch\n",
-        "            if (sessionStopping || socket?.isClosed != false || !sessionSetupAccepted ||\n"
-        "                screenStreamUuid == null || !activation.canRecord()\n"
+        "            if (sessionStopping || socket?.isClosed != false ||\n"
+        "                (activationGateEnabled && (!sessionSetupAccepted ||\n"
+        "                    screenStreamUuid == null || !activation.canRecord()))\n"
         "            ) {\n"
         '                log("AIRPLAY: RECORD 被阻止：初始 SETUP / 屏幕流 SETUP / 视频 TCP 连接尚未全部确认")\n'
         "                return false\n"
@@ -164,12 +171,23 @@ def patch(base: Path, kit: Path) -> None:
     c(
         '                    if (statusLine.contains("200") && connectionEpoch == epoch && !sessionStopping) {\n'
         "                        recordAccepted = true\n",
-        "                    if (activation.onRecordReply(statusLine, connectionEpoch == epoch && !sessionStopping)) {\n"
+        "                    if (AirPlayRtspStatus.accepted(statusLine) && connectionEpoch == epoch && !sessionStopping &&\n"
+        "                        (!activationGateEnabled || activation.onRecordReply(statusLine, true))\n"
+        "                    ) {\n"
         "                        recordAccepted = true\n",
         "record requires exact RTSP 200 plus live epoch",
     )
 
     controller = base / "app/src/main/java/com/mcarplay/app/SessionController.kt"
+    replace_once(
+        controller,
+        "                        ).also { created ->\n"
+        "                            created.onMilestone = { reached, detail ->\n",
+        "                        ).also { created ->\n"
+        "                            created.enableActivationGate()\n"
+        "                            created.onMilestone = { reached, detail ->\n",
+        "strict activation on the production AirPlay client, preserving protocol-level test harness",
+    )
     source = controller.read_text(encoding="utf-8")
     tunnel_start = "                                // iAP 隧道（type-130）：车机→手机的 iAP2 EA 数据（触摸 HID 载体）。\n"
     tunnel_end = "                                // 关键时序（2026-10-17 奥迪定谳）：屏幕 SETUP 后必须尽快连上\n"
