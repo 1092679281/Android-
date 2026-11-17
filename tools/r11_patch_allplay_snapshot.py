@@ -29,8 +29,8 @@ fixed = """        // Snapshot the actual composited car-side image BEFORE Prese
         SDL_RenderPresent(ren);
 
         if (!reported && vw > 0 && vh > 0) {"""
-init = """    bool        reported = false;"""
-initFixed = """    bool        reported = false;
+init = """    bool         reported = false;"""
+initFixed = """    bool         reported = false;
     bool        dumpCaptured = false;"""
 late = """    if (!opt.dump.empty()) allplay::dumpRender(ren, opt.dump);"""
 lateFixed = """    if (!opt.dump.empty() && !dumpCaptured) {
