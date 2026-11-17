@@ -31,8 +31,10 @@
 ```bash
 keytool -genkeypair -v -keystore carplay-release.p12 -storetype PKCS12 \
   -alias carplay -keyalg RSA -keysize 3072 -validity 10000
-# Linux/macOS:
+# Linux:
 base64 -w0 carplay-release.p12
+# macOS:
+base64 < carplay-release.p12 | tr -d '\n'
 # Windows PowerShell:
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("carplay-release.p12"))
 ```
