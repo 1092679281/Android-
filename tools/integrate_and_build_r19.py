@@ -184,7 +184,15 @@ object BtSessionGate {
         "            }\n"
         "            log(\"BT: 车机回连获得唯一 iAP2 所有权，等待旧出站连接退出\")\n"
         "            val observation = ReceiverDetectionRuntime.observation(peerAddress)\n"
-        "            Thread({ runSession(socket, observation, lease) }, \"iap2-bt-session\").apply {\n",
+        "            Thread({\n"
+        "                try {\n"
+        "                    runSession(socket, observation, lease)\n"
+        "                } finally {\n"
+        "                    // Even if socket.inputStream fails before runSession try/finally.\n"
+        "                    lease.close()\n"
+        "                    runCatching { socket.close() }\n"
+        "                }\n"
+        "            }, \"iap2-bt-session\").apply {\n",
         "acquire inbound owner before thread scheduling",
     )
     replace_once(
