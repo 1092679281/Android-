@@ -50,6 +50,7 @@ internal class BluetoothSessionArbiter {
         private var preemptAction: (() -> Unit)? = null
         private var preemptNotified = false
         private var closed = false
+        private var activeCallbacks = 0
 
         internal var confirmed = inbound
         internal var preempted = false
@@ -64,6 +65,28 @@ internal class BluetoothSessionArbiter {
                     true
                 }
             }
+
+        /**
+         * Start work only while this is the current owner. A callback started
+         * just BEFORE preemption is allowed to finish; the new inbound owner
+         * cannot begin iAP2 until ALL such callbacks and the old channel retire.
+         * The callback is never run while holding [lock].
+         */
+        fun dispatchIfCurrent(action: () -> Unit): Boolean {
+            synchronized(lock) {
+                if (closed || owner !== this) return false
+                activeCallbacks++
+            }
+            try {
+                action()
+            } finally {
+                synchronized(lock) {
+                    activeCallbacks--
+                    if (closed && activeCallbacks == 0) retired.countDown()
+                }
+            }
+            return true
+        }
 
         /** When a late callback is registered after preemption, invoke it once. */
         fun onPreempted(action: () -> Unit) {
@@ -117,7 +140,7 @@ internal class BluetoothSessionArbiter {
                 closed = true
                 preemptAction = null
                 if (owner === this) owner = null
-                retired.countDown()
+                if (activeCallbacks == 0) retired.countDown()
             }
         }
     }
