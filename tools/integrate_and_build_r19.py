@@ -388,20 +388,20 @@ def patch(base: Path, kit: Path) -> None:
     head = source.split(delimiter, 1)[0]
     client.write_text(
         head +
-        """/** An atomic lease arbiter prevents simultaneous iAP2 control handshakes. */
+        """/** One lock serializes RFCOMM ownership with the AirPlay active-session gate. */
 object BtSessionGate {
     private val arbiter = BluetoothSessionArbiter()
 
     val inboundActive: Boolean get() = arbiter.inboundActive
     val controlActive: Boolean get() = arbiter.controlActive
 
-    @Volatile
-    var sessionActive: Boolean = false
+    var sessionActive: Boolean
+        get() = arbiter.sessionActive
+        set(value) = arbiter.setSessionActive(value)
 
     internal fun acquireInbound(): BluetoothSessionArbiter.Lease? = arbiter.acquireInbound()
 
-    internal fun acquireOutbound(): BluetoothSessionArbiter.Lease? =
-        if (sessionActive) null else arbiter.acquireOutbound()
+    internal fun acquireOutbound(): BluetoothSessionArbiter.Lease? = arbiter.acquireOutbound()
 }
 """,
         encoding="utf-8",
