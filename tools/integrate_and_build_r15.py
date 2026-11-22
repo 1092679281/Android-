@@ -115,6 +115,8 @@ def main() -> None:
     r14.patch = with_r15
     os.environ["R14_OUTPUT"] = str(stage)
     r14.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     debug = stage / "mcarplay-LaCrosse-R14-airplay-setup-record-debug.apk"
     if not debug.is_file() or not zipfile.is_zipfile(debug):
         raise PatchMismatch("full Android test/build did not create R14 staging APK")
