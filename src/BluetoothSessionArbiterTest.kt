@@ -170,4 +170,55 @@ class BluetoothSessionArbiterTest {
         assertTrue(bLease.isCurrent)
         bLease.close()
     }
+
+    @Test
+    fun sessionActiveBlocksNewOutboundLeaseUntilCleared() {
+        val gate = BluetoothSessionArbiter()
+        gate.setSessionActive(true)
+        assertTrue(gate.sessionActive)
+        assertNull(gate.acquireOutbound())
+        gate.setSessionActive(false)
+        assertFalse(gate.sessionActive)
+        assertNotNull(gate.acquireOutbound()?.also { it.close() })
+    }
+
+    @Test
+    fun preemptedOutboundCannotStartLateTransportOperation() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val inbound = requireNotNull(gate.acquireInbound())
+        val started = AtomicInteger()
+        assertFalse(outbound.dispatchIfCurrent { started.incrementAndGet() })
+        assertTrue(started.get() == 0)
+        outbound.close()
+        assertTrue(inbound.awaitPreviousRetirement(500))
+        inbound.close()
+    }
+
+    @Test
+    fun preemptionCallbackFailureDoesNotOrphanInboundOwner() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        outbound.onPreempted { throw IllegalStateException("simulated socket close failure") }
+        val inbound = requireNotNull(gate.acquireInbound())
+        assertTrue(inbound.isCurrent)
+        assertFalse(outbound.isCurrent)
+        outbound.close()
+        assertTrue(inbound.awaitPreviousRetirement(500))
+        inbound.close()
+    }
+
+    @Test
+    fun callbackRegisteredAfterRetirementIsNotInvoked() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val inbound = requireNotNull(gate.acquireInbound())
+        outbound.close()
+        val calls = AtomicInteger()
+        outbound.onPreempted { calls.incrementAndGet() }
+        assertTrue(calls.get() == 0)
+        assertTrue(inbound.awaitPreviousRetirement(500))
+        inbound.close()
+    }
+
 }
