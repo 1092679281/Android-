@@ -204,10 +204,24 @@ def patch(base: Path, kit: Path) -> None:
     )
     replace_once(
         client,
+        "            } catch (error: IOException) {\n"
+        "                diagnostics.connectFinished(\n"
+        "                    trace,\n"
+        "                    creatingSocket = true,\n"
+        "                    error = error,\n"
         "                    cancelled =\n"
-        "                        !running || generation.get() != myGeneration,\n",
+        "                        !running || generation.get() != myGeneration,\n"
+        "                )\n"
+        "                return null\n",
+        "            } catch (error: IOException) {\n"
+        "                diagnostics.connectFinished(\n"
+        "                    trace,\n"
+        "                    creatingSocket = true,\n"
+        "                    error = error,\n"
         "                    cancelled =\n"
-        "                        !lease.isCurrent || !running || generation.get() != myGeneration,\n",
+        "                        !lease.isCurrent || !running || generation.get() != myGeneration,\n"
+        "                )\n"
+        "                return null\n",
         "classify socket creation interrupted by inbound preemption as cancellation",
     )
     replace_once(
