@@ -312,10 +312,6 @@ def patch(base: Path, kit: Path) -> None:
     # or channel construction throws before the old try/finally was entered.
     replace_once(
         client,
-        "        if (!lease.isCurrent) {\n"
-        "            runCatching { socket.close() }\n"
-        "            return\n"
-        "        }\n"
         "        val stream =\n"
         "            StreamDuplexStream(socket.inputStream, socket.outputStream) {\n"
         "                runCatching { socket.close() }\n"
