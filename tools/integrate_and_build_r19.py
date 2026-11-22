@@ -821,8 +821,13 @@ def main() -> None:
         raise InvariantError("Required AirPlay screen lifecycle JUnit XML is missing")
     screen_suite = ET.parse(screen_report_path).getroot()
     screen_cases = screen_suite.findall("testcase")
-    if len(screen_cases) != 2:
-        raise InvariantError(f"R19 requires both AirPlay lifecycle race tests: got {len(screen_cases)}")
+    expected_screen_cases = {
+        "screenTeardownWaitsForAnInFlightScreenSetupResponse",
+        "screenTeardownWaitsForInFlightRecordResponse",
+    }
+    observed_screen_cases = {case.attrib.get("name") for case in screen_cases}
+    if len(screen_cases) != 2 or observed_screen_cases != expected_screen_cases:
+        raise InvariantError(f"R19 AirPlay lifecycle coverage mismatch: {observed_screen_cases}")
     for attr in ("failures", "errors", "skipped"):
         if int(screen_suite.attrib.get(attr, "0")) != 0:
             raise InvariantError(f"R19 AirPlay lifecycle report has {attr} != 0")
