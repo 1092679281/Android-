@@ -209,6 +209,18 @@ class BluetoothSessionArbiterTest {
     }
 
     @Test
+    fun latePreemptionCallbackFailureDoesNotEscapeAcquisitionThread() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val inbound = requireNotNull(gate.acquireInbound())
+        outbound.onPreempted { throw IllegalStateException("late socket cleanup failure") }
+        assertTrue(inbound.isCurrent)
+        outbound.close()
+        assertTrue(inbound.awaitPreviousRetirement(500))
+        inbound.close()
+    }
+
+    @Test
     fun callbackRegisteredAfterRetirementIsNotInvoked() {
         val gate = BluetoothSessionArbiter()
         val outbound = requireNotNull(gate.acquireOutbound())
