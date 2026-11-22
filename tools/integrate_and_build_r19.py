@@ -244,12 +244,13 @@ object BtSessionGate {
         "                    lease.dispatchIfCurrent { synchronized(channelLock) { if (activeChannel === channel) activeSession = session } }\n",
         "register live inbound sessions only",
     )
-    replace_once(
-        server,
-        "                    BtSessionGate.inboundActive = false\n",
-        "",
-        "remove stale inbound teardown flag",
-    )
+    # Both legacy flag resets are obsolete. A lease must stay owned until
+    # runSession actually stops; detachCurrentSession may only close the channel.
+    old_flag = "                    BtSessionGate.inboundActive = false\\n"
+    data = server.read_text(encoding="utf-8")
+    if data.count(old_flag) != 2:
+        raise InvariantError(f"expected 2 legacy inbound flag clears, found {data.count(old_flag)}")
+    server.write_text(data.replace(old_flag, ""), encoding="utf-8")
     replace_once(
         server,
         "            channel.close()\n"
