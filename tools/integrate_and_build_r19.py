@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 import integrate_and_build_r18 as r18
 
 
@@ -286,6 +287,34 @@ def main() -> None:
     os.environ["R18_OUTPUT"] = str(stage)
     r18.main()
 
+    report_path = (
+        Path(os.environ["R7_UPSTREAM"]).resolve()
+        / "app/build/test-results/testStandardDebugUnitTest"
+        / "TEST-com.mcarplay.app.bt.BluetoothSessionArbiterTest.xml"
+    )
+    if not report_path.is_file():
+        raise InvariantError("Required R19 arbiter JUnit XML missing")
+    suite = ET.parse(report_path).getroot()
+    expected = {
+        "onlyOneOutboundAttemptMayOwnControlChannel",
+        "inboundPreemptsUnconfirmedOutboundExactlyOnce",
+        "staleOutboundCleanupCannotReleaseNewInboundOwner",
+        "preemptCallbackRegisteredAfterReplacementStillFiresExactlyOnce",
+        "establishedOutboundCannotBeTakenByIncomingSocket",
+        "secondInboundNeverInterruptsFirstInbound",
+        "oldOutboundCannotConfirmAfterPreemptionAndNewSocketWaitsForRelease",
+        "newInboundMustWaitUntilOldInFlightCallbackFinishes",
+        "competingOutboundStartsAreMutuallyExclusive",
+        "independentInstancesCannotShareLeasesAcrossSessions",
+    }
+    cases = suite.findall("testcase")
+    observed = {case.attrib.get("name") for case in cases}
+    if len(cases) != 10 or observed != expected:
+        raise InvariantError(f"R19 must run exactly 10 arbiter scenarios: got {observed}")
+    for attr in ("failures", "errors", "skipped"):
+        if int(suite.attrib.get(attr, "0")) != 0:
+            raise InvariantError(f"R19 arbiter report has {attr} != 0")
+
     previous = stage / "mcarplay-LaCrosse-R18-identity-snapshot-debug.apk"
     if not previous.is_file() or not zipfile.is_zipfile(previous):
         raise InvariantError("Android build/tests did not produce a valid staged APK")
@@ -295,6 +324,7 @@ def main() -> None:
     shutil.copy2(previous, destination)
     sha = hashlib.sha256(destination.read_bytes()).hexdigest()
     (output / "SHA256SUMS.txt").write_text(f"{sha}  {destination.name}\n", encoding="utf-8")
+    (output / "BLUETOOTH_ARBITER_JUNIT.xml").write_bytes(report_path.read_bytes())
     (output / "REVIEW-SCOPE.md").write_text(
         "R19 independently examines concurrency, identity and protocol-gating. "
         "Real changes: shared atomic RFCOMM ownership, inbound can take an "
