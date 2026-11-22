@@ -67,6 +67,13 @@ jobs:
           R7_UPSTREAM: ${{ github.workspace }}/upstream
           R19_OUTPUT: ${{ runner.temp }}/r19-apk
         run: python3 kit/tools/integrate_and_build_r19.py
+      - name: Assert source review produced no APK
+        if: env.R19_SOURCE_ONLY == '1'
+        run: |
+          if [ -d "${{ runner.temp }}/r19-apk" ] && find "${{ runner.temp }}/r19-apk" -type f -name '*.apk' -print -quit | grep -q .; then
+            echo "APK packaging is forbidden before source finalization" >&2
+            exit 1
+          fi
       - name: Assemble complete patched Android Studio source tree
         if: success()
         env:
