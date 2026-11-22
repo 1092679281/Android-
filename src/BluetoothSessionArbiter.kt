@@ -17,13 +17,24 @@ import java.util.concurrent.TimeUnit
 internal class BluetoothSessionArbiter {
     private val lock = Any()
     private var owner: Lease? = null
+    private var carPlaySessionActive = false
 
     val inboundActive: Boolean get() = synchronized(lock) { owner?.inbound == true }
     val controlActive: Boolean get() = synchronized(lock) { owner != null }
+    val sessionActive: Boolean get() = synchronized(lock) { carPlaySessionActive }
+
+    /** Serialize the AirPlay-session gate with outbound lease acquisition. */
+    fun setSessionActive(active: Boolean) {
+        synchronized(lock) { carPlaySessionActive = active }
+    }
 
     fun acquireOutbound(): Lease? =
         synchronized(lock) {
-            if (owner != null) null else Lease(inbound = false, previous = null).also { owner = it }
+            if (owner != null || carPlaySessionActive) {
+                null
+            } else {
+                Lease(inbound = false, previous = null).also { owner = it }
+            }
         }
 
     fun acquireInbound(): Lease? {
@@ -92,7 +103,7 @@ internal class BluetoothSessionArbiter {
         fun onPreempted(action: () -> Unit) {
             val invokeNow =
                 synchronized(lock) {
-                    if (preempted && !preemptNotified) {
+                    if (preempted && !closed && !preemptNotified) {
                         preemptNotified = true
                         true
                     } else {
@@ -113,7 +124,10 @@ internal class BluetoothSessionArbiter {
                         }
                     }
                 }
-            action?.invoke()
+            // A faulty cleanup callback must not throw out of acquireInbound after
+            // ownership has already transferred. The old lease remains unretired,
+            // so the inbound side will fail closed at its bounded wait.
+            if (action != null) runCatching { action() }
         }
 
         /**
