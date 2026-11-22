@@ -44,6 +44,8 @@ def main() -> None:
     r16.patch = with_r18
     os.environ["R16_OUTPUT"] = str(stage)
     r16.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
 
     previous = stage / "mcarplay-LaCrosse-R16-buick-setup500-diagnostics-debug.apk"
     if not previous.is_file() or not zipfile.is_zipfile(previous):
