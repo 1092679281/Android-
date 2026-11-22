@@ -1,0 +1,137 @@
+name: LaCrosse R19 single-owner Bluetooth RFCOMM adversarial tests
+
+on:
+  pull_request:
+    branches: [feature/r18-buick-bluetooth-identity-snapshot]
+    paths:
+      - 'tools/integrate_and_build_r*.py'
+      - 'src/**'
+      - 'README-R19.md'
+      - '.github/workflows/build-lacrosse-r19-apk.yml'
+  workflow_dispatch:
+    inputs:
+      package_apk:
+        description: 'Only enable after R19 source review is finalized'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Emit the exact sentinel expected by the integration scripts. GitHub's
+      # boolean expression otherwise serializes true as "true", not "1".
+      R19_SOURCE_ONLY: ${{ (github.event_name == 'pull_request' || inputs.package_apk != true) && '1' || '0' }}
+    steps:
+      - name: Assert APK packaging is disabled during source review
+        if: github.event_name == 'pull_request' || inputs.package_apk != true
+        run: test "$R19_SOURCE_ONLY" = "1"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: kit
+      - uses: actions/checkout@v4
+        with:
+          repository: wangxso/mcarplay
+          ref: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK 35
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install 'platforms;android-35' 'build-tools;35.0.0'
+          test -f "$SDK_ROOT/platforms/android-35/android.jar"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Python test dependency
+        run: python3 -m pip install -r upstream/tools/requirements.txt
+      - name: Check Python patch scripts
+        run: |
+          python3 -m py_compile kit/tools/integrate_and_build_r7.py kit/tools/integrate_and_build_r8.py kit/tools/integrate_and_build_r9.py kit/tools/integrate_and_build_r10.py kit/tools/integrate_and_build_r12.py kit/tools/integrate_and_build_r13.py kit/tools/integrate_and_build_r14.py kit/tools/integrate_and_build_r15.py kit/tools/integrate_and_build_r16.py kit/tools/integrate_and_build_r18.py kit/tools/integrate_and_build_r19.py
+      - name: Patch source and run review gates (APK deferred by default)
+        env:
+          R7_UPSTREAM: ${{ github.workspace }}/upstream
+          R19_OUTPUT: ${{ runner.temp }}/r19-apk
+        run: python3 kit/tools/integrate_and_build_r19.py
+      - name: Assert source review produced no APK
+        if: env.R19_SOURCE_ONLY == '1'
+        run: |
+          if [ -d "${{ runner.temp }}/r19-apk" ] && find "${{ runner.temp }}/r19-apk" -type f -name '*.apk' -print -quit | grep -q .; then
+            echo "APK packaging is forbidden before source finalization" >&2
+            exit 1
+          fi
+      - name: Assemble complete patched Android Studio source tree
+        if: success()
+        env:
+          R19_SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p source-package/mcarplay-project source-package/r19-patch-kit
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.gradle/' \
+            --exclude='**/build/' \
+            --exclude='local.properties' \
+            --exclude='*.log' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='.venv/' \
+            upstream/ source-package/mcarplay-project/
+          rsync -a --delete \
+            --exclude='.git/' \
+            kit/ source-package/r19-patch-kit/
+          cat > source-package/SOURCE-MANIFEST.md <<EOF
+          # mcarplay R19 complete source package
+
+          - R19 patch-kit revision: ${R19_SOURCE_REVISION}
+          - Upstream project: wangxso/mcarplay
+          - Upstream pinned commit: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
+          - mcarplay-project/ is the complete upstream Android Studio project after applying the R19 patch and running the successful build/test pipeline.
+          - r19-patch-kit/ contains this repository's source overlays, tests, integration scripts, workflow definitions, and review notes.
+          - Generated build outputs, Gradle caches, local machine configuration, and Git object databases are excluded.
+          - This is source code, not an APK. APK packaging is intentionally deferred until source review is finalized; any test APK will be debug-signed and still requires in-car validation.
+          EOF
+          test -f source-package/mcarplay-project/gradlew
+          test -f source-package/mcarplay-project/app/src/main/java/com/mcarplay/app/bt/BluetoothSessionArbiter.kt
+          test -f source-package/r19-patch-kit/src/BluetoothSessionArbiter.kt
+      - name: Upload complete R19 source package
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R19-complete-source
+          path: source-package/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve regression test reports even when an adversarial test fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LaCrosse-R19-junit-and-lint
+          path: |
+            upstream/app/build/test-results/testStandardDebugUnitTest/
+            upstream/app/build/reports/tests/testStandardDebugUnitTest/
+            upstream/app/build/reports/lint-results-*
+          if-no-files-found: ignore
+          retention-days: 10
+      - name: Upload debug APK only after explicit finalization dispatch
+        if: success() && github.event_name == 'workflow_dispatch' && inputs.package_apk == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: LaCrosse-R19-connection-arbiter-debug
+          path: ${{ runner.temp }}/r19-apk/
+          if-no-files-found: error
+          retention-days: 14

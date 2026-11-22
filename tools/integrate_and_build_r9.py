@@ -101,6 +101,8 @@ def main() -> None:
     r8.integrate_r8 = with_r9
     os.environ["R8_OUTPUT"] = str(staging)
     r8.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     apk = staging / "mcarplay-LaCrosse-R8-ios-latency-touch-debug.apk"
     if not apk.is_file() or not zipfile.is_zipfile(apk):
         raise r8.r7.Blocked("R9 APK missing or invalid")

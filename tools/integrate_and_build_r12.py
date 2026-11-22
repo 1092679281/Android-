@@ -217,6 +217,8 @@ def main() -> None:
     r10.improve_fps=with_r12
     os.environ["R10_OUTPUT"]=str(stage)
     r10.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     apk=stage/"mcarplay-LaCrosse-R10-source60-debug.apk"
     if not apk.is_file() or not zipfile.is_zipfile(apk):
         raise r10.r9.r8.r7.Blocked("R12 APK not verified")

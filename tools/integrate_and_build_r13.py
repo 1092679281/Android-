@@ -242,6 +242,8 @@ def main() -> None:
     r12.patch = with_r13
     os.environ["R12_OUTPUT"] = str(stage)
     r12.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
 
     previous = stage / "mcarplay-LaCrosse-R12-auto-wifi-sync-debug.apk"
     if not previous.is_file() or not zipfile.is_zipfile(previous):
