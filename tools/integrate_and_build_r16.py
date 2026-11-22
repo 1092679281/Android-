@@ -132,6 +132,8 @@ def main() -> None:
     r15.patch = with_r16
     os.environ["R15_OUTPUT"] = str(stage)
     r15.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     previous = stage / "mcarplay-LaCrosse-R15-online-update-debug.apk"
     if not previous.is_file() or not zipfile.is_zipfile(previous):
         raise PatchMismatch("R16 build failed to produce a valid staged APK")
