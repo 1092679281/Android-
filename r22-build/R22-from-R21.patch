@@ -1,0 +1,620 @@
+--- a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+@@ -3,6 +3,7 @@
+ import android.content.Context
+ import com.mcarplay.app.compat.ReceiverDetectionRuntime
+ import com.mcarplay.app.compat.ReceiverObservation
++import com.mcarplay.app.compat.CompatibilityPrefs
+ import com.mcarplay.app.diagnostics.ConnectionDiagnostics
+ import com.mcarplay.app.iap2.Iap2SenderSession
+ import com.mcarplay.app.iap2.ReceiverProfile
+@@ -67,6 +68,7 @@
+                 if (ReceiverDetectionRuntime.isCurrent(observation)) ConnectionDiagnostics.milestoneCurrent(milestone)
+             },
+             unverifiedInvitePending = unverifiedInvitePending,
++            experimentalE2lbDualGroup = CompatibilityPrefs.e2lbDualGroup(context),
+         )
+     onSession(session)
+     onObservation(observation, true)
+--- a/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
++++ b/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
+@@ -11,6 +11,7 @@
+     private const val KEY_PLAIN_FALLBACK = "compat_plain_fallback"
+     private const val KEY_VEHICLE_PRESET = "compat_vehicle_preset"
+     private const val KEY_AUDIO_BASELINE = "compat_audio_baseline"
++    private const val KEY_E2LB_DUAL_GROUP = "e2lb_dual_group_4300_experiment"
+ 
+     private const val KEY_PASSAT_RETURN = "compat_passat_return_strategy"
+ 
+@@ -62,6 +63,15 @@
+             .apply()
+     }
+ 
++    /** E2LB-specific 0x4300 dual-group A/B experiment. OFF unless explicitly selected. */
++    fun e2lbDualGroup(context: Context): Boolean =
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean(KEY_E2LB_DUAL_GROUP, false)
++
++    fun setE2lbDualGroup(context: Context, enabled: Boolean) {
++        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++            .edit().putBoolean(KEY_E2LB_DUAL_GROUP, enabled).apply()
++    }
++
+     /** 帕萨特「回主界面再进」实验策略；默认关，仅用户手动选择时生效。 */
+     fun passatReturnStrategy(context: Context): PassatReturnStrategy =
+         PassatReturnStrategy.fromKey(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_PASSAT_RETURN, null))
+--- a/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+@@ -0,0 +1,34 @@
++package com.mcarplay.app.iap2
++
++import java.util.Locale
++
++/**
++ * Opt-in, E2LB-only 0x4300 wire-shape experiment. No other receiver is changed.
++ * This is NOT known to make E2LB send 0x4301; tests are intentionally A/B.
++ */
++internal object E2lbAvailabilityBodyPolicy {
++    enum class Shape { SINGLE_GROUP, DUAL_GROUP }
++
++    fun select(
++        model: String?,
++        manufacturer: String?,
++        bluetoothMac: String,
++        experimentEnabled: Boolean,
++    ): Shape {
++        val isE2lb = model.equals("E2LB", ignoreCase = true) &&
++            manufacturer.orEmpty().contains("general motors", ignoreCase = true)
++        val macOk = Regex("[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}").matches(bluetoothMac) &&
++            !bluetoothMac.equals("02:00:00:00:00:00", ignoreCase = true)
++        return if (isE2lb && experimentEnabled && macOk) Shape.DUAL_GROUP else Shape.SINGLE_GROUP
++    }
++
++    fun body(shape: Shape, bluetoothMac: String): ByteArray = when (shape) {
++        Shape.SINGLE_GROUP -> Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
++        Shape.DUAL_GROUP -> {
++            val compact = bluetoothMac.replace(":", "").uppercase(Locale.ROOT)
++            val wiredId = "00008110${compact}0000"
++            Iap2Csm.group(0, Iap2Csm.u8(0, 1), Iap2Csm.string(1, wiredId)) +
++                Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac.lowercase(Locale.ROOT)))
++        }
++    }
++}
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+@@ -165,6 +165,29 @@
+ 
+     private var unknownSessionDropped = 0
+ 
++    /** No raw bytes or device identifiers are retained by these parser counters. */
++    data class ParserStats(
++        val detectMarkers: Long,
++        val invalidHeaderChecksums: Long,
++        val invalidPayloadChecksums: Long,
++        val invalidLengths: Long,
++        val discardedNoiseBytes: Long,
++    )
++
++    private var detectMarkers = 0L
++    private var invalidHeaderChecksums = 0L
++    private var invalidPayloadChecksums = 0L
++    private var invalidLengths = 0L
++    private var discardedNoiseBytes = 0L
++
++    fun parserStats(): ParserStats = ParserStats(
++        detectMarkers,
++        invalidHeaderChecksums,
++        invalidPayloadChecksums,
++        invalidLengths,
++        discardedNoiseBytes,
++    )
++
+     private val unacknowledged = ArrayList<Packet>()
+     private val sendBacklog = ArrayDeque<Packet>()
+     private val pendingEvents = ArrayDeque<Event>()
+@@ -348,20 +371,32 @@
+     // ---- 接收解析 ----
+ 
+     private fun parseAvailable(nowMillis: Long): Boolean {
+-        // 丢弃帧头前的杂字节（含对端 marker FF55…）
++        // A DETECT marker is not a broken frame. Preserve a partial FF55 marker
++        // across feed() boundaries so the diagnostic count remains exact.
+         while (receive.size >= 2 &&
+             !(receive[0] == 0xFF.toByte() && receive[1] == 0x5A.toByte())
+         ) {
++            if (receive[0] == MARKER[0] && receive[1] == MARKER[1]) {
++                if (receive.size < MARKER.size) return false
++                if (MARKER.indices.all { receive[it] == MARKER[it] }) {
++                    detectMarkers++
++                    receive.discard(MARKER.size)
++                    continue
++                }
++            }
++            discardedNoiseBytes++
+             receive.discard(1)
+         }
+         if (receive.size < HEADER_BYTES) return false
+         val header = receive.peek(HEADER_BYTES)
+         if (!checksumValid(header)) {
++            invalidHeaderChecksums++
+             receive.discard(1)
+             return true
+         }
+         val length = readU16(header, 2)
+         if (length < HEADER_BYTES) {
++            invalidLengths++
+             receive.discard(1)
+             return true
+         }
+@@ -369,7 +404,10 @@
+         val frame = receive.take(length)
+         val payloadWithChecksum = frame.copyOfRange(HEADER_BYTES, length)
+         if (payloadWithChecksum.isNotEmpty() && !checksumValid(payloadWithChecksum)) {
+-            receive.discard(1)
++            // receive.take(length) ALREADY consumed the whole corrupt frame.
++            // Discarding one more byte would destroy the FF5A header of a
++            // valid frame immediately following it in the same TCP/RFCOMM read.
++            invalidPayloadChecksums++
+             return true
+         }
+         val payload =
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -96,6 +96,8 @@
+     private val onMilestone: (ConnectionMilestone) -> Unit = {},
+     /** 有新邀请但尚无法安全关联当前链路时，保活交由主控请求用户确认。 */
+     private val unverifiedInvitePending: () -> Boolean = { false },
++    /** Explicitly user-enabled E2LB-only diagnostic experiment (default off). */
++    private val experimentalE2lbDualGroup: Boolean = false,
+ ) {
+     /** 从 0x5703 + 0x4301 解析出的接收端信息。 */
+     data class CarPlayEndpoint(
+@@ -1079,13 +1081,14 @@
+     private fun sendDeviceStateGreetings(force: Boolean = false) {
+         if (greetingsSent && !force) return
+         greetingsSent = true
+-        if (Iap2OptionalMessagePolicy.shouldSend(
++        val includeWirelessUpdate =
++            Iap2OptionalMessagePolicy.shouldSend(
+                 Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
+                 accessoryDeclaresReceive(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE),
+                 receiverSignals.model,
+                 receiverSignals.manufacturer,
+             )
+-        ) {
++        if (includeWirelessUpdate) {
+             send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
+         } else {
+             log("iap2 E2LB 实验 SKIP 0x4e0d: 明确未声明可接收（不影响其它车机）")
+@@ -1108,8 +1111,8 @@
+             Iap2Csm.string(0, deviceUuid()),
+         )
+         log(
+-            "iap2 tx=0x4e0d/0x4e0a/0x4e09/0x4e0b/0x4e0c 设备状态问候" +
+-                "（name=$deviceName mac=$bluetoothMac）",
++            "iap2 设备状态问候实际排队=${if (includeWirelessUpdate) "0x4e0d/" else ""}0x4e0a/0x4e09/0x4e0b/0x4e0c" +
++                "（按明示清单过滤可选项；无会话启动保证）",
+         )
+     }
+ 
+@@ -1127,10 +1130,17 @@
+     private fun sendCarPlayAvailability() {
+         if (carPlayAvailabilitySent) return
+         availabilityPeerFramesBefore = channel.peerFrameCount()
++        val availabilityShape = E2lbAvailabilityBodyPolicy.select(
++            receiverSignals.model,
++            receiverSignals.manufacturer,
++            bluetoothMac,
++            experimentalE2lbDualGroup,
++        )
+         sendFireAndForget(
+             Iap2MessageIds.CARPLAY_AVAILABILITY,
+-            Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
++            E2lbAvailabilityBodyPolicy.body(availabilityShape, bluetoothMac),
+         )
++        log("iap2 0x4300 形态=$availabilityShape (E2LB 实验开关=$experimentalE2lbDualGroup；未证实车机已接受)")
+         carPlayAvailabilitySent = true
+         log("iap2 0x4300 已提交链路发送（awaitAck=false）；尚无证据证明车机应用层认可或已开启 CarPlay")
+     }
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+@@ -137,6 +137,16 @@
+         ) { enabled ->
+             CompatibilityPrefs.setAudioBaseline(ctx, enabled)
+             hostToast(getString(if (enabled) R.string.sf_audio_fallback_on else R.string.sf_audio_fallback_off))
++        }
++
++        // E2LB 双标识 0x4300 A/B 实验：只对通用 E2LB 生效，默认关闭。
++        bindToggle(
++            view.findViewById(R.id.btnE2lbDualOn),
++            view.findViewById(R.id.btnE2lbDualOff),
++            CompatibilityPrefs.e2lbDualGroup(ctx),
++        ) { enabled ->
++            CompatibilityPrefs.setE2lbDualGroup(ctx, enabled)
++            hostToast(getString(if (enabled) R.string.r22_e2lb_dual_on else R.string.r22_e2lb_dual_off))
+         }
+ 
+         // 帕萨特「回主界面再进」实验策略：四选一，默认关；仅主页「车型适配」选了大众时才执行
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -271,6 +271,13 @@
+         lock.notifyAll()
+         runCatching { stream.close() }
+         terminatedLatch.countDown()
++        val stats = engine.parserStats()
++        log(
++            "LINK-PARSER: rx DETECT=${stats.detectMarkers} badHeader=${stats.invalidHeaderChecksums} " +
++                "badPayload=${stats.invalidPayloadChecksums} badLength=${stats.invalidLengths} " +
++                "noiseBytes=${stats.discardedNoiseBytes} peerFrames=$receivedPeerFrameCount " +
++                "(counters only, no raw wire payload)",
++        )
+         if (failure != null) {
+             log("LINK closed: ${failure.message}")
+         } else {
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -72,7 +72,10 @@
+     @Volatile
+     var framesRendered = 0L
+         private set
+-    private var inputDropped = 0L
++    private val inputDropped = java.util.concurrent.atomic.AtomicLong(0)
++    private val inputDropsByReason = java.util.concurrent.atomic.AtomicLongArray(4)
++
++    private enum class InputDropReason { NO_BUFFER, NULL_BUFFER, OVERSIZE, CODEC_ERROR }
+     private val resync = IdrResync()
+     private var framesSkippedForIdr = 0L
+ 
+@@ -131,23 +134,19 @@
+         try {
+             val index = codec.dequeueInputBuffer(INPUT_TIMEOUT_US)
+             if (index < 0) {
+-                inputDropped++
+-                if (inputDropped == 1L || inputDropped % 100 == 0L) {
+-                    log("VIDEO: 转码解码器输入繁忙，已丢 $inputDropped 帧（等 CarWith 下一个 IDR 再续）")
+-                }
+-                dropped()
++                dropped(InputDropReason.NO_BUFFER)
+                 return
+             }
+             val buffer =
+                 codec.getInputBuffer(index) ?: run {
+-                    dropped()
++                    dropped(InputDropReason.NULL_BUFFER)
+                     return
+                 }
+             buffer.clear()
+             if (frame.data.size > buffer.capacity()) {
+                 codec.queueInputBuffer(index, 0, 0, lastInputPtsUs, 0)
+                 log("VIDEO: 转码输入帧 ${frame.data.size}B 超出解码缓冲 ${buffer.capacity()}B，丢弃")
+-                dropped()
++                dropped(InputDropReason.OVERSIZE)
+                 return
+             }
+             buffer.put(frame.data)
+@@ -155,12 +154,19 @@
+             codec.queueInputBuffer(index, 0, frame.data.size, lastInputPtsUs, 0)
+         } catch (error: Exception) {
+             if (running.get()) log("VIDEO: 转码解码输入异常 - ${error.message}")
+-            dropped()
++            dropped(InputDropReason.CODEC_ERROR)
+         }
+     }
+ 
+     /** 丢了一个访问单元：后续 P 帧缺参考，等 IDR 并向 CarWith 要关键帧。 */
+-    private fun dropped() {
++    private fun dropped(reason: InputDropReason) {
++        val total = inputDropped.incrementAndGet()
++        inputDropsByReason.incrementAndGet(reason.ordinal)
++        if (total == 1L || total % 100 == 0L) {
++            log("VIDEO: 转码输入丢帧 total=$total busy=${inputDropsByReason.get(0)} " +
++                "null=${inputDropsByReason.get(1)} oversize=${inputDropsByReason.get(2)} " +
++                "codec=${inputDropsByReason.get(3)}（等下一 IDR）")
++        }
+         resync.discontinuity()
+         requestSourceKeyFrameIfDue()
+     }
+@@ -192,7 +198,7 @@
+         }
+         runCatching { released.await(1, TimeUnit.SECONDS) }
+         glThread.quitSafely()
+-        log("VIDEO: 转码管线已停止（共渲染 $framesRendered 帧，输入丢弃 $inputDropped 帧，等 IDR 跳过 $framesSkippedForIdr 帧）")
++        log("VIDEO: 转码管线已停止（共渲染 $framesRendered 帧，输入丢弃 ${inputDropped.get()} 帧，等 IDR 跳过 $framesSkippedForIdr 帧）")
+     }
+ 
+     private fun startDecoder(
+@@ -248,7 +254,7 @@
+ 
+     /** 一行转码管线统计（诊断）：CarWith 输入 → 解码 → 渲染进编码器。 */
+     fun statsLine(): String =
+-        "输入 $framesSubmitted 帧 → 解码 $framesDecoded → 渲染 $framesRendered；输入丢弃 $inputDropped、" +
++        "输入 $framesSubmitted 帧 → 解码 $framesDecoded → 渲染 $framesRendered；输入丢弃 ${inputDropped.get()}、" +
+             "等 IDR 跳过 $framesSkippedForIdr；解码器${if (decoder == null) "未启动" else "运行中"}"
+ 
+     private fun releaseCodec(codec: MediaCodec) {
+--- a/app/src/main/java/com/mcarplay/app/video/TranscodePolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/video/TranscodePolicy.kt
+@@ -78,6 +78,12 @@
+         return true
+     }
+ 
++    /** Reset the IDR wait and request throttle for a wholly new source session. */
++    fun reset() {
++        awaitingIdr = false
++        lastRequestAt = null
++    }
++
+     /** 记一次码流不连续（丢帧 / 入队失败），之后等 IDR。 */
+     fun discontinuity() {
+         awaitingIdr = true
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -133,6 +133,8 @@
+ 
+     /** 透传线程与转码编码线程可能同时写数据口：所有网络写入串行。 */
+     private val writeLock = Any()
++    /** Hardware bitrate configuration must not hold the network write lock. */
++    private val abrApplyLock = Any()
+ 
+     /**
+      * 转码资源发布与 [stop] 互斥：stop 之后才初始化完的编码器 / EGL 由初始化方自己释放。
+@@ -520,7 +522,7 @@
+             encoder = null
+             inputSurface = null
+         }
+-        releaseVideoResources(active, codec, surface)
++        synchronized(abrApplyLock) { releaseVideoResources(active, codec, surface) }
+         if (externalVideoSource != null && streamStatsLogged.compareAndSet(false, true)) {
+             val gate = synchronized(screenOutputGate) { screenOutputGate.summary() }
+             log("VIDEO: 透传码流统计（会话结束）${streamStats.summary()}\n  ↳ 屏幕输出门控：$gate")
+@@ -743,8 +745,19 @@
+         newHeight: Int,
+     ) {
+         if (newWidth <= 0 || newHeight <= 0) return
+-        sourceWidth = (newWidth / 2) * 2
+-        sourceHeight = (newHeight / 2) * 2
++        val roundedWidth = (newWidth / 2) * 2
++        val roundedHeight = (newHeight / 2) * 2
++        if (roundedWidth != sourceWidth || roundedHeight != sourceHeight) {
++            // A new SPS/source generation invalidates the old reference chain.
++            // Reset IDR request throttling but KEEP waiting for a fresh IDR;
++            // an old queued P frame must not be mistaken for a valid new source.
++            synchronized(passthroughDropResync) {
++                passthroughDropResync.reset()
++                passthroughDropResync.discontinuity()
++            }
++        }
++        sourceWidth = roundedWidth
++        sourceHeight = roundedHeight
+         // 转码中画布固定为车机流尺寸；CarWith 尺寸变化交给解码器自适应
+         if (transcoder != null) return
+         width = sourceWidth
+@@ -1154,8 +1167,9 @@
+         size: Int,
+         keyFrame: Boolean,
+         output: java.io.OutputStream,
+-    ): Int =
+-        synchronized(writeLock) {
++    ): Int {
++        var pendingAbr: Triple<MediaCodec, VideoEncoderAbr, VideoEncoderAbr.Decision>? = null
++        val sent = synchronized(writeLock) {
+             if (quiescing.get()) return 0
+             if (!configSent) {
+                 log("VIDEO: 丢弃一帧（config 尚未发送）")
+@@ -1210,6 +1224,26 @@
+             val abr = encoderAbr
+             if (activeCodec != null && abr != null) {
+                 abr.onFrameWritten(header.size + sealed.size, writeNanos, uptimeMs())?.let { decision ->
++                    pendingAbr = Triple(activeCodec, abr, decision)
++                }
++            }
++            framesSent++
++            framesSinceKeepAlive++
++            bytesSinceKeepAlive += plain.size.toLong()
++            if (keyFrame || framesSent <= 3 || framesSent % 150 == 0L) {
++                log("VIDEO: 帧 #$framesSent ${plain.size}B${if (keyFrame) " (key)" else ""} 已发送")
++            }
++            plain.size
++        }
++        // Apply AFTER writeLock: some OEM MediaCodec implementations block for
++        // tens of milliseconds in setParameters(), which previously stalled TCP writes.
++        pendingAbr?.let { (activeCodec, abr, decision) ->
++            synchronized(abrApplyLock) {
++                // Another sender may already have committed this transition.
++                // The codec may also have been retired by stop() since the frame.
++                if (!stopped.get() && !quiescing.get() && encoder === activeCodec &&
++                    encoderAbr === abr && abr.currentBitrate == decision.fromBitrateBps
++                ) {
+                     try {
+                         val params = android.os.Bundle()
+                         params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, decision.bitrateBps)
+@@ -1223,14 +1257,9 @@
+                     }
+                 }
+             }
+-            framesSent++
+-            framesSinceKeepAlive++
+-            bytesSinceKeepAlive += plain.size.toLong()
+-            if (keyFrame || framesSent <= 3 || framesSent % 150 == 0L) {
+-                log("VIDEO: 帧 #$framesSent ${plain.size}B${if (keyFrame) " (key)" else ""} 已发送")
+-            }
+-            plain.size
+-        }
++        }
++        return sent
++    }
+ 
+     /** 128 字节消息头：u32LE body 长度、opcode、NTP 32.32 LE 时间戳，其余为零。 */
+     private fun buildHeader(
+--- a/app/src/main/res/layout/fragment_panel_display.xml
++++ b/app/src/main/res/layout/fragment_panel_display.xml
+@@ -60,7 +60,18 @@
+ 
+         <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_audio_fallback_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+ 
+-        </LinearLayout><LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:background="@drawable/ui_bg_card" android:orientation="vertical" android:padding="16dp"><TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="0dp" android:text="@string/lay_passat_return" android:textColor="@color/ui_text" android:textSize="16sp" android:textStyle="bold" />
++
++        </LinearLayout>
++        <!-- E2LB-only protocol A/B experiment: defaults OFF and never changes other car models. -->
++        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:background="@drawable/ui_bg_card" android:orientation="vertical" android:padding="16dp">
++            <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/r22_e2lb_dual_title" android:textColor="@color/ui_text" android:textSize="16sp" android:textStyle="bold" />
++            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
++                <TextView android:id="@+id/btnE2lbDualOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++                <TextView android:id="@+id/btnE2lbDualOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            </LinearLayout>
++            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/r22_e2lb_dual_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
++        </LinearLayout>
++        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:background="@drawable/ui_bg_card" android:orientation="vertical" android:padding="16dp"><TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="0dp" android:text="@string/lay_passat_return" android:textColor="@color/ui_text" android:textSize="16sp" android:textStyle="bold" />
+ 
+         <HorizontalScrollView android:layout_width="match_parent" android:layout_height="wrap_content" android:fillViewport="false" android:scrollbars="none"><LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -57,4 +57,8 @@
+     <string name="carlife_hu_bridge_start">启动</string>
+     <string name="carlife_hu_bridge_stop">停止</string>
+     <string name="accessibility_description">镜像模式：把车机触摸手势注入手机屏幕，不读取屏幕内容</string>
++    <string name="r22_e2lb_dual_title">E2LB 双标识 CarPlay 实验</string>
++    <string name="r22_e2lb_dual_desc">仅用于别克 E2LB 的 0x4300 报文 A/B 对照。未经实车验证，不保证解决 0x4301 静默；如无改善请关闭。</string>
++    <string name="r22_e2lb_dual_on">E2LB 双标识实验已开启（下次连接生效）</string>
++    <string name="r22_e2lb_dual_off">E2LB 双标识实验已关闭</string>
+ </resources>
+--- a/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
+@@ -0,0 +1,28 @@
++package com.mcarplay.app.iap2
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class E2lbAvailabilityBodyPolicyTest {
++    private val mac = "4C:92:D2:AB:CD:EF"
++
++    @Test fun defaultsOffAndDoesNotAffectAudiOrOtherGm() {
++        assertEquals(E2lbAvailabilityBodyPolicy.Shape.SINGLE_GROUP, E2lbAvailabilityBodyPolicy.select("E2LB", "Saic General Motors", mac, false))
++        assertEquals(E2lbAvailabilityBodyPolicy.Shape.SINGLE_GROUP, E2lbAvailabilityBodyPolicy.select("AUDI", "DELPHI", mac, true))
++        assertEquals(E2lbAvailabilityBodyPolicy.Shape.SINGLE_GROUP, E2lbAvailabilityBodyPolicy.select("A2LL", "General Motors", mac, true))
++        assertEquals(E2lbAvailabilityBodyPolicy.Shape.SINGLE_GROUP, E2lbAvailabilityBodyPolicy.select("E2LB", "General Motors", "02:00:00:00:00:00", true))
++    }
++
++    @Test fun dualGroupEncodesWiredAndLowercaseWirelessIdentifiers() {
++        val shape = E2lbAvailabilityBodyPolicy.select("E2LB", "Saic General Motors", mac, true)
++        assertEquals(E2lbAvailabilityBodyPolicy.Shape.DUAL_GROUP, shape)
++        val params = Iap2Csm.parseParams(E2lbAvailabilityBodyPolicy.body(shape, mac))
++        assertEquals(listOf(0, 1), params.map { it.id })
++        val group0 = Iap2Csm.parseParams(params[0].value)
++        val group1 = Iap2Csm.parseParams(params[1].value)
++        assertEquals("000081104C92D2ABCDEF0000", group0[1].value.toString(Charsets.UTF_8).trimEnd('\u0000'))
++        assertEquals("4c:92:d2:ab:cd:ef", group1[1].value.toString(Charsets.UTF_8).trimEnd('\u0000'))
++        assertTrue(group0[0].value.contentEquals(byteArrayOf(1)))
++    }
++}
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+@@ -8,6 +8,40 @@
+ 
+ /** 两个链路引擎通过直接交换输出字节完成握手与数据往返（无线程、无 I/O）。 */
+ class Iap2LinkEngineTest {
++    @Test
++    fun corruptPayloadFollowedByValidFrameDoesNotLoseTheValidFrame() {
++        val sender = Iap2LinkEngine()
++        val receiver = Iap2LinkEngine()
++        sender.start(0)
++        receiver.start(0)
++        exchangeUntilNormal(sender, receiver)
++        assertTrue(sender.sendControl(Iap2Csm.encode(0x5000), 10))
++        val good = sender.takeOutput()
++        val corrupt = good.clone().apply { this[lastIndex] = (this[lastIndex].toInt() xor 0x01).toByte() }
++        receiver.feed(corrupt + good, 11)
++        val messages = pollControls(receiver)
++        assertEquals(1, messages.size)
++        assertArrayEquals(Iap2Csm.encode(0x5000), messages.single())
++        assertEquals(1L, receiver.parserStats().invalidPayloadChecksums)
++    }
++
++    @Test
++    fun partialDetectAndValidControlFrameRemainAligned() {
++        val sender = Iap2LinkEngine()
++        val receiver = Iap2LinkEngine()
++        sender.start(0)
++        receiver.start(0)
++        exchangeUntilNormal(sender, receiver)
++        assertTrue(sender.sendControl(Iap2Csm.encode(0x5001), 10))
++        val good = sender.takeOutput()
++        val marker = Iap2LinkEngine.MARKER
++        val markersBefore = receiver.parserStats().detectMarkers
++        receiver.feed(marker.copyOfRange(0, 2), 11)
++        receiver.feed(marker.copyOfRange(2, marker.size) + good, 12)
++        assertEquals(markersBefore + 1, receiver.parserStats().detectMarkers)
++        assertEquals(1, pollControls(receiver).size)
++    }
++
+     @Test
+     fun handshakeReachesNormalOnBothSides() {
+         val phone = Iap2LinkEngine()
+--- a/app/src/test/java/com/mcarplay/app/video/TranscodePolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/video/TranscodePolicyTest.kt
+@@ -9,6 +9,18 @@
+ import org.junit.Test
+ 
+ class TranscodePolicyTest {
++    @Test
++    fun resetClearsIdrWaitingAndRequestThrottle() {
++        val gate = IdrResync(requestIntervalMillis = 1000)
++        gate.discontinuity()
++        org.junit.Assert.assertTrue(gate.requestDue(100))
++        org.junit.Assert.assertFalse(gate.admit(false))
++        gate.reset()
++        org.junit.Assert.assertTrue(gate.admit(false))
++        gate.discontinuity()
++        org.junit.Assert.assertTrue(gate.requestDue(101))
++    }
++
+     @Test
+     fun transcodesOnlyWhenSourceDiffersFromStream() {
+         // 帕萨特 2025：CarWith 1920×1140，车机流 1280×720
+--- a/docs/R22-E2LB-FIX-REVIEW.md
++++ b/docs/R22-E2LB-FIX-REVIEW.md
+@@ -0,0 +1,42 @@
++# R22 — E2LB handshake / iAP2 parser and media hardening (EXPERIMENTAL)
++
++Date: 2026-11-22. Base: the exact 683-file `mcarplay-R21-E2LB-adversarial-source-EXPERIMENTAL.zip` previously delivered. This is a source correction, **not** a confirmed vehicle fix or installable APK.
++
++## Corrected
++
++1. **Deterministic iAP2 payload-checksum bug** (`iap2/Iap2LinkEngine.kt`): `receive.take(length)` already consumes a broken frame; removed an additional `receive.discard(1)` which previously consumed the next frame's first `FF` byte. Added regression tests for a broken packet followed by a good packet and a fragmented `FF 55 ...` marker preceding a good packet. Markers, invalid headers, bad payloads, invalid lengths and unframed bytes now have distinct payload-free counters. `Iap2LinkChannel` emits a `LINK-PARSER` summary on termination.
++2. **Truthful E2LB greeting log**: after optional `0x4E0D` is skipped, the summary no longer falsely reports it as sent.
++3. **Opt-in E2LB-only `0x4300` shape experiment**: added two-group encoding with a wired identifier `00008110 + MAC (uppercase, compact) + 0000` and the lowercase wireless MAC in group 1. The current single-group encoding remains the default. A **Display settings → E2LB 双标识 CarPlay 实验** switch can enable it on the *next* connection. The switch is ignored for other receiver models and for an unknown/placeholder Bluetooth identity. This experiment is not evidence that the head unit will send `0x4301`.
++4. **ABR codec update no longer holds network write lock** (`video/VideoSender.kt`). Codec bitrate updates run after frame write/synchronization finishes, under a separate lock also held while releasing the codec, with stale codec/state checks. Hardware `setParameters` must succeed before the ABR model commits; a rejected or stale decision cannot update the model.
++5. **Transcoder input-drop statistics** (`video/CarWithTranscoder.kt`): count all decoder-input loss paths (`NO_BUFFER`, `NULL_BUFFER`, `OVERSIZE`, `CODEC_ERROR`) once each, with totals and reason counts. Previously only the busy/no-buffer branch incremented the counter.
++6. **IDR recovery state reset**: added an explicit `IdrResync.reset()` for new source generations. When source dimensions change, the request throttle resets but the pipeline still waits for a fresh IDR; stale P frames are not admitted.
++
++## Deliberately not changed
++
++- `0x4E0A` language `zh-CN`, greeting ordering and entire-carplay profile inference: no receiver-side evidence yet supports a global change.
++- Always-on `MulticastLock`: R21 already scopes modern NSD publish and discovery to the car Wi-Fi `Network`; modern Android NSD does not universally require a multicast lock. Android 17 vehicle and network-change checks remain outstanding.
++- `AirPlayCrypto.chachaOpen`: the earlier report verified that bad authentication tags were not silently swallowed in R21. No redundant rewrite.
++- `0x4300` dual-group is not forced on by default. Other known tests with E2LB have not proven it solves this receiver-side silence.
++- The application still cannot read the true local Bluetooth MAC on every unprivileged Android build; the current limitation cannot be bypassed by simply granting `BLUETOOTH_CONNECT`.
++
++## Tests actually executed here
++
++- 23 Kotlin/JVM test methods: iAP2 link negotiation/ACK/duplication and checksum recovery, E2LB dual-group payload policy, ABR model state and rejection handling. **23 PASS / 0 FAIL**, compiled and run with the locally available Kotlin 1.9 CLI and minimal JUnit API shims (not the Android Gradle test runner).
++- Additional actual Kotlin parser/protocol smoke runner: 15 PASS / 0 FAIL; Kotlin 1.9 compatibility adapter is only for existing Kotlin-2 `ArrayDeque.addLast` in the isolated smoke compilation, **production source untouched**.
++- Python tool suite: **87 PASS / 0 FAIL**.
++- Android XML resources/layout: both parse.
++- R21 baseline compared byte-for-byte against original R21 ZIP: all 683 original files matched before modifications.
++
++### Unavailable/blocked verification
++
++- `./gradlew --offline --no-daemon :app:testStandardDebugUnitTest` cannot start: local Gradle 8.10.2 distribution absent and wrapper fails DNS resolution at `services.gradle.org`. Android SDK, Android lint and APK compilation were not run here. **Do not assume this source builds cleanly on Android until CI is run.**
++- E2LB parking-condition vehicle validation has not been run. The observed 2026-11-22 failure was already upstream of screen/audio. It remains necessary to capture receiver `0x4301`, `_carplay-ctrl` invite, AirPlay discovery and `SETUP 200`, and then verify picture/sound/touch.
++
++## A/B validation in parked vehicle
++
++1. Install a CI-verified test APK from this source only after checking package/signing; enable the same car Wi-Fi and Bluetooth. Leave E2LB dual-group switch **off** in first attempt. Export redacted log.
++2. Enable `E2LB 双标识 CarPlay 实验` under Display settings, reconnect and export another log.
++3. Compare `iap2 0x4300 形态=...`, `LINK-PARSER`, `0x4301`, ctrl invite count, `_airplay._tcp` discovery, SETUP status. A `pair-verify 200` without `SETUP 200` is not full CarPlay activation. Do not force repeated SETUP to guessed gateway:7000.
++4. If dual-group doesn't help, turn the switch **off** and keep the source's R20/R21 fallback intact.
++
++The repository's previous R20/R21 ZIPs and APKs were not overwritten; changes exist only in this R22 source copy.
