@@ -111,7 +111,13 @@ internal class BluetoothSessionArbiter {
                         false
                     }
                 }
-            if (invokeNow) action()
+            if (invokeNow) {
+                try {
+                    action()
+                } catch (_: Exception) {
+                    // The new owner still proceeds only after the old lease retires.
+                }
+            }
         }
 
         internal fun deliverPreemption() {
@@ -127,7 +133,13 @@ internal class BluetoothSessionArbiter {
             // A faulty cleanup callback must not throw out of acquireInbound after
             // ownership has already transferred. The old lease remains unretired,
             // so the inbound side will fail closed at its bounded wait.
-            if (action != null) runCatching { action() }
+            if (action != null) {
+                try {
+                    action()
+                } catch (_: Exception) {
+                    // The new owner still fails closed if the old operation cannot retire.
+                }
+            }
         }
 
         /**
