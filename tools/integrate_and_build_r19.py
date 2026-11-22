@@ -28,6 +28,13 @@ def patch(base: Path, kit: Path) -> None:
     copy(kit, base, "BluetoothSessionArbiterTest.kt", "app/src/test/java/com/mcarplay/app/bt/BluetoothSessionArbiterTest.kt")
 
     client = base / "app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt"
+    airplay = base / "app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt"
+    copy(
+        kit,
+        base,
+        "AirPlayScreenLifecycleConcurrencyTest.kt",
+        "app/src/test/java/com/mcarplay/app/airplay/AirPlayScreenLifecycleConcurrencyTest.kt",
+    )
 
     # A lease is acquired before starting BluetoothSocket.connect(), not after:
     # inbound calls may arrive during SDP or while an outgoing socket is blocked.
@@ -362,6 +369,221 @@ def patch(base: Path, kit: Path) -> None:
         "            runCatching { socket.close() }\n"
         "            runCatching { log(\"BT-C: 本轮会话结束（客户端仍在运行，将自动重连）\") }\n",
         "always retire socket and optional channel",
+    )
+
+    # Serialize state-changing AirPlay lifecycle operations. SETUP/RECORD/TEARDOWN
+    # used to race because stream UUID and activation state were updated after RTSP
+    # responses while stop/recovery could run concurrently.
+    replace_once(
+        airplay,
+        "    private val activation = AirPlayActivationState()\n",
+        "    private val activation = AirPlayActivationState()\n"
+        "    private val screenLifecycleLock = java.util.concurrent.locks.ReentrantLock()\n"
+        "\n"
+        "    private fun <T> withScreenLifecycleLock(block: () -> T): T {\n"
+        "        screenLifecycleLock.lock()\n"
+        "        return try { block() } finally { screenLifecycleLock.unlock() }\n"
+        "    }\n",
+        "add a reentrant lock for SETUP/RECORD/TEARDOWN lifecycle",
+    )
+    replace_once(
+        airplay,
+        "    fun runSetup(): SetupInfo? {\n",
+        "    fun runSetup(): SetupInfo? = withScreenLifecycleLock { runSetupLocked() }\n"
+        "\n"
+        "    private fun runSetupLocked(): SetupInfo? {\n",
+        "serialize initial session SETUP with screen lifecycle",
+    )
+    replace_once(
+        airplay,
+        "    fun runScreenStream(\n"
+        "        sessionKey: ByteArray?,\n"
+        "        displayUuid: String? = null,\n"
+        "    ): ScreenStreamInfo? {\n",
+        "    fun runScreenStream(\n"
+        "        sessionKey: ByteArray?,\n"
+        "        displayUuid: String? = null,\n"
+        "    ): ScreenStreamInfo? = withScreenLifecycleLock { runScreenStreamLocked(sessionKey, displayUuid) }\n"
+        "\n"
+        "    private fun runScreenStreamLocked(\n"
+        "        sessionKey: ByteArray?,\n"
+        "        displayUuid: String? = null,\n"
+        "    ): ScreenStreamInfo? {\n",
+        "serialize screen SETUP with teardown and RECORD",
+    )
+    replace_once(
+        airplay,
+        "    fun teardownScreenStream(): Boolean {\n",
+        "    fun teardownScreenStream(): Boolean = withScreenLifecycleLock { teardownScreenStreamLocked() }\n"
+        "\n"
+        "    private fun teardownScreenStreamLocked(): Boolean {\n",
+        "serialize screen stream teardown",
+    )
+    replace_once(
+        airplay,
+        "    fun teardownSession(): Boolean {\n",
+        "    fun teardownSession(): Boolean = withScreenLifecycleLock { teardownSessionLocked() }\n"
+        "\n"
+        "    private fun teardownSessionLocked(): Boolean {\n",
+        "serialize full session teardown",
+    )
+    replace_once(
+        airplay,
+        "    fun enableActivationGate() {\n"
+        "        activationGateEnabled = true\n"
+        "        activation.reset()\n"
+        "    }\n",
+        "    fun enableActivationGate() = withScreenLifecycleLock {\n"
+        "        activationGateEnabled = true\n"
+        "        activation.reset()\n"
+        "    }\n",
+        "serialize activation gate initialization",
+    )
+    replace_once(
+        airplay,
+        "    fun confirmVideoDataPortConnected(): Boolean {\n",
+        "    fun confirmVideoDataPortConnected(): Boolean = withScreenLifecycleLock {\n",
+        "serialize video data-port confirmation",
+    )
+    replace_once(
+        airplay,
+        "    fun record(\n"
+        "        timeoutMillis: Int = 10_000,\n"
+        "        force: Boolean = false,\n"
+        "    ): Boolean {\n",
+        "    fun record(\n"
+        "        timeoutMillis: Int = 10_000,\n"
+        "        force: Boolean = false,\n"
+        "    ): Boolean = withScreenLifecycleLock { recordLocked(timeoutMillis, force) }\n"
+        "\n"
+        "    private fun recordLocked(\n"
+        "        timeoutMillis: Int = 10_000,\n"
+        "        force: Boolean = false,\n"
+        "    ): Boolean {\n",
+        "serialize RECORD with screen teardown and re-setup",
+    )
+
+    # close() must close the socket BEFORE waiting for the lifecycle lock so an
+    # in-flight RTSP request wakes up and releases that lock.
+    replace_once(
+        airplay,
+        "    fun close() {\n"
+        "        sessionSetupAccepted = false\n"
+        "        screenStreamUuid = null\n"
+        "        activation.reset()\n",
+        "    fun close() {\n",
+        "defer activation reset until transport has been interrupted",
+    )
+    replace_once(
+        airplay,
+        "            runCatching { closing.first?.close() }\n"
+        "            activeHost = null\n",
+        "            runCatching { closing.first?.close() }\n"
+        "            withScreenLifecycleLock {\n"
+        "                synchronized(this) {\n"
+        "                    sessionSetupAccepted = false\n"
+        "                    screenStreamUuid = null\n"
+        "                    activation.reset()\n"
+        "                }\n"
+        "            }\n"
+        "            activeHost = null\n",
+        "reset activation only after pending RTSP work has been interrupted",
+    )
+
+    # A stop arriving while a successful SETUP response is in flight must not
+    # resurrect a local active state after the stop path has already begun.
+    replace_once(
+        airplay,
+        "        modesAckCounts.clear()\n"
+        "        activation.reset()\n"
+        "        sessionSetupAccepted = false\n"
+        "        screenStreamUuid = null\n"
+        "        recordAccepted = false\n",
+        "        val canStart =\n"
+        "            synchronized(this) {\n"
+        "                if (sessionStopping || socket?.isClosed != false) {\n"
+        "                    false\n"
+        "                } else {\n"
+        "                    modesAckCounts.clear()\n"
+        "                    activation.reset()\n"
+        "                    sessionSetupAccepted = false\n"
+        "                    screenStreamUuid = null\n"
+        "                    recordAccepted = false\n"
+        "                    true\n"
+        "                }\n"
+        "            }\n"
+        "        if (!canStart) {\n"
+        "            log(\"AIRPLAY: SETUP 被阻止：控制通道已关闭或会话正在停止\")\n"
+        "            return null\n"
+        "        }\n",
+        "reject SETUP start after stop and synchronize activation reset",
+    )
+    replace_once(
+        airplay,
+        "        sessionSetupAccepted = true\n"
+        "        activation.sessionSetupAccepted()\n",
+        "        val activated =\n"
+        "            synchronized(this) {\n"
+        "                if (sessionStopping || socket?.isClosed != false) {\n"
+        "                    false\n"
+        "                } else {\n"
+        "                    sessionSetupAccepted = true\n"
+        "                    activation.sessionSetupAccepted()\n"
+        "                    true\n"
+        "                }\n"
+        "            }\n"
+        "        if (!activated) {\n"
+        "            log(\"AIRPLAY: SETUP 应答晚到但会话已停止——发送 TEARDOWN 清理\")\n"
+        "            sendTeardown(linkedMapOf(), \"停止期间完成的会话 SETUP\")\n"
+        "            return null\n"
+        "        }\n",
+        "do not activate an AirPlay session after a concurrent stop",
+    )
+    replace_once(
+        airplay,
+        "        if (activationGateEnabled && (!sessionSetupAccepted || !activation.canSetupScreen())) {\n"
+        "            log(\"AIRPLAY: 初始 SETUP 尚未确认——拒绝提前发送屏幕流 SETUP\")\n"
+        "            return null\n"
+        "        }\n",
+        "        val canStartScreen =\n"
+        "            synchronized(this) {\n"
+        "                !sessionStopping && socket?.isClosed == false &&\n"
+        "                    (!activationGateEnabled || (sessionSetupAccepted && activation.canSetupScreen()))\n"
+        "            }\n"
+        "        if (!canStartScreen) {\n"
+        "            log(\"AIRPLAY: 当前会话未就绪或正在停止——拒绝屏幕流 SETUP\")\n"
+        "            return null\n"
+        "        }\n",
+        "guard screen SETUP against concurrent stop",
+    )
+    replace_once(
+        airplay,
+        "        armMib3VirtualLink()\n"
+        "        screenStreamUuid = streamUuid\n"
+        "        if (activationGateEnabled && !activation.screenSetupAccepted()) {\n"
+        "            log(\"AIRPLAY: 屏幕流 SETUP 时序冲突——拒绝后续 RECORD\")\n"
+        "            return null\n"
+        "        }\n",
+        "        val activated =\n"
+        "            synchronized(this) {\n"
+        "                if (sessionStopping || socket?.isClosed != false) {\n"
+        "                    false\n"
+        "                } else {\n"
+        "                    val stageAccepted = !activationGateEnabled || activation.screenSetupAccepted()\n"
+        "                    if (stageAccepted) screenStreamUuid = streamUuid\n"
+        "                    stageAccepted\n"
+        "                }\n"
+        "            }\n"
+        "        if (!activated) {\n"
+        "            log(\"AIRPLAY: 屏幕流 SETUP 应答晚到或状态已变化——拒绝激活并清理远端流\")\n"
+        "            sendTeardown(\n"
+        "                linkedMapOf(\"streams\" to listOf(linkedMapOf<String, Any?>(\"type\" to SCREEN_STREAM_TYPE, \"uuid\" to streamUuid))),\n"
+        "                \"停止期间完成的屏幕流\",\n"
+        "            )\n"
+        "            return null\n"
+        "        }\n"
+        "        armMib3VirtualLink()\n",
+        "atomically publish accepted screen UUID or tear down late remote stream",
     )
 
     replace_once(
