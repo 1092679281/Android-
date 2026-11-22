@@ -367,11 +367,7 @@ def patch(base: Path, kit: Path) -> None:
     replace_once(
         client,
         "    private fun runSession(socket: BluetoothSocket) {\n",
-        "    private fun runSession(socket: BluetoothSocket, lease: BluetoothSessionArbiter.Lease) {\n"
-        "        if (!lease.isCurrent) {\n"
-        "            runCatching { socket.close() }\n"
-        "            return\n"
-        "        }\n",
+        "    private fun runSession(socket: BluetoothSocket, lease: BluetoothSessionArbiter.Lease) {\n",
         "bound outbound protocol to live lease",
     )
     replace_once(
