@@ -254,7 +254,7 @@ object BtSessionGate {
     )
     # Both legacy flag resets are obsolete. A lease must stay owned until
     # runSession actually stops; detachCurrentSession may only close the channel.
-    old_flag = "                    BtSessionGate.inboundActive = false\\n"
+    old_flag = "                    BtSessionGate.inboundActive = false\n"
     data = server.read_text(encoding="utf-8")
     if data.count(old_flag) != 2:
         raise InvariantError(f"expected 2 legacy inbound flag clears, found {data.count(old_flag)}")
