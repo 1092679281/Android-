@@ -509,7 +509,7 @@ def patch(base: Path, kit: Path) -> None:
         "        recordAccepted = false\n",
         "        val canStart =\n"
         "            synchronized(this) {\n"
-        "                if (sessionStopping || socket?.isClosed != false) {\n"
+        "                if (sessionStopping) {\n"
         "                    false\n"
         "                } else {\n"
         "                    modesAckCounts.clear()\n"
@@ -521,7 +521,7 @@ def patch(base: Path, kit: Path) -> None:
         "                }\n"
         "            }\n"
         "        if (!canStart) {\n"
-        "            log(\"AIRPLAY: SETUP 被阻止：控制通道已关闭或会话正在停止\")\n"
+        "            log(\"AIRPLAY: SETUP 被阻止：会话正在停止\")\n"
         "            return null\n"
         "        }\n",
         "reject SETUP start after stop and synchronize activation reset",
