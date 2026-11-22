@@ -46,3 +46,39 @@ path.write_text(source, encoding='utf-8')
 replacements += 1
 assert replacements == 13, replacements
 print(f'Fixed {replacements} inherited no-consecutive-comments formatting issues')
+
+
+# ktlint requires a blank separator between ordinary block and KDoc/EOL comments.
+BLANK_BEFORE = {
+    'app/src/main/java/com/mcarplay/app/SessionController.kt': '// 40s 总窗 =',
+    'app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt': '/** 链路断开：同时携带 RFCOMM',
+    'app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt': '/** 链路断开：同时携带 RFCOMM',
+    'app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt': '// 默认**关**',
+    'app/src/main/java/com/mcarplay/app/shizuku/CarInputServiceImpl.kt': '// BlockedPrivateApi/DEPRECATION',
+    'app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt': '// 预算按字节计。',
+}
+for rel, marker in BLANK_BEFORE.items():
+    path = ROOT / rel
+    text = path.read_text(encoding='utf-8')
+    if text.count(marker) != 1:
+        raise RuntimeError(f'Nonunique comment separator marker: {rel}')
+    pos = text.index(marker)
+    line_start = text.rfind('\n', 0, pos)
+    if line_start < 0 or text[line_start + 1:pos].strip():
+        raise RuntimeError(f'Expected indented comment: {rel}')
+    text = text[:line_start + 1] + '\n' + text[line_start + 1:]
+    path.write_text(text, encoding='utf-8')
+
+path = ROOT / 'app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt'
+text = path.read_text(encoding='utf-8')
+marker = '// ---- 事件通道命令发送（对照 DiPlay sendCommandLocked）----'
+if text.count(marker) != 1:
+    raise RuntimeError('Missing unique AirPlay event-command marker')
+pos = text.index(marker)
+previous = text.rfind('/**', 0, pos)
+end = text.find('*/', previous)
+if previous < 0 or end < 0 or end >= pos:
+    raise RuntimeError('Expected preceding AirPlay event-command KDoc')
+text = text[:previous] + '/*' + text[previous + 3:]
+path.write_text(text, encoding='utf-8')
+print('Fixed 7 additional comment-adjacency warnings')
