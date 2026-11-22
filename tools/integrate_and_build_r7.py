@@ -282,6 +282,34 @@ def main():
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(kit / "src" / name, destination)
 
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        # Source review must never produce an installable APK. Keep the complete
+        # compile/test/lint gates, but defer all packaging until the user freezes R19.
+        cmd = [
+            "bash", "./gradlew", "--no-daemon", "spotlessApply", "spotlessCheck",
+            ":app:testStandardDebugUnitTest", ":app:lintStandardDebug",
+        ]
+        print("+", " ".join(cmd), flush=True)
+        subprocess.run(cmd, cwd=base, check=True)
+        remote_cmd = [
+            "bash", "./gradlew", "--no-daemon", ":app:testRemoteDebugUnitTest",
+            "--tests", "com.mcarplay.app.bridge.*",
+        ]
+        print("+", " ".join(remote_cmd), flush=True)
+        subprocess.run(remote_cmd, cwd=base, check=True)
+        python_tests = [
+            sys.executable, "-m", "unittest", "discover",
+            "-s", "tools", "-p", "test_*.py",
+        ]
+        subprocess.run(python_tests, cwd=base, check=True)
+        subprocess.run(
+            ["bash", "-lc", "node --test tools/debug-bridge/*.test.mjs"],
+            cwd=base,
+            check=True,
+        )
+        print("R19 source-only validation PASS; no APK assembled", flush=True)
+        return
+
     cmd = ["bash", "./gradlew", "--no-daemon", "spotlessApply", "spotlessCheck",
            ":app:testStandardDebugUnitTest", ":app:lintStandardDebug", ":app:assembleStandardDebug"]
     print("+", " ".join(cmd), flush=True)
