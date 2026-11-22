@@ -1,0 +1,144 @@
+package com.mcarplay.app.bt
+
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+
+/** Independent adversarial tests: no platform Bluetooth APIs or mocked successes. */
+class BluetoothSessionArbiterTest {
+    @Test
+    fun onlyOneOutboundAttemptMayOwnControlChannel() {
+        val gate = BluetoothSessionArbiter()
+        val owner = requireNotNull(gate.acquireOutbound())
+        assertNull(gate.acquireOutbound())
+        assertTrue(gate.controlActive)
+        assertFalse(gate.inboundActive)
+        owner.close()
+        assertNotNull(gate.acquireOutbound()?.also { it.close() })
+    }
+
+    @Test
+    fun inboundPreemptsUnconfirmedOutboundExactlyOnce() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val closes = AtomicInteger()
+        outbound.onPreempted { closes.incrementAndGet() }
+        val inbound = requireNotNull(gate.acquireInbound())
+        assertFalse(outbound.isCurrent)
+        assertTrue(inbound.isCurrent)
+        assertTrue(gate.inboundActive)
+        assertTrue(closes.get() == 1)
+        assertFalse(inbound.awaitPreviousRetirement(10))
+        outbound.close()
+        assertTrue(inbound.awaitPreviousRetirement(500))
+        inbound.close()
+        assertFalse(gate.controlActive)
+    }
+
+    @Test
+    fun staleOutboundCleanupCannotReleaseNewInboundOwner() {
+        val gate = BluetoothSessionArbiter()
+        val old = requireNotNull(gate.acquireOutbound())
+        val inbound = requireNotNull(gate.acquireInbound())
+        old.close()
+        old.close()
+        assertTrue(inbound.isCurrent)
+        assertTrue(gate.inboundActive)
+        assertNull(gate.acquireOutbound())
+        inbound.close()
+        assertFalse(gate.inboundActive)
+    }
+
+    @Test
+    fun preemptCallbackRegisteredAfterReplacementStillFiresExactlyOnce() {
+        val gate = BluetoothSessionArbiter()
+        val old = requireNotNull(gate.acquireOutbound())
+        val inbound = requireNotNull(gate.acquireInbound())
+        val count = AtomicInteger()
+        old.onPreempted { count.incrementAndGet() }
+        old.onPreempted { count.incrementAndGet() }
+        assertTrue(count.get() == 1)
+        old.close()
+        inbound.close()
+    }
+
+    @Test
+    fun establishedOutboundCannotBeTakenByIncomingSocket() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        assertTrue(outbound.confirm())
+        assertNull(gate.acquireInbound())
+        assertTrue(outbound.isCurrent)
+        outbound.close()
+        assertNotNull(gate.acquireInbound()?.also { it.close() })
+    }
+
+    @Test
+    fun secondInboundNeverInterruptsFirstInbound() {
+        val gate = BluetoothSessionArbiter()
+        val first = requireNotNull(gate.acquireInbound())
+        assertNull(gate.acquireInbound())
+        assertTrue(first.isCurrent)
+        first.close()
+        assertNotNull(gate.acquireInbound()?.also { it.close() })
+    }
+
+    @Test
+    fun oldOutboundCannotConfirmAfterPreemptionAndNewSocketWaitsForRelease() {
+        val gate = BluetoothSessionArbiter()
+        val outgoing = requireNotNull(gate.acquireOutbound())
+        val incoming = requireNotNull(gate.acquireInbound())
+        assertFalse(outgoing.confirm())
+        assertFalse(incoming.awaitPreviousRetirement(1))
+        outgoing.close()
+        assertTrue(incoming.awaitPreviousRetirement(100))
+        incoming.close()
+    }
+
+    @Test
+    fun competingOutboundStartsAreMutuallyExclusive() {
+        val gate = BluetoothSessionArbiter()
+        val start = CountDownLatch(1)
+        val acquired = AtomicInteger()
+        val finish = CountDownLatch(1)
+        val threads =
+            (1..12).map {
+                thread(start = true) {
+                    if (start.await(3, TimeUnit.SECONDS)) {
+                        val lease = gate.acquireOutbound()
+                        if (lease != null) {
+                            acquired.incrementAndGet()
+                            finish.await(3, TimeUnit.SECONDS)
+                            lease.close()
+                        }
+                    }
+                }
+            }
+        start.countDown()
+        Thread.sleep(100)
+        assertTrue("At most one simultaneous owner", acquired.get() == 1)
+        finish.countDown()
+        threads.forEach { it.join(3_000) }
+        assertFalse(gate.controlActive)
+    }
+
+    @Test
+    fun independentInstancesCannotShareLeasesAcrossSessions() {
+        val a = BluetoothSessionArbiter()
+        val b = BluetoothSessionArbiter()
+        val aLease = requireNotNull(a.acquireOutbound())
+        val bLease = requireNotNull(b.acquireOutbound())
+        assertTrue(aLease.isCurrent)
+        assertTrue(bLease.isCurrent)
+        aLease.close()
+        assertTrue(bLease.isCurrent)
+        bLease.close()
+    }
+}
