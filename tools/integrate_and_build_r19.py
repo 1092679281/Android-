@@ -117,12 +117,12 @@ def patch(base: Path, kit: Path) -> None:
         "                onLinkClosed,\n"
         "                onPreEndpointFailure,\n",
         "                { endpoint ->\n"
-        "                    if (lease.isCurrent && lease.confirm()) onEndpoint(endpoint)\n"
+        "                    lease.dispatchIfCurrent { if (lease.confirm()) onEndpoint(endpoint) }\n"
         "                },\n"
-        "                { credentials -> if (lease.isCurrent) onWifiCredentials(credentials) },\n"
-        "                { endpoint -> if (lease.isCurrent) onEndpointUpdate(endpoint) },\n"
-        "                { observation, peer -> if (lease.isCurrent) onLinkClosed(observation, peer) },\n"
-        "                { reason, peer -> if (lease.isCurrent) onPreEndpointFailure(reason, peer) },\n",
+        "                { credentials -> lease.dispatchIfCurrent { onWifiCredentials(credentials) } },\n"
+        "                { endpoint -> lease.dispatchIfCurrent { onEndpointUpdate(endpoint) } },\n"
+        "                { observation, peer -> lease.dispatchIfCurrent { onLinkClosed(observation, peer) } },\n"
+        "                { reason, peer -> lease.dispatchIfCurrent { onPreEndpointFailure(reason, peer) } },\n",
         "prevent stale outgoing callbacks from altering active vehicle session",
     )
     replace_once(
@@ -130,15 +130,15 @@ def patch(base: Path, kit: Path) -> None:
         "                onGeneration,\n"
         "                peerAddress = socket.remoteDevice?.address,\n"
         "                onObservation = onObservation,\n",
-        "                { generation -> if (lease.isCurrent) onGeneration(generation) },\n"
+        "                { generation -> lease.dispatchIfCurrent { onGeneration(generation) } },\n"
         "                peerAddress = socket.remoteDevice?.address,\n"
-        "                onObservation = { observation, active -> if (lease.isCurrent) onObservation(observation, active) },\n",
+        "                onObservation = { observation, active -> lease.dispatchIfCurrent { onObservation(observation, active) } },\n",
         "ignore old outbound observation data",
     )
     replace_once(
         client,
         "                onSession = { session -> if (activeChannel.get() === channel) activeSession.set(channel to session) },\n",
-        "                onSession = { session -> if (lease.isCurrent && activeChannel.get() === channel) activeSession.set(channel to session) },\n",
+        "                onSession = { session -> lease.dispatchIfCurrent { if (activeChannel.get() === channel) activeSession.set(channel to session) } },\n",
         "ensure outbound activeSession belongs to lease",
     )
 
@@ -219,11 +219,11 @@ object BtSessionGate {
         "                onEndpointUpdate,\n"
         "                onLinkClosed,\n"
         "                onPreEndpointFailure,\n",
-        "                { endpoint -> if (lease.isCurrent) onEndpoint(endpoint) },\n"
-        "                { credentials -> if (lease.isCurrent) onWifiCredentials(credentials) },\n"
-        "                { endpoint -> if (lease.isCurrent) onEndpointUpdate(endpoint) },\n"
-        "                { observation, peer -> if (lease.isCurrent) onLinkClosed(observation, peer) },\n"
-        "                { reason, peer -> if (lease.isCurrent) onPreEndpointFailure(reason, peer) },\n",
+        "                { endpoint -> lease.dispatchIfCurrent { onEndpoint(endpoint) } },\n"
+        "                { credentials -> lease.dispatchIfCurrent { onWifiCredentials(credentials) } },\n"
+        "                { endpoint -> lease.dispatchIfCurrent { onEndpointUpdate(endpoint) } },\n"
+        "                { observation, peer -> lease.dispatchIfCurrent { onLinkClosed(observation, peer) } },\n"
+        "                { reason, peer -> lease.dispatchIfCurrent { onPreEndpointFailure(reason, peer) } },\n",
         "prevent stale inbound callbacks",
     )
     replace_once(
@@ -232,16 +232,16 @@ object BtSessionGate {
         "                peerAddress = socket.remoteDevice?.address,\n"
         "                observation = observation,\n"
         "                onObservation = onObservation,\n",
-        "                { generation -> if (lease.isCurrent) onGeneration(generation) },\n"
+        "                { generation -> lease.dispatchIfCurrent { onGeneration(generation) } },\n"
         "                peerAddress = socket.remoteDevice?.address,\n"
         "                observation = observation,\n"
-        "                onObservation = { activeObservation, active -> if (lease.isCurrent) onObservation(activeObservation, active) },\n",
+        "                onObservation = { activeObservation, active -> lease.dispatchIfCurrent { onObservation(activeObservation, active) } },\n",
         "prevent stale inbound generation/state",
     )
     replace_once(
         server,
         "                    synchronized(channelLock) { if (activeChannel === channel) activeSession = session }\n",
-        "                    synchronized(channelLock) { if (lease.isCurrent && activeChannel === channel) activeSession = session }\n",
+        "                    lease.dispatchIfCurrent { synchronized(channelLock) { if (activeChannel === channel) activeSession = session } }\n",
         "register live inbound sessions only",
     )
     replace_once(
