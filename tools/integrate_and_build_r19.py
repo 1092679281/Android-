@@ -183,6 +183,159 @@ def patch(base: Path, kit: Path) -> None:
         "            }\n",
         "guard socket-to-protocol transition and lease lifetime",
     )
+    # Register cancellation against the exact socket after creation. This closes
+    # the race where inbound wins before currentSocket is populated.
+    replace_once(
+        client,
+        "    private fun tryConnect(\n"
+        "        device: BluetoothDevice,\n"
+        "        name: String,\n"
+        "        myGeneration: Long,\n"
+        "        diagnosticEpoch: Long,\n"
+        "    ): BluetoothSocket? {\n",
+        "    private fun tryConnect(\n"
+        "        device: BluetoothDevice,\n"
+        "        name: String,\n"
+        "        myGeneration: Long,\n"
+        "        diagnosticEpoch: Long,\n"
+        "        lease: BluetoothSessionArbiter.Lease,\n"
+        "    ): BluetoothSocket? {\n",
+        "bind RFCOMM connect attempt to its lease",
+    )
+    replace_once(
+        client,
+        "        currentSocket.set(socket)\n"
+        "        if (!running || generation.get() != myGeneration) {\n",
+        "        lease.onPreempted {\n"
+        "            currentSocket.compareAndSet(socket, null)\n"
+        "            runCatching { socket.close() }\n"
+        "            runCatching { activeChannel.get()?.close() }\n"
+        "        }\n"
+        "        currentSocket.set(socket)\n"
+        "        if (!lease.isCurrent || !running || generation.get() != myGeneration) {\n",
+        "register exact socket cancellation before blocking connect",
+    )
+    replace_once(
+        client,
+        "            socket.connect()\n"
+        "            diagnostics.connectFinished(trace, cancelled = !running || generation.get() != myGeneration)\n"
+        "            inboundWait.connected(device.address)\n"
+        "            socket\n",
+        "            socket.connect()\n"
+        "            if (!lease.isCurrent || !running || generation.get() != myGeneration) {\n"
+        "                currentSocket.compareAndSet(socket, null)\n"
+        "                runCatching { socket.close() }\n"
+        "                diagnostics.connectFinished(trace, cancelled = true)\n"
+        "                return null\n"
+        "            }\n"
+        "            diagnostics.connectFinished(trace, cancelled = false)\n"
+        "            inboundWait.connected(device.address)\n"
+        "            socket\n",
+        "reject socket success after preemption or stop",
+    )
+    replace_once(
+        client,
+        "        } catch (error: SecurityException) {\n"
+        "            currentSocket.compareAndSet(socket, null)\n"
+        "            runCatching { socket.close() }\n"
+        "            diagnostics.connectFinished(trace, error = error, cancelled = !running || generation.get() != myGeneration)\n"
+        "            null\n"
+        "        }\n",
+        "        } catch (error: Exception) {\n"
+        "            currentSocket.compareAndSet(socket, null)\n"
+        "            runCatching { socket.close() }\n"
+        "            val cancelled = !lease.isCurrent || !running || generation.get() != myGeneration\n"
+        "            diagnostics.connectFinished(trace, error = error, cancelled = cancelled)\n"
+        "            if (!cancelled) runCatching { log(\"BT-C: RFCOMM connect exception - ${error.message ?: error.javaClass.simpleName}\") }\n"
+        "            null\n"
+        "        }\n",
+        "clean up unexpected RFCOMM connect exceptions",
+    )
+    replace_once(
+        client,
+        "        } catch (error: SecurityException) {\n"
+        "            diagnostics.connectFinished(\n"
+        "                trace,\n"
+        "                creatingSocket = true,\n"
+        "                error = error,\n"
+        "                cancelled =\n"
+        "                    !running || generation.get() != myGeneration,\n"
+        "            )\n"
+        "            return null\n"
+        "        }\n",
+        "        } catch (error: Exception) {\n"
+        "            diagnostics.connectFinished(\n"
+        "                trace,\n"
+        "                creatingSocket = true,\n"
+        "                error = error,\n"
+        "                cancelled =\n"
+        "                    !lease.isCurrent || !running || generation.get() != myGeneration,\n"
+        "            )\n"
+        "            return null\n"
+        "        }\n",
+        "handle unexpected RFCOMM socket creation exceptions",
+    )
+
+    # Make every post-connect exit close the socket, even when stream acquisition
+    # or channel construction throws before the old try/finally was entered.
+    replace_once(
+        client,
+        "        if (!lease.isCurrent) {\n"
+        "            runCatching { socket.close() }\n"
+        "            return\n"
+        "        }\n"
+        "        val stream =\n"
+        "            StreamDuplexStream(socket.inputStream, socket.outputStream) {\n"
+        "                runCatching { socket.close() }\n"
+        "            }\n"
+        "        val channel = Iap2LinkChannel(stream, name = \"iap2-bt-car\") { line -> log(line) }\n"
+        "        activeChannel.set(channel)\n"
+        "        try {\n",
+        "        var sessionChannel: Iap2LinkChannel? = null\n"
+        "        try {\n"
+        "            if (!lease.isCurrent) return\n"
+        "            val stream =\n"
+        "                StreamDuplexStream(socket.inputStream, socket.outputStream) {\n"
+        "                    runCatching { socket.close() }\n"
+        "                }\n"
+        "            val channel = Iap2LinkChannel(stream, name = \"iap2-bt-car\") { line -> log(line) }\n"
+        "            sessionChannel = channel\n"
+        "            activeChannel.set(channel)\n"
+        "            if (!lease.isCurrent) return\n",
+        "put stream/channel setup inside unconditional cleanup scope",
+    )
+    replace_once(
+        client,
+        "        } catch (error: IOException) {\n"
+        "            log(\"BT-C: SESSION 失败 - ${error.message}\")\n"
+        "        } finally {\n",
+        "        } catch (error: IOException) {\n"
+        "            runCatching { log(\"BT-C: SESSION 失败 - ${error.message}\") }\n"
+        "        } catch (error: Exception) {\n"
+        "            if (error is InterruptedException) Thread.currentThread().interrupt()\n"
+        "            runCatching { log(\"BT-C: SESSION 异常 - ${error.message ?: error.javaClass.simpleName}\") }\n"
+        "        } finally {\n",
+        "keep reconnect loop alive after non-IO session setup failures",
+    )
+    replace_once(
+        client,
+        "            activeChannel.compareAndSet(channel, null)\n"
+        "            activeSession.get()?.takeIf { it.first === channel }?.let { activeSession.compareAndSet(it, null) }\n"
+        "            currentSocket.compareAndSet(socket, null)\n"
+        "            runCatching { socket.close() }\n"
+        "            channel.close()\n"
+        "            log(\"BT-C: 本轮会话结束（客户端仍在运行，将自动重连）\")\n",
+        "            sessionChannel?.let { channel ->\n"
+        "                activeChannel.compareAndSet(channel, null)\n"
+        "                activeSession.get()?.takeIf { it.first === channel }?.let { activeSession.compareAndSet(it, null) }\n"
+        "                runCatching { channel.close() }\n"
+        "            }\n"
+        "            currentSocket.compareAndSet(socket, null)\n"
+        "            runCatching { socket.close() }\n"
+        "            runCatching { log(\"BT-C: 本轮会话结束（客户端仍在运行，将自动重连）\") }\n",
+        "always retire socket and optional channel",
+    )
+
     replace_once(
         client,
         "    private fun runSession(socket: BluetoothSocket) {\n",
