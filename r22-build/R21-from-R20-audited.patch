@@ -1,0 +1,447 @@
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -4406,7 +4406,7 @@
+             // 两者都发生在等邀请期间，不额外占用时间。
+             if (!wifiHandoffGuard.runIfActive(::handoffCancelled) {
+                     ctrlAdvertiser?.ensureForNetwork(endpoint.ssid, force = true, network = wifiConnector?.currentNetwork)
+-                    endpointBrowser?.restart()
++                    endpointBrowser?.restart(network = wifiConnector?.currentNetwork)
+                 }
+             ) {
+                 releaseHandoff()
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
+@@ -0,0 +1,16 @@
++package com.mcarplay.app.iap2
++
++/** Separates transport-level replies from a verified CarPlay-start signal. */
++internal object Iap2AvailabilityProgress {
++    enum class State { START_SESSION, LINK_SILENT, LINK_ACTIVITY_NO_START }
++
++    fun classify(
++        framesReceivedAfterAvailability: Long,
++        startSessionReceived: Boolean,
++    ): State =
++        when {
++            startSessionReceived -> State.START_SESSION
++            framesReceivedAfterAvailability == 0L -> State.LINK_SILENT
++            else -> State.LINK_ACTIVITY_NO_START
++        }
++}
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2OptionalMessagePolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2OptionalMessagePolicy.kt
+@@ -0,0 +1,20 @@
++package com.mcarplay.app.iap2
++
++/**
++ * E2LB-only compatibility experiment. A receiver's advertised receive list is not
++ * always exhaustive: Audi MIB3 was observed to ACK undeclared messages. Do NOT
++ * generalize this filter to all receivers; keep their existing wire sequence.
++ */
++internal object Iap2OptionalMessagePolicy {
++    fun shouldSend(
++        messageId: Int,
++        accessoryAccepts: Boolean?,
++        model: String?,
++        manufacturer: String?,
++    ): Boolean {
++        val isE2lb = model.equals("E2LB", ignoreCase = true) && manufacturer.orEmpty().contains("general motors", ignoreCase = true)
++        if (!isE2lb || accessoryAccepts != false) return true
++        return messageId != Iap2MessageIds.WIRELESS_CARPLAY_UPDATE &&
++            messageId != Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER
++    }
++}
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -188,6 +188,9 @@
+ 
+     /** 0x4300 本轮是否已发（车机可收时会在凭据窗口内提前发，Phase 1 末尾幂等）。 */
+     private var carPlayAvailabilitySent = false
++
++    /** Frames received before 0x4300; counts include link ACK, not evidence of session acceptance. */
++    private var availabilityPeerFramesBefore: Long? = null
+ 
+     /** 最近一次晚到 0x4301 的端点指纹（车机周期重发相同内容时不重复打详情）。 */
+     private var lastLateStartSessionSignature: Int? = null
+@@ -622,6 +625,18 @@
+                     minOf(deadline, System.nanoTime() + startSessionWindow),
+                 )
+         }
++        availabilityPeerFramesBefore?.let { before ->
++            val delta = (channel.peerFrameCount() - before).coerceAtLeast(0L)
++            val outcome =
++                Iap2AvailabilityProgress.classify(
++                    framesReceivedAfterAvailability = delta,
++                    startSessionReceived = startSession != null,
++                )
++            log(
++                "iap2 0x4300 观察: peerFrames=$delta result=$outcome " +
++                    "(peerFrames 包含纯 ACK；不代表 0x4300 已被接受；0x4301 才是启动证据)",
++            )
++        }
+         var endpoint =
+             if (startSession != null) {
+                 parseStartSession(startSession, wifiFromExchange)
+@@ -734,10 +749,20 @@
+         // 真机顺序：0x4301 之后回 0x4E0E（传输标识确认）。
+         // Audi 实测：车机对该消息**接受但从不 ACK**（其余包毫秒级 ACK）——必须发后不管，
+         // 否则重传看门狗在 +20s 把整条蓝牙链路杀掉（EA 会话/触摸载体随之丢失）。
+-        sendFireAndForget(
+-            Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
+-            Iap2Csm.string(0, bluetoothMac),
+-        )
++        if (Iap2OptionalMessagePolicy.shouldSend(
++                Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
++                accessoryDeclaresReceive(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER),
++                receiverSignals.model,
++                receiverSignals.manufacturer,
++            )
++        ) {
++            sendFireAndForget(
++                Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER,
++                Iap2Csm.string(0, bluetoothMac),
++            )
++        } else {
++            log("iap2 E2LB 实验 SKIP 0x4e0e: 明确未声明可接收（不代表此消息是故障根因）")
++        }
+         log(
+             "iap2 0x4e0d/0x4e0e/0x4300 —— Phase 1 结束：" +
+                 "wifiSource=${endpoint.wifiCredentialSource} startSession=${startSession != null} " +
+@@ -1054,7 +1079,17 @@
+     private fun sendDeviceStateGreetings(force: Boolean = false) {
+         if (greetingsSent && !force) return
+         greetingsSent = true
+-        send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
++        if (Iap2OptionalMessagePolicy.shouldSend(
++                Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
++                accessoryDeclaresReceive(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE),
++                receiverSignals.model,
++                receiverSignals.manufacturer,
++            )
++        ) {
++            send(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2Csm.u8(0, 1))
++        } else {
++            log("iap2 E2LB 实验 SKIP 0x4e0d: 明确未声明可接收（不影响其它车机）")
++        }
+         send(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2Csm.string(0, "zh-CN"))
+         send(Iap2MessageIds.DEVICE_INFORMATION_UPDATE, Iap2Csm.string(0, deviceName))
+         val epochSeconds = System.currentTimeMillis() / 1000L
+@@ -1091,11 +1126,13 @@
+      */
+     private fun sendCarPlayAvailability() {
+         if (carPlayAvailabilitySent) return
+-        carPlayAvailabilitySent = true
++        availabilityPeerFramesBefore = channel.peerFrameCount()
+         sendFireAndForget(
+             Iap2MessageIds.CARPLAY_AVAILABILITY,
+             Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac)),
+         )
++        carPlayAvailabilitySent = true
++        log("iap2 0x4300 已提交链路发送（awaitAck=false）；尚无证据证明车机应用层认可或已开启 CarPlay")
+     }
+ 
+     /** 两份清单里是否声明了任一 EA 消息（0xEA00/0xEA01/0xEA03）——用于区分是否走 EA 通道。 */
+--- a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
+@@ -155,7 +155,10 @@
+         force: Boolean = false,
+         network: android.net.Network? = null,
+     ): Boolean {
+-        if (registered && registeredSsid == ssid && !force && !macPlaceholder) return true
++        // The same SSID may refer to a NEW Android Network after an AP reconnect.
++        // Do not silently retain an NSD registration scoped to the previous network.
++        val networkUnchanged = network == null || network == registeredNetwork
++        if (registered && registeredSsid == ssid && !force && !macPlaceholder && networkUnchanged) return true
+         // force 冷却：绑定后的一连串「确保」调用（bindCarWifiAndRegister → 端点交接）
+         // 常在同一秒内发生，逐次 unregister+register 会撞 NsdManager 的
+         // listener-already-in-use 并吃 1.2s 重试，反而拖慢连接。
+@@ -181,7 +184,8 @@
+             unregisterServiceOnly()
+         }
+         registeredSsid = ssid
+-        registeredNetwork = network ?: registeredNetwork
++        // Null means unscoped/pre-join; never keep a stale previous Network handle.
++        registeredNetwork = network
+         var ok = start()
+         if (!ok) {
+             // 注销是异步的：极端情况下 registerService 会遇到 "listener already in use"，
+@@ -221,6 +225,11 @@
+                     // 匹配待邀请的手机，占位值会导致车机永远不邀请 → 0x4301 永不到达）。
+                     setAttribute("id", mac)
+                     setAttribute("srcvers", SENDER_SRCVERS)
++                    // Android 13+: constrain advertisement to the verified car Wi-Fi,
++                    // rather than potentially advertising on another active interface.
++                    if (android.os.Build.VERSION.SDK_INT >= 33) {
++                        registeredNetwork?.let { setNetwork(it) }
++                    }
+                 }
+             // 每次注册用全新 listener：unregisterService 是异步的，复用同一个 listener
+             // 会撞上 "listener already in use"（真车实测 10-11 卡住 ctrl 广播）
+@@ -236,7 +245,8 @@
+             log(
+                 "$TAG: 已监听 :${socket.localPort}，广播 $SERVICE_TYPE " +
+                     "name=$SERVICE_NAME id=$mac srcvers=$SENDER_SRCVERS" +
+-                    if (mac == DeviceIdentity.PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "",
++                    (if (mac == DeviceIdentity.PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "") +
++                    " networkScoped=${android.os.Build.VERSION.SDK_INT >= 33 && registeredNetwork != null}",
+             )
+             true
+         } catch (error: Exception) {
+@@ -269,13 +279,18 @@
+                 return
+             }
+             val requestLine = head.lineSequence().firstOrNull() ?: ""
+-            val headers =
++            // Untrusted HTTP headers may contain credentials or arbitrary private values.
++            // Only log bounded header NAMES and the non-query request target.
++            val headerNames =
+                 head
+                     .substringAfter("\r\n", "")
+                     .lineSequence()
+-                    .filter { it.contains(':') }
+-                    .joinToString("; ") { it.trim() }
+-            log("$TAG: $peer -> [$requestLine] $headers")
++                    .map { it.substringBefore(':').trim() }
++                    .filter { it.matches(Regex("[A-Za-z0-9-]{1,48}")) }
++                    .take(16)
++                    .joinToString(",")
++            val requestSummary = requestLine.substringBefore('?').take(96)
++            log("$TAG: $peer -> [$requestSummary] headerNames=$headerNames")
+ 
+             // 车机 ctrl 邀请：这是「车机已发现手机、AirPlay 窗口已开」的权威信号
+             // （catplay CarPlayCtrlSession：收到即把邀请交给连接流程）。
+@@ -289,7 +304,7 @@
+                         ?.trim()
+                 inviteCount++
+                 lastInviteAtMillis = android.os.SystemClock.uptimeMillis()
+-                log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
++                log("$TAG: ✓ 收到 ctrl 邀请（第 $inviteCount 次，receiverIdPresent=${!receiverId.isNullOrBlank()}）——需继续验证 CarPlay 会话")
+                 runCatching { onInvite?.invoke(client.localAddress?.hostAddress) }
+             }
+ 
+@@ -324,12 +339,8 @@
+                 // 读超时即停止转储
+             }
+             if (rest.size() > 0) {
+-                log(
+-                    "$TAG: 应答后收到 ${rest.size()} 字节：" +
+-                        rest.toByteArray().take(64).joinToString(" ") {
+-                            "%02x".format(it.toInt() and 0xFF)
+-                        },
+-                )
++                // Do not dump arbitrary peer bytes into persistently exported diagnostics.
++                log("$TAG: 应答后收到 ${rest.size()} 字节（内容未记录）")
+             }
+             log("$TAG: $peer 连接结束")
+         } catch (error: IOException) {
+@@ -382,18 +393,31 @@
+     private fun createListener(): NsdManager.RegistrationListener =
+         object : NsdManager.RegistrationListener {
+             override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
+-                // 只认当前这次注册：已被注销的旧注册迟到的回调不能把广播标成可见
+-                if (activeListener === this) advertisedAtMillis = SystemClock.uptimeMillis()
+-                log("$TAG: mDNS 注册成功 ${serviceInfo.serviceName}")
++                val current = synchronized(this@CarPlayCtrlAdvertiser) {
++                    if (activeListener !== this) false else {
++                        advertisedAtMillis = SystemClock.uptimeMillis()
++                        true
++                    }
++                }
++                if (current) {
++                    log("$TAG: mDNS 本地注册已确认 ${serviceInfo.serviceName}（车机是否收到广播仍需 ctrl 邀请核验）")
++                }
+             }
+ 
+             override fun onRegistrationFailed(
+                 serviceInfo: NsdServiceInfo,
+                 errorCode: Int,
+             ) {
+-                // 重置状态：下一次 ensureForNetwork（新会话的 0x5703）会重新注册
+-                registered = false
+-                log("$TAG: mDNS 注册失败 code=$errorCode（下次会话自动重试）")
++                // A stale callback from an old listener must not invalidate a new registration.
++                val current = synchronized(this@CarPlayCtrlAdvertiser) {
++                    if (activeListener !== this) false else {
++                        registered = false
++                        advertisedAtMillis = 0L
++                        activeListener = null
++                        true
++                    }
++                }
++                if (current) log("$TAG: mDNS 注册失败 code=$errorCode（本轮可安全重试）")
+             }
+ 
+             override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) = Unit
+--- a/app/src/main/java/com/mcarplay/app/net/CarPlayServiceBrowser.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CarPlayServiceBrowser.kt
+@@ -24,6 +24,7 @@
+     }
+ 
+     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
++    private val callbackExecutor = context.mainExecutor
+     private var discovering = false
+ 
+     /**
+@@ -63,7 +64,10 @@
+     }
+ 
+     @Synchronized
+-    fun start(serviceType: String = AIRPLAY_TYPE) {
++    fun start(
++        serviceType: String = AIRPLAY_TYPE,
++        network: android.net.Network? = null,
++    ) {
+         if (discovering) {
+             log("$TAG: 已在扫描中")
+             return
+@@ -71,7 +75,13 @@
+         log("$TAG: 开始发现 $serviceType")
+         val listener = newDiscoveryListener()
+         discoveryListener = listener
+-        nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
++        if (network != null && android.os.Build.VERSION.SDK_INT >= 33) {
++            nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, network, callbackExecutor, listener)
++            log("$TAG: 发现范围限定为已核对的车机 Network")
++        } else {
++            nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, listener)
++            log("$TAG: 发现范围未限定 Network（等待后续车机网络绑定）")
++        }
+         discovering = true
+     }
+ 
+@@ -81,13 +91,16 @@
+      * （帕萨特 2026-11-01 23:02：「已在扫描中」后 3 s「mDNS 未发现」）。停掉再开一轮才会重报。
+      */
+     @Synchronized
+-    fun restart(serviceType: String = AIRPLAY_TYPE) {
++    fun restart(
++        serviceType: String = AIRPLAY_TYPE,
++        network: android.net.Network? = null,
++    ) {
+         resetCache()
+         if (discovering) {
+             stop()
+             log("$TAG: 已清缓存，重新发现以重报现有服务")
+         }
+-        start(serviceType)
++        start(serviceType, network)
+     }
+ 
+     @Synchronized
+@@ -165,10 +178,11 @@
+                     val txt =
+                         info.attributes.entries.joinToString(", ") { (key, value) ->
+                             val text =
+-                                value
+-                                    ?.toString(Charsets.UTF_8)
+-                                    ?.trimEnd { it.code == 0 }
+-                                    .orEmpty()
++                                if (key.lowercase() in setOf("features", "srcvers", "model")) {
++                                    value?.toString(Charsets.UTF_8)?.trimEnd { it.code == 0 }?.take(64).orEmpty()
++                                } else {
++                                    "(value omitted)"
++                                }
+                             "$key=$text"
+                         }
+                     // 验收放在缓存之前：非车机端点（如同一 WiFi 上的 Mac）不得污染 awaitEndpoint
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -35,6 +35,9 @@
+     @Volatile
+     private var lastPeerFrameAtMillis = -1L
+ 
++    /** Incoming iAP2 frames (including bare ACK), not a count of accepted application messages. */
++    private var receivedPeerFrameCount = 0L
++
+     /** 原始字节转储预算（每方向每连接），真车字节级对照用。 */
+     private var rxDumpBudget = RAW_DUMP_LIMIT
+     private var txDumpBudget = RAW_DUMP_LIMIT_TX
+@@ -57,6 +60,7 @@
+         }
+         engine.onFrameReceived = { control, sequence, ack, sessionId, size ->
+             lastPeerFrameAtMillis = nowMillis()
++            receivedPeerFrameCount++
+             // 真车调试关键观测：车机在识别阶段是否回帧、回什么（静默分歧全靠它定位）
+             if (rxFrameLogs < FRAME_LOG_LIMIT) {
+                 rxFrameLogs++
+@@ -95,6 +99,9 @@
+ 
+     /** 对端最后一帧距今的毫秒数；从未收到过对端帧返回 null。只用于诊断日志。 */
+     fun millisSinceLastPeerFrame(): Long? = lastPeerFrameAtMillis.takeIf { it >= 0 }?.let { nowMillis() - it }
++
++    /** Snapshot only. Can include ACK-only frames; never use as proof of CarPlay activation. */
++    fun peerFrameCount(): Long = synchronized(lock) { receivedPeerFrameCount }
+ 
+     /**
+      * 等待链路终结（[close] 或读写失败），最多 [timeoutMillis]；返回是否已终结。
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
+@@ -0,0 +1,21 @@
++package com.mcarplay.app.iap2
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class Iap2AvailabilityProgressTest {
++    @Test
++    fun silentLinkDoesNotCountAsCarPlayStart() {
++        assertEquals(Iap2AvailabilityProgress.State.LINK_SILENT, Iap2AvailabilityProgress.classify(0L, false))
++    }
++
++    @Test
++    fun ackOrHeartbeatsAloneAreNotCarPlayStartEvidence() {
++        assertEquals(Iap2AvailabilityProgress.State.LINK_ACTIVITY_NO_START, Iap2AvailabilityProgress.classify(11L, false))
++    }
++
++    @Test
++    fun explicitStartSessionIsStrongEvidenceEvenWithNoOtherFrames() {
++        assertEquals(Iap2AvailabilityProgress.State.START_SESSION, Iap2AvailabilityProgress.classify(0L, true))
++    }
++}
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2OptionalMessagePolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2OptionalMessagePolicyTest.kt
+@@ -0,0 +1,44 @@
++package com.mcarplay.app.iap2
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class Iap2OptionalMessagePolicyTest {
++    private fun shouldSend(id: Int, accepts: Boolean?, model: String = "E2LB", manufacturer: String = "Saic General Motors") =
++        Iap2OptionalMessagePolicy.shouldSend(id, accepts, model, manufacturer)
++
++    @Test
++    fun e2lbExplicitReceiveListSkipsOptionalUndeclaredMessages() {
++        val allowed = setOf(0x6801, 0x4C01, 0x4C04, 0x5001, 0x4E09, 0x4E0A, 0x4E0B, 0x4E0C, 0x4300)
++        for (id in listOf(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)) {
++            assertFalse(shouldSend(id, id in allowed))
++        }
++    }
++
++    @Test
++    fun unknownListAndDeclaredPositiveKeepLegacyBehavior() {
++        for (id in listOf(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)) {
++            assertTrue(shouldSend(id, null))
++            assertTrue(shouldSend(id, true))
++        }
++    }
++
++    @Test
++    fun knownAudiWithIncompleteListsIsNotRegressed() {
++        for (id in listOf(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER)) {
++            assertTrue(shouldSend(id, false, "AUDI MMI", "DELPHI"))
++        }
++    }
++
++    @Test
++    fun otherGmModelsAreNotChangedWithoutEvidence() {
++        assertTrue(shouldSend(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE, false, "A2LL"))
++    }
++
++    @Test
++    fun availabilityIsNeverSuppressedByOptionalFilter() {
++        assertTrue(shouldSend(Iap2MessageIds.CARPLAY_AVAILABILITY, false))
++        assertTrue(shouldSend(Iap2MessageIds.CARPLAY_AVAILABILITY, null))
++    }
++}
