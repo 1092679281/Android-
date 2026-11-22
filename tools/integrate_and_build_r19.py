@@ -812,8 +812,23 @@ def main() -> None:
         if int(suite.attrib.get(attr, "0")) != 0:
             raise InvariantError(f"R19 arbiter report has {attr} != 0")
 
+    screen_report_path = (
+        Path(os.environ["R7_UPSTREAM"]).resolve()
+        / "app/build/test-results/testStandardDebugUnitTest"
+        / "TEST-com.mcarplay.app.airplay.AirPlayScreenLifecycleConcurrencyTest.xml"
+    )
+    if not screen_report_path.is_file():
+        raise InvariantError("Required AirPlay screen lifecycle JUnit XML is missing")
+    screen_suite = ET.parse(screen_report_path).getroot()
+    screen_cases = screen_suite.findall("testcase")
+    if len(screen_cases) != 2:
+        raise InvariantError(f"R19 requires both AirPlay lifecycle race tests: got {len(screen_cases)}")
+    for attr in ("failures", "errors", "skipped"):
+        if int(screen_suite.attrib.get(attr, "0")) != 0:
+            raise InvariantError(f"R19 AirPlay lifecycle report has {attr} != 0")
+
     if os.environ.get("R19_SOURCE_ONLY") == "1":
-        print("R19 source-only review PASS: 17/17 arbiter tests; no APK assembled", flush=True)
+        print("R19 source-only review PASS: 17/17 arbiter + 2/2 AirPlay lifecycle tests; no APK assembled", flush=True)
         return
 
     previous = stage / "mcarplay-LaCrosse-R18-identity-snapshot-debug.apk"
