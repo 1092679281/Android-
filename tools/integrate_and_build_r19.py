@@ -204,10 +204,10 @@ def patch(base: Path, kit: Path) -> None:
     )
     replace_once(
         client,
-        "                cancelled =\n"
-        "                    !running || generation.get() != myGeneration,\n",
-        "                cancelled =\n"
-        "                    !lease.isCurrent || !running || generation.get() != myGeneration,\n",
+        "                    cancelled =\n"
+        "                        !running || generation.get() != myGeneration,\n",
+        "                    cancelled =\n"
+        "                        !lease.isCurrent || !running || generation.get() != myGeneration,\n",
         "classify socket creation interrupted by inbound preemption as cancellation",
     )
     replace_once(
