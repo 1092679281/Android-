@@ -204,6 +204,24 @@ def patch(base: Path, kit: Path) -> None:
     )
     replace_once(
         client,
+        "                cancelled =\n"
+        "                    !running || generation.get() != myGeneration,\n",
+        "                cancelled =\n"
+        "                    !lease.isCurrent || !running || generation.get() != myGeneration,\n",
+        "classify socket creation interrupted by inbound preemption as cancellation",
+    )
+    replace_once(
+        client,
+        "            val cancelled = !running || generation.get() != myGeneration\n"
+        "            diagnostics.connectFinished(trace, error = error, cancelled = cancelled)\n"
+        "            if (!cancelled) noteConnectFailure(device, name, error, SystemClock.elapsedRealtime() - connectStartedAt)\n",
+        "            val cancelled = !lease.isCurrent || !running || generation.get() != myGeneration\n"
+        "            diagnostics.connectFinished(trace, error = error, cancelled = cancelled)\n"
+        "            if (!cancelled) noteConnectFailure(device, name, error, SystemClock.elapsedRealtime() - connectStartedAt)\n",
+        "do not count intentional inbound preemption as receiver rejection",
+    )
+    replace_once(
+        client,
         "        currentSocket.set(socket)\n"
         "        if (!running || generation.get() != myGeneration) {\n",
         "        lease.onPreempted {\n"
