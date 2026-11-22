@@ -17,10 +17,11 @@ import java.util.concurrent.TimeUnit
 internal class BluetoothSessionArbiter {
     private val lock = Any()
     private var owner: Lease? = null
+    private val retiringLeases = LinkedHashSet<Lease>()
     private var carPlaySessionActive = false
 
     val inboundActive: Boolean get() = synchronized(lock) { owner?.inbound == true }
-    val controlActive: Boolean get() = synchronized(lock) { owner != null }
+    val controlActive: Boolean get() = synchronized(lock) { owner != null || retiringLeases.isNotEmpty() }
     val sessionActive: Boolean get() = synchronized(lock) { carPlaySessionActive }
 
     /** Serialize the AirPlay-session gate with outbound lease acquisition. */
@@ -30,7 +31,7 @@ internal class BluetoothSessionArbiter {
 
     fun acquireOutbound(): Lease? =
         synchronized(lock) {
-            if (owner != null || carPlaySessionActive) {
+            if (owner != null || retiringLeases.isNotEmpty() || carPlaySessionActive) {
                 null
             } else {
                 Lease(inbound = false, previous = null).also { owner = it }
@@ -41,9 +42,15 @@ internal class BluetoothSessionArbiter {
         val previous: Lease?
         val acquired: Lease
         synchronized(lock) {
+            // A timed-out inbound handoff must not free the gate while its old
+            // outbound transport action is still running.
+            if (owner == null && retiringLeases.isNotEmpty()) return null
             previous = owner
             if (previous != null && (previous.inbound || previous.confirmed)) return null
-            previous?.preempted = true
+            previous?.let {
+                it.preempted = true
+                retiringLeases += it
+            }
             acquired = Lease(inbound = true, previous = previous)
             owner = acquired
         }
@@ -93,7 +100,7 @@ internal class BluetoothSessionArbiter {
             } finally {
                 synchronized(lock) {
                     activeCallbacks--
-                    if (closed && activeCallbacks == 0) retired.countDown()
+                    signalRetiredIfCompleteLocked()
                 }
             }
             return true
@@ -123,7 +130,7 @@ internal class BluetoothSessionArbiter {
         internal fun deliverPreemption() {
             val action =
                 synchronized(lock) {
-                    if (!preempted || preemptNotified) null else {
+                    if (!preempted || closed || preemptNotified) null else {
                         preemptAction?.also {
                             preemptAction = null
                             preemptNotified = true
@@ -160,13 +167,20 @@ internal class BluetoothSessionArbiter {
             return complete && isCurrent
         }
 
+        private fun signalRetiredIfCompleteLocked() {
+            if (closed && activeCallbacks == 0) {
+                retiringLeases.remove(this)
+                retired.countDown()
+            }
+        }
+
         override fun close() {
             synchronized(lock) {
                 if (closed) return
                 closed = true
                 preemptAction = null
                 if (owner === this) owner = null
-                if (activeCallbacks == 0) retired.countDown()
+                signalRetiredIfCompleteLocked()
             }
         }
     }
