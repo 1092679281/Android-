@@ -441,6 +441,12 @@ def patch(base: Path, kit: Path) -> None:
     )
     replace_once(
         airplay,
+        "     * 其他接收端保留音频后补发 RECORD 的既有行为。等待网络响应时不持有客户端锁，close 可随时终止。\n",
+        "     * 其他接收端保留音频后补发 RECORD 的既有行为。专用生命周期锁串行化状态变更；close 先关 socket 再等待此锁，仍可中断请求。\n",
+        "document close-safe lifecycle serialization",
+    )
+    replace_once(
+        airplay,
         "    fun confirmVideoDataPortConnected(): Boolean {\n",
         "    fun confirmVideoDataPortConnected(): Boolean = withScreenLifecycleLock { confirmVideoDataPortConnectedLocked() }\n"
         "\n"
