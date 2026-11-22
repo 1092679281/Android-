@@ -26,7 +26,7 @@ R19 的 `BluetoothSessionArbiter` 提供：
 
 ## 审查三：协议/回归 — 新增自动化红线
 
-`BluetoothSessionArbiterTest` 独立在纯 JVM 上覆盖 17 个场景：互斥出站、抢占回调恰好一次、旧 owner 不能释放新 owner、迟到回调、健康出站抗抢占、重复入站拒绝、抢占后不得确认、12 线程并发启动、两个实例隔离、AirPlay 活跃门闸、抢占后禁止迟到传输操作、抢占回调异常、迟到注册回调异常、退役后的迟到回调、入站超时后的退役租约隔离、仍在运行的旧传输操作隔离。
+`BluetoothSessionArbiterTest` 独立在纯 JVM 上覆盖 17 个蓝牙仲裁场景，另有 2 个真实 TCP 回环 AirPlay 生命周期竞态测试：互斥出站、抢占回调恰好一次、旧 owner 不能释放新 owner、迟到回调、健康出站抗抢占、重复入站拒绝、抢占后不得确认、12 线程并发启动、两个实例隔离、AirPlay 活跃门闸、抢占后禁止迟到传输操作、抢占回调异常、迟到注册回调异常、退役后的迟到回调、入站超时后的退役租约隔离、仍在运行的旧传输操作隔离。
 
 完整 R7→R18→R19 补丁重放，运行所有既有 JVM 单元测试、Spotless、Lint、Debug APK 构建。CI 使用 `if: always()` 另存原始 JUnit HTML/XML：失败时同样提供可复核证据。构建成功**不代表实车已经显示 CarWith**。
 
@@ -48,10 +48,14 @@ R18 最新通过版保留不动，R19 为独立 PR/调试分支。R19 APK 也是
 
 ## R19 本轮二次对抗修复（源码审查中）
 
+- **AirPlay 生命周期串行化**：初始 SETUP、屏幕 SETUP、RECORD、屏幕/会话 TEARDOWN 通过独立可重入锁串行化；`close()` 先关闭 socket 再等待生命周期锁，避免停止动作被网络等待卡住。
+- **晚到 SETUP 清理**：停止已开始后才返回 200 的初始 SETUP/屏幕 SETUP 不再复活本地激活状态；屏幕 SETUP 晚到时会主动 TEARDOWN 远端流。
+- **真实 RTSP 并发回归**：新增两个 loopback TCP 测试，分别证明屏幕 SETUP 响应未返回时 TEARDOWN 不会抢先完成，以及 RECORD 响应未返回时屏幕 TEARDOWN 不会越序。
+
 - **超时不释放所有权**：入站等待旧出站退役超时后，拒绝本次入站，但旧租约继续留在 retiring 集合中；在旧操作真实退出前，新的出站和入站都不能取得控制权。
 
 - 修复 inbound 在 `createRfcommSocketToServiceRecord()` 期间抢占时，清理回调可能早于 `currentSocket.set()` 执行的窗口；出站 connect 与完整 session 现在都受 lease action 保护，Socket 创建后立即注册针对该 Socket 的清理回调。
 - 将 AirPlay `sessionActive` 迁入 arbiter 同一把锁，和 `acquireOutbound()` 原子化。
 - 统一 outbound Socket / lease 转移：异常、取消、过期、正常会话分别保证关闭 Socket 与释放 lease，不再把连接线程异常直接抛出而终止循环。
 - 将流与 channel 构造纳入 `try/finally`，修复构造阶段抛异常时旧代码未清理 `currentSocket` 的问题。
-- 新增 4 个纯 JVM 对抗用例；源审查 CI 必须核验 17 项全通过。
+- 新增 4 个纯 JVM 对抗用例；源审查 CI 必须核验 17 项蓝牙仲裁 + 2 项 AirPlay 生命周期测试全部通过。
