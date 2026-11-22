@@ -542,11 +542,15 @@ def main() -> None:
         "newInboundMustWaitUntilOldInFlightCallbackFinishes",
         "competingOutboundStartsAreMutuallyExclusive",
         "independentInstancesCannotShareLeasesAcrossSessions",
+        "sessionActiveBlocksNewOutboundLeaseUntilCleared",
+        "preemptedOutboundCannotStartLateTransportOperation",
+        "preemptionCallbackFailureDoesNotOrphanInboundOwner",
+        "callbackRegisteredAfterRetirementIsNotInvoked",
     }
     cases = suite.findall("testcase")
     observed = {case.attrib.get("name") for case in cases}
-    if len(cases) != 10 or observed != expected:
-        raise InvariantError(f"R19 must run exactly 10 arbiter scenarios: got {observed}")
+    if len(cases) != 14 or observed != expected:
+        raise InvariantError(f"R19 must run exactly 14 arbiter scenarios: got {observed}")
     for attr in ("failures", "errors", "skipped"):
         if int(suite.attrib.get(attr, "0")) != 0:
             raise InvariantError(f"R19 arbiter report has {attr} != 0")
