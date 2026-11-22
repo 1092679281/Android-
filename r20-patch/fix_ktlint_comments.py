@@ -82,3 +82,37 @@ if previous < 0 or end < 0 or end >= pos:
 text = text[:previous] + '/*' + text[previous + 3:]
 path.write_text(text, encoding='utf-8')
 print('Fixed 7 additional comment-adjacency warnings')
+
+
+# Two more old KDocs became orphaned when methods were inserted below them.
+FORGOTTEN_DOCS = {
+    'app/src/main/java/com/mcarplay/app/SessionController.kt': '/** Read-only current WLAN name for UI;',
+    'app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt': '/** Activate strict SETUP/RECORD gating',
+}
+for rel, marker in FORGOTTEN_DOCS.items():
+    path = ROOT / rel
+    source = path.read_text(encoding='utf-8')
+    if source.count(marker) != 1:
+        raise RuntimeError(f'Nonunique trailing KDoc in {rel}')
+    pos = source.index(marker)
+    previous = source.rfind('/**', 0, pos)
+    end = source.find('*/', previous)
+    if previous < 0 or end < 0 or end >= pos:
+        raise RuntimeError(f'Expected orphaned KDoc near {marker}')
+    source = source[:previous] + '/*' + source[previous + 3:]
+    path.write_text(source, encoding='utf-8')
+
+# The old one-line callback description was replaced with a fuller KDoc.
+# Drop the redundant description entirely rather than keeping two adjacent comments.
+for rel in (
+    'app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt',
+    'app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt',
+):
+    path = ROOT / rel
+    source = path.read_text(encoding='utf-8')
+    marker = '/* 发送端链路断开（保活泵退出）时通知主控（释放僵尸轮次，见 SessionController.onSenderLinkClosed）。 */\\n\\n'
+    if source.count(marker) != 1:
+        raise RuntimeError(f'Expected exactly one duplicate callback comment in {rel}')
+    source = source.replace(marker, '')
+    path.write_text(source, encoding='utf-8')
+print('Cleaned four additional orphaned/redundant KDocs')
