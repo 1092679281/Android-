@@ -3,7 +3,6 @@ package com.mcarplay.app.bt
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
@@ -103,27 +102,57 @@ class BluetoothSessionArbiterTest {
     }
 
     @Test
+    fun newInboundMustWaitUntilOldInFlightCallbackFinishes() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val callbackEntered = CountDownLatch(1)
+        val callbackRelease = CountDownLatch(1)
+        val worker =
+            thread {
+                assertTrue(
+                    outbound.dispatchIfCurrent {
+                        callbackEntered.countDown()
+                        callbackRelease.await(3, TimeUnit.SECONDS)
+                    },
+                )
+            }
+        assertTrue(callbackEntered.await(2, TimeUnit.SECONDS))
+        val inbound = requireNotNull(gate.acquireInbound())
+        outbound.close()
+        assertFalse("Old callback is still active", inbound.awaitPreviousRetirement(50))
+        callbackRelease.countDown()
+        worker.join(3_000)
+        assertFalse(worker.isAlive)
+        assertTrue("New channel can now safely start", inbound.awaitPreviousRetirement(500))
+        inbound.close()
+    }
+
+    @Test
     fun competingOutboundStartsAreMutuallyExclusive() {
         val gate = BluetoothSessionArbiter()
         val start = CountDownLatch(1)
         val acquired = AtomicInteger()
+        val attemptsDone = CountDownLatch(12)
         val finish = CountDownLatch(1)
         val threads =
             (1..12).map {
                 thread(start = true) {
                     if (start.await(3, TimeUnit.SECONDS)) {
                         val lease = gate.acquireOutbound()
+                        if (lease != null) acquired.incrementAndGet()
+                        attemptsDone.countDown()
                         if (lease != null) {
-                            acquired.incrementAndGet()
                             finish.await(3, TimeUnit.SECONDS)
                             lease.close()
                         }
+                    } else {
+                        attemptsDone.countDown()
                     }
                 }
             }
         start.countDown()
-        Thread.sleep(100)
-        assertTrue("At most one simultaneous owner", acquired.get() == 1)
+        assertTrue("All competitors attempted acquisition", attemptsDone.await(3, TimeUnit.SECONDS))
+        assertTrue("Exactly one simultaneous owner", acquired.get() == 1)
         finish.countDown()
         threads.forEach { it.join(3_000) }
         assertFalse(gate.controlActive)
