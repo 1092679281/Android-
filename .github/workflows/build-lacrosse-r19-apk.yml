@@ -64,6 +64,7 @@ jobs:
             --exclude='.gradle/' \
             --exclude='**/build/' \
             --exclude='local.properties' \
+            --exclude='*.log' \
             upstream/ source-package/mcarplay-project/
           rsync -a --delete \
             --exclude='.git/' \
@@ -74,8 +75,8 @@ jobs:
           - R19 patch-kit revision: ${R19_SOURCE_REVISION}
           - Upstream project: wangxso/mcarplay
           - Upstream pinned commit: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
-          - The `mcarplay-project/` directory is the complete upstream Android Studio project after applying the R19 patch and running the successful build/test pipeline.
-          - The `r19-patch-kit/` directory contains this repository's source overlays, tests, integration scripts, workflow definitions, and review notes.
+          - mcarplay-project/ is the complete upstream Android Studio project after applying the R19 patch and running the successful build/test pipeline.
+          - r19-patch-kit/ contains this repository's source overlays, tests, integration scripts, workflow definitions, and review notes.
           - Generated build outputs, Gradle caches, local machine configuration, and Git object databases are excluded.
           - This is source code, not a release-signed APK. The R19 build is a debug build; real vehicle CarPlay display still requires in-car validation.
           EOF
