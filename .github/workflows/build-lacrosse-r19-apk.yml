@@ -23,7 +23,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Emit the exact sentinel expected by the integration scripts. GitHub's
+      # boolean expression otherwise serializes true as "true", not "1".
+      R19_SOURCE_ONLY: ${{ (github.event_name == 'pull_request' || inputs.package_apk != true) && '1' || '0' }}
     steps:
+      - name: Assert APK packaging is disabled during source review
+        if: github.event_name == 'pull_request' || inputs.package_apk != true
+        run: test "$R19_SOURCE_ONLY" = "1"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -59,7 +66,6 @@ jobs:
         env:
           R7_UPSTREAM: ${{ github.workspace }}/upstream
           R19_OUTPUT: ${{ runner.temp }}/r19-apk
-          R19_SOURCE_ONLY: ${{ github.event_name == 'pull_request' || inputs.package_apk != true }}
         run: python3 kit/tools/integrate_and_build_r19.py
       - name: Assemble complete patched Android Studio source tree
         if: success()
