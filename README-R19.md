@@ -26,7 +26,7 @@ R19 的 `BluetoothSessionArbiter` 提供：
 
 ## 审查三：协议/回归 — 新增自动化红线
 
-`BluetoothSessionArbiterTest` 独立在纯 JVM 上覆盖 14 个场景：互斥出站、抢占回调恰好一次、旧 owner 不能释放新 owner、迟到回调、健康出站抗抢占、重复入站拒绝、抢占后不得确认、12 线程并发启动、两个实例隔离、AirPlay 活跃门闸、抢占后禁止迟到传输操作、回调异常、退役后的迟到回调。
+`BluetoothSessionArbiterTest` 独立在纯 JVM 上覆盖 15 个场景：互斥出站、抢占回调恰好一次、旧 owner 不能释放新 owner、迟到回调、健康出站抗抢占、重复入站拒绝、抢占后不得确认、12 线程并发启动、两个实例隔离、AirPlay 活跃门闸、抢占后禁止迟到传输操作、抢占回调异常、迟到注册回调异常、退役后的迟到回调。
 
 完整 R7→R18→R19 补丁重放，运行所有既有 JVM 单元测试、Spotless、Lint、Debug APK 构建。CI 使用 `if: always()` 另存原始 JUnit HTML/XML：失败时同样提供可复核证据。构建成功**不代表实车已经显示 CarWith**。
 
@@ -52,4 +52,4 @@ R18 最新通过版保留不动，R19 为独立 PR/调试分支。R19 APK 也是
 - 将 AirPlay `sessionActive` 迁入 arbiter 同一把锁，和 `acquireOutbound()` 原子化。
 - 统一 outbound Socket / lease 转移：异常、取消、过期、正常会话分别保证关闭 Socket 与释放 lease，不再把连接线程异常直接抛出而终止循环。
 - 将流与 channel 构造纳入 `try/finally`，修复构造阶段抛异常时旧代码未清理 `currentSocket` 的问题。
-- 新增 4 个纯 JVM 对抗用例；源审查 CI 必须核验 14 项全通过。
+- 新增 4 个纯 JVM 对抗用例；源审查 CI 必须核验 15 项全通过。
