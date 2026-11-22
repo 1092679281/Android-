@@ -274,6 +274,8 @@ def main() -> None:
     r13.patch = with_r14
     os.environ["R13_OUTPUT"] = str(stage)
     r13.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     previous = stage / "mcarplay-LaCrosse-R13-handshake-state-debug.apk"
     if not previous.is_file() or not zipfile.is_zipfile(previous):
         raise PatchMismatch("R14 APK did not build")
