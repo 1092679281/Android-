@@ -115,6 +115,8 @@ def main() -> None:
     r9.quick_connect = with_r10
     os.environ["R9_OUTPUT"] = str(staging)
     r9.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     apk = staging / "mcarplay-LaCrosse-R9-quick-connect-debug.apk"
     if not apk.is_file() or not zipfile.is_zipfile(apk):
         raise r9.r8.r7.Blocked("R10 APK missing or invalid")
