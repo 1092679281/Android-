@@ -4,9 +4,9 @@ on:
   pull_request:
     branches: [feature/r18-buick-bluetooth-identity-snapshot]
     paths:
-      - 'tools/integrate_and_build_r19.py'
-      - 'src/BluetoothSessionArbiter.kt'
-      - 'src/BluetoothSessionArbiterTest.kt'
+      - 'tools/integrate_and_build_r*.py'
+      - 'src/**'
+      - 'README-R19.md'
       - '.github/workflows/build-lacrosse-r19-apk.yml'
   workflow_dispatch:
     inputs:
