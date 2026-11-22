@@ -1,6 +1,7 @@
 package com.mcarplay.app.airplay
 
 import com.mcarplay.app.iap2.Iap2SenderSession
+import com.mcarplay.app.iap2.ReceiverProfile
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
