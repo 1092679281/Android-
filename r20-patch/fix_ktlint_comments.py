@@ -116,3 +116,25 @@ for rel in (
     source = source.replace(marker, '')
     path.write_text(source, encoding='utf-8')
 print('Cleaned four additional orphaned/redundant KDocs')
+
+
+# Orphaned header KDocs directly before new, more precise method KDocs.
+SECONDARY_ORPHANS = {
+    'app/src/main/java/com/mcarplay/app/SessionController.kt':
+        '/**\n     * 当前网络的快照：Network 句柄',
+    'app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt':
+        '/**\n     * 读线程按「加密是否已启用」切分缓冲区：',
+}
+for rel, marker in SECONDARY_ORPHANS.items():
+    path = ROOT / rel
+    text = path.read_text(encoding='utf-8')
+    if text.count(marker) != 1:
+        raise RuntimeError(f'Nonunique secondary KDoc in {rel}')
+    pos = text.index(marker)
+    previous = text.rfind('/**', 0, pos)
+    end = text.find('*/', previous)
+    if previous < 0 or end < 0 or end >= pos:
+        raise RuntimeError(f'Expected preceding secondary KDoc in {rel}')
+    text = text[:previous] + '/*' + text[previous + 3:]
+    path.write_text(text, encoding='utf-8')
+print('Resolved two secondary orphaned KDocs')
