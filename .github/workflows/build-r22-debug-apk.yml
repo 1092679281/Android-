@@ -107,7 +107,7 @@ jobs:
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
           mkdir -p dist
           cp "$apk" dist/mcarplay-R22-E2LB-experimental-debug.apk
-          (cd dist; sha256sum mcarplay-R20-audited-debug.apk > SHA256SUMS.txt)
+          (cd dist; sha256sum mcarplay-R22-E2LB-experimental-debug.apk > SHA256SUMS.txt)
           printf 'R22 EXPERIMENTAL DEBUG ONLY. Not E2LB-vehicle certified. CI debug signing; upgrade may require uninstall.\n' > dist/BUILD-SCOPE.txt
       - name: Upload verified R20 debug APK
         if: success()
