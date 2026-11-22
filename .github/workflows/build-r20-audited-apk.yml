@@ -1,0 +1,84 @@
+name: R20 audited build and verify APK
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/r20-audited.patch.xz.b64'
+      - '.github/workflows/build-r20-audited-apk.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - name: Download exact R19 Android Studio project used for R20 delta
+        uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-R19-complete-source
+          run-id: 44990721353
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: prepared
+      - name: Apply audited R20 source (15-file delta, fail closed)
+        run: |
+          set -euo pipefail
+          base64 --decode kit/tools/r20-audited.patch.xz.b64 | xz --decompress > /tmp/r20.patch
+          cd prepared
+          git apply --check /tmp/r20.patch
+          git apply /tmp/r20.patch
+          test -f mcarplay-project/app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
+          test -f mcarplay-project/app/src/main/java/com/mcarplay/app/audio/ExternalPcmAligner.kt
+          echo "Applied audited R20 delta; no R19 fallback"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK 35
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -x "$SDKMANAGER"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install 'platforms;android-35' 'build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Format, compile and test R20, lint and assemble
+        working-directory: prepared/mcarplay-project
+        run: |
+          bash ./gradlew --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug :app:assembleStandardDebug
+      - name: Verify built APK and SHA-256
+        run: |
+          set -euo pipefail
+          APK="$(find prepared/mcarplay-project/app/build/outputs/apk/standard/debug -name '*.apk' -type f | head -1)"
+          test -s "$APK"
+          unzip -tqq "$APK"
+          "${ANDROID_HOME}/build-tools/35.0.0/apksigner" verify "$APK"
+          mkdir -p deliver
+          cp "$APK" deliver/mcarplay-LaCrosse-R20-audited-debug.apk
+          cd deliver
+          sha256sum *.apk | tee SHA256SUMS.txt
+          echo "R20 audited source built and signed; real-car E2LB compatibility not yet confirmed" > BUILD-NOTES.txt
+      - name: Preserve failure evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: R20-audited-test-reports
+          path: |
+            prepared/mcarplay-project/app/build/test-results/
+            prepared/mcarplay-project/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload verified R20 APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: R20-audited-debug-apk
+          path: deliver/
+          if-no-files-found: error
+          retention-days: 30
