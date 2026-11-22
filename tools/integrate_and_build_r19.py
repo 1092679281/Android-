@@ -442,7 +442,9 @@ def patch(base: Path, kit: Path) -> None:
     replace_once(
         airplay,
         "    fun confirmVideoDataPortConnected(): Boolean {\n",
-        "    fun confirmVideoDataPortConnected(): Boolean = withScreenLifecycleLock {\n",
+        "    fun confirmVideoDataPortConnected(): Boolean = withScreenLifecycleLock { confirmVideoDataPortConnectedLocked() }\n"
+        "\n"
+        "    private fun confirmVideoDataPortConnectedLocked(): Boolean {\n",
         "serialize video data-port confirmation",
     )
     replace_once(
