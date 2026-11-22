@@ -571,17 +571,19 @@ def main() -> None:
         "preemptionCallbackFailureDoesNotOrphanInboundOwner",
         "callbackRegisteredAfterRetirementIsNotInvoked",
         "latePreemptionCallbackFailureDoesNotEscapeAcquisitionThread",
+        "inboundTimeoutKeepsRetiringOutboundLeaseBlockingAllNewOwners",
+        "inboundTimeoutCannotReleaseGateWhileTransportCallbackIsStillRunning",
     }
     cases = suite.findall("testcase")
     observed = {case.attrib.get("name") for case in cases}
-    if len(cases) != 15 or observed != expected:
-        raise InvariantError(f"R19 must run exactly 15 arbiter scenarios: got {observed}")
+    if len(cases) != 17 or observed != expected:
+        raise InvariantError(f"R19 must run exactly 17 arbiter scenarios: got {observed}")
     for attr in ("failures", "errors", "skipped"):
         if int(suite.attrib.get(attr, "0")) != 0:
             raise InvariantError(f"R19 arbiter report has {attr} != 0")
 
     if os.environ.get("R19_SOURCE_ONLY") == "1":
-        print("R19 source-only review PASS: 15/15 arbiter tests; no APK assembled", flush=True)
+        print("R19 source-only review PASS: 17/17 arbiter tests; no APK assembled", flush=True)
         return
 
     previous = stage / "mcarplay-LaCrosse-R18-identity-snapshot-debug.apk"
