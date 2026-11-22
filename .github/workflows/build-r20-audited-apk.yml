@@ -59,6 +59,7 @@ jobs:
           test -s app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
           test -s app/src/test/java/com/mcarplay/app/bt/BluetoothSessionArbiterTest.kt
           echo "Exact R20 audited source patch applied"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/fix_ktlint_comments.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
       - name: Full Kotlin/JVM tests, formatting, Android Lint and real APK compilation
         working-directory: baseline/mcarplay-project
         run: |
