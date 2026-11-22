@@ -221,6 +221,53 @@ class BluetoothSessionArbiterTest {
     }
 
     @Test
+    fun inboundTimeoutKeepsRetiringOutboundLeaseBlockingAllNewOwners() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val inbound = requireNotNull(gate.acquireInbound())
+        assertFalse(inbound.awaitPreviousRetirement(10))
+        inbound.close()
+
+        assertTrue(gate.controlActive)
+        assertNull(gate.acquireOutbound())
+        assertNull(gate.acquireInbound())
+
+        outbound.close()
+        assertFalse(gate.controlActive)
+        assertNotNull(gate.acquireOutbound()?.also { it.close() })
+    }
+
+    @Test
+    fun inboundTimeoutCannotReleaseGateWhileTransportCallbackIsStillRunning() {
+        val gate = BluetoothSessionArbiter()
+        val outbound = requireNotNull(gate.acquireOutbound())
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val finished = CountDownLatch(1)
+        val worker =
+            thread {
+                outbound.dispatchIfCurrent {
+                    entered.countDown()
+                    assertTrue(release.await(2, TimeUnit.SECONDS))
+                }
+                outbound.close()
+                finished.countDown()
+            }
+        assertTrue(entered.await(1, TimeUnit.SECONDS))
+
+        val inbound = requireNotNull(gate.acquireInbound())
+        assertFalse(inbound.awaitPreviousRetirement(10))
+        inbound.close()
+        assertNull(gate.acquireOutbound())
+
+        release.countDown()
+        assertTrue(finished.await(1, TimeUnit.SECONDS))
+        worker.join(1_000)
+        assertFalse(gate.controlActive)
+        assertNotNull(gate.acquireOutbound()?.also { it.close() })
+    }
+
+    @Test
     fun callbackRegisteredAfterRetirementIsNotInvoked() {
         val gate = BluetoothSessionArbiter()
         val outbound = requireNotNull(gate.acquireOutbound())
