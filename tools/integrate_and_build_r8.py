@@ -279,6 +279,8 @@ def main() -> None:
     r7.integrate_r7 = integrate_after_r7
     os.environ["R7_OUTPUT"] = str(staging)
     r7.main()
+    if os.environ.get("R19_SOURCE_ONLY") == "1":
+        return
     built = staging / "mcarplay-LaCrosse-R7-queue-priority-debug.apk"
     if not built.is_file() or not zipfile.is_zipfile(built):
         raise r7.Blocked("R8 compiled artifact missing")
