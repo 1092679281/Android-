@@ -285,7 +285,7 @@ def patch(base: Path, kit: Path) -> None:
     )
     replace_once(
         client,
-        "        } catch (error: SecurityException) {\n"
+        "            } catch (error: SecurityException) {\n"
         "                diagnostics.connectFinished(\n"
         "                    trace,\n"
         "                    creatingSocket = true,\n"
@@ -294,7 +294,7 @@ def patch(base: Path, kit: Path) -> None:
         "                        !running || generation.get() != myGeneration,\n"
         "                )\n"
         "                return null\n"
-        "        }\n",
+        "            }\n",
         "        } catch (error: Exception) {\n"
         "            diagnostics.connectFinished(\n"
         "                trace,\n"
