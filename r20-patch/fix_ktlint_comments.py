@@ -110,7 +110,7 @@ for rel in (
 ):
     path = ROOT / rel
     source = path.read_text(encoding='utf-8')
-    marker = '/* 发送端链路断开（保活泵退出）时通知主控（释放僵尸轮次，见 SessionController.onSenderLinkClosed）。 */\\n\\n'
+    marker = '/* 发送端链路断开（保活泵退出）时通知主控（释放僵尸轮次，见 SessionController.onSenderLinkClosed）。 */\n\n'
     if source.count(marker) != 1:
         raise RuntimeError(f'Expected exactly one duplicate callback comment in {rel}')
     source = source.replace(marker, '')
