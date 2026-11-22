@@ -1,0 +1,139 @@
+name: R22 E2LB experimental Android CI and debug APK
+
+on:
+  push:
+    branches:
+      - feature/r22-e2lb-debug-apk
+    paths:
+      - 'r20-patch/**'
+      - 'r22-build/**'
+      - '.github/workflows/build-r22-debug-apk.yml'
+  pull_request:
+    branches:
+      - feature/r20-audited-apk-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: r22-experimental-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - name: Retrieve exact pinned R19 full-source baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-R19-complete-source
+          run-id: 44990721353
+          github-token: ${{ github.token }}
+          path: baseline
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Prepare Android SDK 35
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          yes | "$sdkmanager" --sdk_root="$sdk" --licenses > /dev/null || true
+          "$sdkmanager" --sdk_root="$sdk" --install 'platforms;android-35' 'build-tools;35.0.0'
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Reconstruct EXACT audited R20 source from pinned R19
+        run: |
+          set -euo pipefail
+          cat kit/r20-patch/part*.txt | tr -d '\n\r' | base64 --decode | xz --decompress > r20.patch
+          echo 'c7c94575be31374612d60a060b21ac58faef3ab2b2be3c9ce026760d7c684684  r20.patch' | sha256sum --check --status
+          test -f baseline/mcarplay-project/gradlew
+          cd baseline/mcarplay-project
+          git apply -p3 --check "$GITHUB_WORKSPACE/r20.patch"
+          git apply -p3 "$GITHUB_WORKSPACE/r20.patch"
+          test -s app/src/main/java/com/mcarplay/app/audio/ExternalPcmAligner.kt
+          test -s app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
+          test -s app/src/test/java/com/mcarplay/app/bt/BluetoothSessionArbiterTest.kt
+          echo "Exact R20 baseline patch applied"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/fix_ktlint_comments.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/post_audit_fixes.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r22-build/R21-from-R20-audited.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r22-build/R21-from-R20-audited.patch"
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r22-build/R22-from-R21.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r22-build/R22-from-R21.patch"
+          test -s app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+          test -s app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
+          echo "R22 E2LB experimental sources reconstructed from audited R20"
+      - name: Full Kotlin/JVM tests, formatting, Android Lint and real APK compilation
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug :app:assembleStandardDebug
+      - name: Strictly verify R20 critical regression test suites ran and passed
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root=Path('baseline/mcarplay-project/app/build/test-results/testStandardDebugUnitTest')
+          names=['com.mcarplay.app.bt.BluetoothSessionArbiterTest','com.mcarplay.app.video.VideoEncoderAbrTest','com.mcarplay.app.audio.ExternalPcmAlignerTest','com.mcarplay.app.airplay.StreamFrameCipherTest','com.mcarplay.app.iap2.Iap2LinkEngineTest','com.mcarplay.app.iap2.E2lbAvailabilityBodyPolicyTest']
+          total=0
+          for cls in names:
+              f=root/('TEST-'+cls+'.xml')
+              if not f.is_file(): raise SystemExit('Missing mandatory R20 JUnit suite: '+str(f))
+              suite=ET.parse(f).getroot()
+              tests=suite.findall('testcase')
+              errors=[x for x in tests if x.find('failure') is not None or x.find('error') is not None or x.find('skipped') is not None]
+              if len(tests)<2 or errors: raise SystemExit(f'R22 mandatory suite rejected: {cls}: {len(tests)} cases, {len(errors)} bad')
+              total+=len(tests)
+              print(cls, 'PASS', len(tests))
+          print('R22 mandatory source tests passed:', total)
+          PY
+      - name: Verify APK structure, certificate and digest
+        run: |
+          set -euo pipefail
+          apk='baseline/mcarplay-project/app/build/outputs/apk/standard/debug/app-standard-debug.apk'
+          test -s "$apk"
+          unzip -tqq "$apk"
+          unzip -Z1 "$apk" | grep -qx 'AndroidManifest.xml'
+          unzip -Z1 "$apk" | grep -qx 'classes.dex'
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$apk"
+          mkdir -p dist
+          cp "$apk" dist/mcarplay-R22-E2LB-experimental-debug.apk
+          (cd dist; sha256sum mcarplay-R22-E2LB-experimental-debug.apk > SHA256SUMS.txt)
+          printf 'R22 EXPERIMENTAL DEBUG ONLY. Not E2LB-vehicle certified. CI debug signing; upgrade may require uninstall.\n' > dist/BUILD-SCOPE.txt
+      - name: Upload verified R20 debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R22-E2LB-experimental-debug-apk
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve exact patched R20 source
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R22-E2LB-experimental-complete-source
+          path: |
+            baseline/mcarplay-project/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve JUnit and Lint evidence on any result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R22-junit-lint-evidence
+          path: |
+            baseline/mcarplay-project/app/build/test-results/
+            baseline/mcarplay-project/app/build/reports/tests/
+            baseline/mcarplay-project/app/build/reports/lint-results-*
+          if-no-files-found: ignore
+          retention-days: 14
