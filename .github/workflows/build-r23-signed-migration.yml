@@ -75,19 +75,37 @@ jobs:
           git apply -p1 --check "$GITHUB_WORKSPACE/kit/r23-build/R23-from-R22.patch"
           git apply -p1 "$GITHUB_WORKSPACE/kit/r23-build/R23-from-R22.patch"
           grep -F 'val appVersionName = "0.1.9"' app/build.gradle.kts
-          echo "R23 source reconstruction completed"
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ("app/src/main/java/com/mcarplay/app/update/GitHubRelease.kt", "app/src/test/java/com/mcarplay/app/update/GitHubReleaseTest.kt"):
+              p=Path(name)
+              s=p.read_text()
+              assert s.count("1092679281/CarPlay-Updates")==1, name
+              p.write_text(s.replace("1092679281/CarPlay-Updates", "1092679281/Android-"))
+          p=Path("docs/UPDATES.md")
+          s=p.read_text()
+          assert s.count("wangxso/mcarplay")==2
+          p.write_text(s.replace("wangxso/mcarplay", "1092679281/Android-"))
+          p=Path("CHANGELOG.md")
+          s=p.read_text()
+          anchor="## [v0.1.7-test.1] - 2026-11-13"
+          assert s.count(anchor)==1
+          notes="## [v0.1.9-test.1] - 2026-11-24\n\n> R23 experimental signing migration: iAP2 ACK, early messages, endpoint provenance. E2LB vehicle validation pending.\n> R23 实验签名迁移版：iAP2 ACK、提前消息、端点来源修复；E2LB 实车待验证。\n\n"
+          p.write_text(s.replace(anchor, notes+anchor))
+          PY
+          echo "R23 source reconstruction and verified update-repository configuration completed"
       - name: Full Kotlin/JVM tests, formatting, Android Lint and real APK compilation
         working-directory: baseline/mcarplay-project
         run: |
           set -euo pipefail
-          bash ./gradlew --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug :app:assembleStandardRelease
+          bash ./gradlew --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.releaseTag=v0.1.9-test.1 :app:assembleStandardRelease
       - name: Strictly verify R23 critical regression test suites ran and passed
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
           root=Path('baseline/mcarplay-project/app/build/test-results/testStandardDebugUnitTest')
-          names=['com.mcarplay.app.bt.BluetoothSessionArbiterTest','com.mcarplay.app.video.VideoEncoderAbrTest','com.mcarplay.app.audio.ExternalPcmAlignerTest','com.mcarplay.app.airplay.StreamFrameCipherTest','com.mcarplay.app.iap2.Iap2LinkEngineTest','com.mcarplay.app.iap2.E2lbAvailabilityBodyPolicyTest','com.mcarplay.app.iap2.CarPlayBringupStateTest','com.mcarplay.app.iap2.Iap2SenderSessionTest']
+          names=['com.mcarplay.app.bt.BluetoothSessionArbiterTest','com.mcarplay.app.video.VideoEncoderAbrTest','com.mcarplay.app.audio.ExternalPcmAlignerTest','com.mcarplay.app.airplay.StreamFrameCipherTest','com.mcarplay.app.iap2.Iap2LinkEngineTest','com.mcarplay.app.iap2.E2lbAvailabilityBodyPolicyTest','com.mcarplay.app.iap2.CarPlayBringupStateTest','com.mcarplay.app.iap2.Iap2SenderSessionTest','com.mcarplay.app.update.GitHubReleaseTest','com.mcarplay.app.update.ApkUpdateVerifierTest']
           total=0
           for cls in names:
               f=root/('TEST-'+cls+'.xml')
