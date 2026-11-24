@@ -1,0 +1,707 @@
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.8"
++val appVersionName = "0.1.9"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -2921,6 +2921,7 @@
+     private fun awaitCtrlInvite(
+         ssid: String,
+         timeoutMillis: Long,
++        observation: ReceiverObservation?,
+     ): Boolean {
+         val advertiser = ctrlAdvertiser
+         val deadline = android.os.SystemClock.uptimeMillis() + timeoutMillis
+@@ -2935,7 +2936,7 @@
+                 CtrlInviteGate.decide(
+                     nowMillis = now,
+                     waitStartedAtMillis = startedAt,
+-                    lastInviteAtMillis = advertiser?.lastInviteAtMillis ?: 0L,
++                    lastInviteAtMillis = if (receiverHasInvited(observation)) ctrlInviteEvidence?.receivedAtMillis ?: 0L else 0L,
+                     mdnsEndpointFound = endpointBrowser?.awaitEndpoint(0) != null,
+                     advertisedAtMillis = advertiser?.advertisedAtMillis ?: 0L,
+                     reannouncedAtMillis = reannouncedAt,
+@@ -2948,7 +2949,7 @@
+ 
+                 CtrlInviteGate.Decision.MDNS_FALLBACK -> {
+                     appendLog(
+-                        "CTRL: 已发现 _airplay._tcp，广播可见/重公告后 ${CtrlInviteGate.MDNS_GRACE_MS}ms 内无新鲜邀请" +
++                        "CTRL: 已发现 _airplay._tcp，本地注册/重公告后 ${CtrlInviteGate.MDNS_GRACE_MS}ms 内无新鲜邀请" +
+                             "（旧邀请 $invites 次不算，共等 ${now - startedAt}ms）——按旧机型直接连接 AirPlay",
+                     )
+                     return true
+@@ -2961,7 +2962,7 @@
+                     val advertisedAt = advertiser?.advertisedAtMillis ?: 0L
+                     appendLog(
+                         "CTRL: " +
+-                            (if (advertisedAt > 0L) "广播可见 ${now - advertisedAt}ms 仍无邀请" else "${now - startedAt}ms 未确认广播可见") +
++                            (if (advertisedAt > 0L) "本地注册 ${now - advertisedAt}ms 仍无邀请" else "${now - startedAt}ms 未确认本地注册") +
+                             "——强制重新公告一次（catplay 同款 force_announce）",
+                     )
+                     ctrlAdvertiser?.ensureForNetwork(ssid, force = true, network = wifiConnector?.currentNetwork)
+@@ -2973,7 +2974,7 @@
+                 val advertisedAt = advertiser?.advertisedAtMillis ?: 0L
+                 appendLog(
+                     "CTRL: 等待车机 ctrl 邀请…（已等 ${now - startedAt}ms，" +
+-                        (if (advertisedAt > 0L) "广播已可见 ${now - advertisedAt}ms" else "广播尚未确认可见") + "）",
++                        (if (advertisedAt > 0L) "本地注册已确认 ${now - advertisedAt}ms" else "本地注册尚未确认") + "）",
+                 )
+                 lastLogAt = now
+             }
+@@ -2983,7 +2984,7 @@
+                 return false
+             }
+         }
+-        appendLog("CTRL: ${timeoutMillis}ms 未收到邀请——按超时继续连接（可能车机走旧发现路径）")
++        appendLog("CTRL: ${timeoutMillis}ms 未收到有效邀请或发现端点——由接收端策略决定后续")
+         return false
+     }
+ 
+@@ -3364,6 +3365,7 @@
+     private fun resolveEndpointHost(
+         endpoint: Iap2SenderSession.CarPlayEndpoint,
+         source: String,
++        allowGatewayFallback: Boolean = true,
+     ): Iap2SenderSession.CarPlayEndpoint {
+         var effective = endpoint
+         val cached = endpointBrowser?.awaitEndpoint(0)
+@@ -3384,6 +3386,7 @@
+                 // 兜底：热点场景车机 IP = 网关（Audi 实测 .1，但取网关更通用）。
+                 // mDNS 在部分网络/机型上不稳定（2026-10-11 实测车机 mDNS 时有时无）；
+                 // 网关地址 + 默认端口 7000 直接连，AirPlay 端口是固定约定。
++                if (!allowGatewayFallback) return effective
+                 val gateways = wifiConnector?.gatewayCandidates().orEmpty()
+                 val gateway = gateways.firstOrNull()
+                 if (gateway != null) {
+@@ -4427,17 +4430,43 @@
+                         releaseHandoff()
+                         return@run
+                     }
++                    val strictE2lb = endpoint.receiverSignals.model.equals("E2LB", ignoreCase = true) &&
++                        endpoint.receiverSignals.manufacturer.orEmpty().contains("general motors", ignoreCase = true)
++                    val boundNetwork = wifiConnector?.currentNetwork
++                    var ctrlReady = endpointSelfContained
+                     if (endpointSelfContained) {
+                         appendLog("AIRPLAY: 0x4301 端点完整（${endpoint.ipAddresses.firstOrNull()}:${endpoint.airPlayPort}）——直接配对，不等 ctrl 邀请")
+                     } else {
+                         // 等 ctrl 邀请（catplay CarPlayCtrlServer：邀请=车机已发现手机且
+                         // AirPlay 窗口已开，收到即刻连接）。此前是「固定睡 1.6s 赌它已到」，
+                         // 快的时候白等、慢的时候不够；改为事件驱动。
+-                        awaitCtrlInvite(endpoint.ssid, CTRL_INVITE_WAIT_MS)
++                        ctrlReady = awaitCtrlInvite(endpoint.ssid, CTRL_INVITE_WAIT_MS, endpoint.observation)
+                     }
+                     // 端点解析放在邀请之后：车机的 `_airplay._tcp` 常在受邀后才上线，
+                     // 且这一步最长 3s——必须在后台线程做，不能占住网络回调线程。
+-                    var effectiveEndpoint = resolveEndpointHost(endpoint, source)
++                    var effectiveEndpoint = resolveEndpointHost(endpoint, source, allowGatewayFallback = !strictE2lb)
++                    if (strictE2lb && (!ctrlReady || effectiveEndpoint.airPlayPort <= 0 ||
++                            !EndpointHosts.hasUsable(effectiveEndpoint.ipAddresses))
++                    ) {
++                        // Keep one observation and its bound network alive; no speculative pairing on :7000.
++                        val deadline = SystemClock.uptimeMillis() + 180_000L
++                        phaseHint = t(R.string.sc_waiting_4301)
++                        appendLog("E2LB: 等待正式启动端点（最多180秒），不猜测网关端口")
++                        while (!handoffCancelled() && boundNetwork != null &&
++                            wifiConnector?.currentNetwork == boundNetwork && SystemClock.uptimeMillis() < deadline
++                        ) {
++                            pendingEndpointUpdate.takeIf { it.observation === endpoint.observation }?.let { late ->
++                                effectiveEndpoint = preferEndpoint(late, effectiveEndpoint)
++                            }
++                            endpointBrowser?.awaitEndpoint(0)?.let { info ->
++                                effectiveEndpoint = mergeBrowserEndpoint(effectiveEndpoint, info, source, effectiveEndpoint.airPlayPort <= 0)
++                            }
++                            if (!effectiveEndpoint.portIsFallback && effectiveEndpoint.airPlayPort in 1..65535 &&
++                                EndpointHosts.hasUsable(effectiveEndpoint.ipAddresses)
++                            ) break
++                            Thread.sleep(250)
++                        }
++                    }
+                     // 交接流程起步期间车机补发的 0x4301（比 mDNS 合成更权威）在此并入。
+                     pendingEndpointUpdate.takeIf { it.observation === endpoint.observation }?.let { late ->
+                         effectiveEndpoint = preferEndpoint(late, effectiveEndpoint)
+@@ -4445,6 +4474,14 @@
+                             "AIRPLAY: 并入交接期间晚到的 0x4301 端点 → " +
+                                 "${effectiveEndpoint.ipAddresses.firstOrNull()}:${effectiveEndpoint.airPlayPort}",
+                         )
++                    }
++                    if (strictE2lb && (handoffCancelled() || boundNetwork == null ||
++                            wifiConnector?.currentNetwork != boundNetwork || effectiveEndpoint.portIsFallback ||
++                            effectiveEndpoint.airPlayPort !in 1..65535 || !EndpointHosts.hasUsable(effectiveEndpoint.ipAddresses))
++                    ) {
++                        appendLog("E2LB: 未获得明确端点或本轮网络已变化；停止在 DISCOVERY，不提交盲猜 SETUP")
++                        if (!wasCancelled()) ConnectionDiagnostics.timeline.finish(diagnosticAttempt, DiagnosticCode.CONNECTION_INCOMPLETE, true)
++                        return@run
+                     }
+                     if (effectiveEndpoint.airPlayPort > 0 && EndpointHosts.hasUsable(effectiveEndpoint.ipAddresses)) {
+                         ConnectionDiagnostics.timeline.milestone(
+--- a/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
+@@ -3095,7 +3095,7 @@
+                     }
+                     if (port != target.airPlayPort) endpoint = endpoint.copy(airPlayPort = port)
+                     log("AIRPLAY: TCP 已连通 $activeHost:$port（本机 ${newSocket.localAddress.hostAddress}）")
+-                    milestone(ConnectionMilestone.AIRPLAY_CONNECTED, if (port == target.airPlayPort) "port=advertised" else "port=fallback")
++                    milestone(ConnectionMilestone.AIRPLAY_CONNECTED, if (port == target.airPlayPort && !target.portIsFallback) "port=advertised" else "port=fallback")
+                     return true
+                 } catch (error: IOException) {
+                     runCatching { newSocket.close() }
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionMilestone.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionMilestone.kt
+@@ -19,6 +19,9 @@
+ 
+     /** 已发 0xAA05 自报认证完成；不代表本机校验了证书/签名，也不代表 AirPlay 配对成功。 */
+     IAP2_AUTHENTICATED(ConnectionStage.BLUETOOTH),
++
++    /** Compatibility signal sent after an unverified response; never proof of authentication. */
++    IAP2_AUTH_SIGNAL_UNVERIFIED(ConnectionStage.BLUETOOTH),
+ 
+     /** 拿到车机明确下发的完整热点配置（0x5703，或 0x4301 自带安全类型/密码）；仅已知 SSID 不算。 */
+     WIFI_CREDENTIALS(ConnectionStage.BLUETOOTH),
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt
+@@ -105,7 +105,8 @@
+             ConnectionStage.BLUETOOTH ->
+                 when {
+                     ConnectionMilestone.BT_LINK !in reached -> Blocker.BT_LINK
+-                    ConnectionMilestone.IAP2_AUTHENTICATED !in reached -> Blocker.IAP2_AUTH
++                    ConnectionMilestone.IAP2_AUTHENTICATED !in reached &&
++                        ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED !in reached -> Blocker.IAP2_AUTH
+                     ConnectionMilestone.WIFI_CREDENTIALS !in reached -> Blocker.WIFI_INFO
+                     else -> null
+                 }
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
+@@ -85,7 +85,9 @@
+             when (milestone) {
+                 ConnectionMilestone.BT_LINK -> R.string.ms_bt_link
+                 ConnectionMilestone.IAP2_IDENTIFIED -> R.string.ms_iap2_identified
+-                ConnectionMilestone.IAP2_AUTHENTICATED -> R.string.ms_iap2_authenticated
++                ConnectionMilestone.IAP2_AUTHENTICATED,
++                ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED,
++                -> R.string.ms_iap2_authenticated
+                 ConnectionMilestone.WIFI_CREDENTIALS -> R.string.ms_wifi_credentials
+                 ConnectionMilestone.WIFI_JOINED -> R.string.ms_wifi_joined
+                 ConnectionMilestone.CTRL_INVITED -> R.string.ms_ctrl_invited
+--- a/app/src/main/java/com/mcarplay/app/iap2/CarPlayBringupState.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/CarPlayBringupState.kt
+@@ -24,7 +24,8 @@
+     ): MfiNextAction =
+         if (!linkAlive ||
+             evidence == MfiChallengeEvidence.LINK_LOST ||
+-            evidence == MfiChallengeEvidence.EXPLICITLY_REJECTED
++            evidence == MfiChallengeEvidence.EXPLICITLY_REJECTED ||
++            evidence == MfiChallengeEvidence.TIMED_OUT
+         ) {
+             MfiNextAction.ABORT
+         } else {
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+@@ -365,7 +365,7 @@
+         }
+         sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck)
+         drainSendWindow(nowMillis)
+-        return true
++        return state != State.DEAD
+     }
+ 
+     // ---- 接收解析 ----
+@@ -559,6 +559,7 @@
+ 
+     private fun completeNegotiationIfPending(nowMillis: Long) {
+         if (state == State.NEGOTIATING && peerSynchronization != null) {
++            if (lastSentAcknowledged == null) lastSentAcknowledged = INITIAL_SEQUENCE
+             state = State.NORMAL
+             markerDeadline = null
+             syncDeadline = null
+@@ -635,10 +636,16 @@
+         acknowledgement: Int,
+         nowMillis: Long,
+     ) {
++        val previous = lastSentAcknowledged ?: INITIAL_SEQUENCE
++        val advance = sequenceDistance(acknowledgement, previous)
++        val sent = sequenceDistance(sentSequence, previous)
++        // RFCOMM is ordered; only a cumulative ACK inside the sent interval is valid.
++        // Negotiation retains its legacy completion path without accepting bogus ACK watermarks.
++        if (advance in 1..sent) {
++            lastSentAcknowledged = acknowledgement
++            unacknowledged.removeAll { sequenceDistance(it.sequence, previous) in 1..advance }
++        }
+         completeNegotiationIfPending(nowMillis)
+-        lastSentAcknowledged = acknowledgement
+-        val window = (peerSynchronization?.maxOutgoing ?: maxOutgoing) + ACK_SLACK
+-        unacknowledged.removeAll { sequenceDistance(it.sequence, acknowledgement) !in 1..window }
+         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
+         drainSendWindow(nowMillis)
+     }
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -174,7 +174,7 @@
+ 
+     /** 暂存区上限：车机订阅类消息可能在长等待期间持续到达，无上限会吃内存。 */
+     private val maxPendingFrames = 256
+-    private var pendingOverflowLogged = false
++
+ 
+     private val random = SecureRandom()
+ 
+@@ -193,6 +193,7 @@
+ 
+     /** Frames received before 0x4300; counts include link ACK, not evidence of session acceptance. */
+     private var availabilityPeerFramesBefore: Long? = null
++    private var availabilityParserBefore: Iap2LinkEngine.ParserStats? = null
+ 
+     /** 最近一次晚到 0x4301 的端点指纹（车机周期重发相同内容时不重复打详情）。 */
+     private var lastLateStartSessionSignature: Int? = null
+@@ -381,7 +382,7 @@
+             "iap2 tx=0xaa05 compatibility signal; evidence=" + mfiEvidence +
+                 "; certificate/signature NOT verified; peer acceptance NOT established",
+         )
+-        reached(ConnectionMilestone.IAP2_AUTHENTICATED) // Legacy timeline means LOCAL 0xAA05 only.
++        reached(ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED)
+ 
+         // ---- 设备状态问候（须紧跟 0xAA05：车机据此判定 accessory 就绪）----
+         sendDeviceStateGreetings()
+@@ -634,6 +635,16 @@
+                     framesReceivedAfterAvailability = delta,
+                     startSessionReceived = startSession != null,
+                 )
++            availabilityParserBefore?.let { parserBefore ->
++                val after = channel.parserStats()
++                log(
++                    "LINK-PARSER 0x4300 window: DETECT=${after.detectMarkers - parserBefore.detectMarkers} " +
++                        "badHeader=${after.invalidHeaderChecksums - parserBefore.invalidHeaderChecksums} " +
++                        "badPayload=${after.invalidPayloadChecksums - parserBefore.invalidPayloadChecksums} " +
++                        "badLength=${after.invalidLengths - parserBefore.invalidLengths} " +
++                        "noiseBytes=${after.discardedNoiseBytes - parserBefore.discardedNoiseBytes}",
++                )
++            }
+             log(
+                 "iap2 0x4300 观察: peerFrames=$delta result=$outcome " +
+                     "(peerFrames 包含纯 ACK；不代表 0x4300 已被接受；0x4301 才是启动证据)",
+@@ -990,7 +1001,7 @@
+                 MFI_ATTEMPTS.map { it.first }
+             }
+         val windowOf = MFI_ATTEMPTS.associate { it.first to it.second }
+-        val memory = receiverKey?.let { MfiLengthMemory.load(context, it) } ?: MfiLengthMemory.Entry()
++        val memory = receiverKey?.let { MfiLengthMemory.load(context, it).copy(succeeded = null) } ?: MfiLengthMemory.Entry()
+         val order = pinnedLength?.let { listOf(it) } ?: MfiLengthMemory.orderAttempts(baselineLengths, memory)
+         if (pinnedLength != null) {
+             log("iap2 MFi 固定 ${pinnedLength}B（接收端策略）——只发一次，窗口 ${MfiLengthMemory.KNOWN_GOOD_WINDOW_MS}ms")
+@@ -1018,12 +1029,10 @@
+             while (true) {
+                 val remaining = (window - System.nanoTime()) / 1_000_000L
+                 if (remaining <= 0) break
+-                val frame = recvFrame(remaining)
++                val frame = recvNewFrame(remaining)
+                 if (frame == null) {
+                     if (!channel.isAlive) {
+-                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
+-                        // 硬拒绝：链路级证据，推翻「该长度=上次成功」的记忆（防误记锁死）
+-                        receiverKey?.let { MfiLengthMemory.recordHardRejected(context, it, size) }
++                        log("iap2 MFi 挑战期间链路断开（${size}B）；原因未验证，不记为认证拒绝")
+                         return MfiChallengeEvidence.LINK_LOST
+                     }
+                     continue
+@@ -1039,17 +1048,13 @@
+                         gotFailure = true
+                     }
+ 
+-                    else ->
+-                        log(
+-                            "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
+-                                "(${Iap2MessageIds.nameOf(frame.messageId)})",
+-                        )
++                    else -> deferFrame(frame)
+                 }
+                 if (gotResponse || gotFailure) break
+             }
+             if (gotResponse) {
+                 // 多档共用连接时，迟到应答可能属于上一档；无可靠归属就不训练成功参数。
+-                if (position == 0) receiverKey?.let { MfiLengthMemory.recordSuccess(context, it, size) }
++                log("iap2 MFi response observed; not cryptographically verified; no success memory written")
+                 return MfiChallengeEvidence.RESPONSE_UNVERIFIED
+             }
+             if (gotFailure) {
+@@ -1130,6 +1135,7 @@
+     private fun sendCarPlayAvailability() {
+         if (carPlayAvailabilitySent) return
+         availabilityPeerFramesBefore = channel.peerFrameCount()
++        availabilityParserBefore = channel.parserStats()
+         val availabilityShape = E2lbAvailabilityBodyPolicy.select(
+             receiverSignals.model,
+             receiverSignals.manufacturer,
+@@ -1347,14 +1353,7 @@
+                 "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
+                     "(${Iap2MessageIds.nameOf(frame.messageId)})，非预期，暂存待后续消费",
+             )
+-            pendingFrames += frame
+-            if (pendingFrames.size > maxPendingFrames) {
+-                pendingFrames.removeFirst()
+-                if (!pendingOverflowLogged) {
+-                    pendingOverflowLogged = true
+-                    log("iap2 非预期帧暂存区超过 $maxPendingFrames 条——丢弃最旧的（车机订阅类消息过多）")
+-                }
+-            }
++            deferFrame(frame)
+         }
+     }
+ 
+@@ -1368,35 +1367,23 @@
+         // 声明会发却没到时写「该接收端不发 StartHID」会误导排查（issue #66，
+         // 2026-11-15 保时捷 NEW 轮的实测：声明 StartHID=会发，2s 内未到）。
+         val hidWindowNanos = minOf(System.nanoTime() + START_HID_WAIT_NANOS, deadline)
+-        while (true) {
+-            val remaining = (hidWindowNanos - System.nanoTime()) / 1_000_000L
+-            if (remaining <= 0) {
+-                log(startHidTimeoutLine(declaresSend = accessoryDeclaresSend(Iap2MessageIds.START_HID)))
+-                return
+-            }
+-            val frame = recvFrame(remaining)
+-            if (frame == null) {
+-                if (!channel.isAlive) return // 链路已死：交给后续 expect 报出明确错误
+-                continue
+-            }
+-            when (frame.messageId) {
+-                Iap2MessageIds.START_HID -> {
+-                    log("iap2 rx=0x6800 start-hid bytes=${frame.body.size}")
+-                    send(
+-                        Iap2MessageIds.DEVICE_HID_REPORT,
+-                        Iap2Csm.u16(0, 0),
+-                        Iap2Csm.param(1, byteArrayOf(0)),
+-                    )
+-                    return
+-                }
+-
+-                else ->
+-                    log(
+-                        "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
+-                            "(${Iap2MessageIds.nameOf(frame.messageId)})",
+-                    )
+-            }
+-        }
++        val frame = expectOrNull(Iap2MessageIds.START_HID, hidWindowNanos)
++        if (frame == null) {
++            log(startHidTimeoutLine(declaresSend = accessoryDeclaresSend(Iap2MessageIds.START_HID)))
++            return
++        }
++        log("iap2 rx=0x6800 start-hid bytes=${frame.body.size}")
++        send(
++            Iap2MessageIds.DEVICE_HID_REPORT,
++            Iap2Csm.u16(0, 0),
++            Iap2Csm.param(1, byteArrayOf(0)),
++        )
++    }
++
++    private fun deferFrame(frame: Iap2Csm.Frame) {
++        // A bounded queue must not silently discard a session-start or credential message.
++        if (pendingFrames.size >= maxPendingFrames) throw IOException("iAP2 deferred control queue overflow")
++        pendingFrames += frame
+     }
+ 
+     /**
+--- a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
+@@ -294,7 +294,7 @@
+ 
+             // 车机 ctrl 邀请：这是「车机已发现手机、AirPlay 窗口已开」的权威信号
+             // （catplay CarPlayCtrlSession：收到即把邀请交给连接流程）。
+-            if (requestLine.startsWith("GET /ctrl-int/1/connect")) {
++            if (requestLine.split(' ').let { it.size == 3 && it[0] == "GET" && it[1].substringBefore('?') == "/ctrl-int/1/connect" && it[2].startsWith("HTTP/") }) {
+                 val receiverId =
+                     head
+                         .lineSequence()
+--- a/app/src/main/java/com/mcarplay/app/net/CarPlayServiceBrowser.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CarPlayServiceBrowser.kt
+@@ -38,11 +38,14 @@
+     /** 每次清缓存/换网递增；旧网段的异步 resolve 回调不能把结果写回新代次。 */
+     @Volatile
+     private var cacheGeneration = 0
++    private val serviceTokens = mutableMapOf<Pair<String, String>, Any>()
++    private fun serviceKey(info: NsdServiceInfo) = info.serviceName to info.serviceType
+ 
+     /** 新会话开始时清掉上一轮缓存（车机可能换了地址/端口）。 */
+     @Synchronized
+     fun resetCache() {
+         cacheGeneration++
++        serviceTokens.clear()
+         resolved = null
+     }
+ 
+@@ -105,6 +108,7 @@
+ 
+     @Synchronized
+     fun stop() {
++        resetCache()
+         if (!discovering) return
+         discoveryListener?.let { listener -> runCatching { nsdManager.stopServiceDiscovery(listener) } }
+         discoveryListener = null
+@@ -123,9 +127,12 @@
+                 serviceType: String,
+                 errorCode: Int,
+             ) {
+-                if (discoveryListener === this) {
+-                    discoveryListener = null
+-                    discovering = false
++                synchronized(this@CarPlayServiceBrowser) {
++                    if (discoveryListener === this) {
++                        discoveryListener = null
++                        discovering = false
++                        resetCache()
++                    }
+                 }
+                 log("$TAG: 发现启动失败 code=$errorCode")
+             }
+@@ -143,10 +150,19 @@
+ 
+             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                 log("$TAG: 发现服务 ${serviceInfo.serviceName} (${serviceInfo.serviceType})，解析中…")
+-                resolveWithRetry(serviceInfo, attempts = 3, generation = generation)
++                val token = synchronized(this@CarPlayServiceBrowser) {
++                    if (generation != cacheGeneration || discoveryListener !== this) return
++                    Any().also { serviceTokens[serviceKey(serviceInfo)] = it }
++                }
++                resolveWithRetry(serviceInfo, attempts = 3, generation = generation, token = token)
+             }
+ 
+             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
++                synchronized(this@CarPlayServiceBrowser) {
++                    if (generation != cacheGeneration || discoveryListener !== this) return
++                    serviceTokens.remove(serviceKey(serviceInfo))
++                    if (resolved?.let(::serviceKey) == serviceKey(serviceInfo)) resolved = null
++                }
+                 log("$TAG: 服务消失 ${serviceInfo.serviceName}")
+             }
+         }
+@@ -156,7 +172,12 @@
+         serviceInfo: NsdServiceInfo,
+         attempts: Int,
+         generation: Int,
++        token: Any,
+     ) {
++        val key = serviceKey(serviceInfo)
++        synchronized(this) {
++            if (generation != cacheGeneration || serviceTokens[key] !== token) return
++        }
+         val listener =
+             object : NsdManager.ResolveListener {
+                 override fun onResolveFailed(
+@@ -166,7 +187,7 @@
+                     if (errorCode == NsdManager.FAILURE_ALREADY_ACTIVE && attempts > 1) {
+                         Thread {
+                             Thread.sleep(200)
+-                            resolveWithRetry(info, attempts - 1, generation)
++                            resolveWithRetry(serviceInfo, attempts - 1, generation, token)
+                         }.start()
+                     } else {
+                         log("$TAG: 解析失败 ${info.serviceName} code=$errorCode")
+@@ -192,7 +213,7 @@
+                     // resetCache 与最终写入/上报必须是同一个临界区：否则旧网段的
+                     // resolve 可能在清缓存后重新写回，并把旧地址带给下一轮连接。
+                     synchronized(this@CarPlayServiceBrowser) {
+-                        if (accepted && generation == cacheGeneration) {
++                        if (accepted && generation == cacheGeneration && serviceTokens[key] === token) {
+                             resolved = info
+                             onEndpoint(info)
+                         }
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -103,6 +103,8 @@
+     /** Snapshot only. Can include ACK-only frames; never use as proof of CarPlay activation. */
+     fun peerFrameCount(): Long = synchronized(lock) { receivedPeerFrameCount }
+ 
++    fun parserStats(): Iap2LinkEngine.ParserStats = synchronized(lock) { engine.parserStats() }
++
+     /**
+      * 等待链路终结（[close] 或读写失败），最多 [timeoutMillis]；返回是否已终结。
+      * 可被中断：调用方若需要在已中断状态下等待，先清除中断标志、等完再恢复。
+@@ -121,7 +123,7 @@
+             if (terminated) return false
+             val accepted = engine.sendControl(bytes, nowMillis(), awaitAck)
+             drainOutputLocked()
+-            return accepted
++            return accepted && !terminated
+         }
+     }
+ 
+--- a/app/src/main/res/values/strings_diag.xml
++++ b/app/src/main/res/values/strings_diag.xml
+@@ -59,7 +59,7 @@
+     <string name="step_streaming">画面</string>
+     <string name="ms_bt_link">蓝牙链路已建立</string>
+     <string name="ms_iap2_identified">iAP2 识别完成</string>
+-    <string name="ms_iap2_authenticated">iAP2 认证完成</string>
++    <string name="ms_iap2_authenticated">iAP2 兼容信号（未验证）</string>
+     <string name="ms_wifi_credentials">已拿到车机热点信息</string>
+     <string name="ms_wifi_joined">已加入车机网络</string>
+     <string name="ms_ctrl_invited">收到车机 ctrl 邀请</string>
+--- a/app/src/main/res/values-en/strings_diag.xml
++++ b/app/src/main/res/values-en/strings_diag.xml
+@@ -59,7 +59,7 @@
+     <string name="step_streaming">Video</string>
+     <string name="ms_bt_link">Bluetooth link up</string>
+     <string name="ms_iap2_identified">iAP2 identified</string>
+-    <string name="ms_iap2_authenticated">iAP2 authenticated</string>
++    <string name="ms_iap2_authenticated">iAP2 compatibility signal (unverified)</string>
+     <string name="ms_wifi_credentials">Hotspot details received</string>
+     <string name="ms_wifi_joined">Joined the car network</string>
+     <string name="ms_ctrl_invited">Head-unit invite received</string>
+--- a/app/src/test/java/com/mcarplay/app/iap2/CarPlayBringupStateTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/CarPlayBringupStateTest.kt
+@@ -36,16 +36,15 @@
+     }
+ 
+     @Test
+-    fun silentTimeoutIsAnExplicitlyUnverifiedCompatibilityAttempt() {
++    fun silentTimeoutAbortsWithoutSuccessSignal() {
+         val state = CarPlayBringupState()
+         state.onLinkReady()
+         state.onIdentified()
+         assertEquals(
+-            MfiNextAction.SEND_UNVERIFIED_AUTH_SIGNAL,
++            MfiNextAction.ABORT,
+             state.onMfiEvidence(MfiChallengeEvidence.TIMED_OUT, linkAlive = true),
+         )
+-        state.onAuthSignalSent()
+-        assertEquals(CarPlayBringupState.Stage.AUTH_SIGNAL_SENT_UNVERIFIED, state.stage)
++        assertEquals(CarPlayBringupState.Stage.FAILED, state.stage)
+     }
+ 
+     @Test
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+@@ -8,6 +8,47 @@
+ 
+ /** 两个链路引擎通过直接交换输出字节完成握手与数据往返（无线程、无 I/O）。 */
+ class Iap2LinkEngineTest {
++    @Test
++    fun invalidAcknowledgementsNeverRemoveUnsentOrUnconfirmedPackets() {
++        val phone = normalHandshake().phone
++        fun field(name: String): Any? = phone.javaClass.getDeclaredField(name).apply { isAccessible = true }.get(phone)
++        fun outstanding(): Int = (field("unacknowledged") as List<*>).size
++        fun watermark(): Int = field("lastSentAcknowledged") as Int
++        fun ack(sequence: Int) = ackFrame().apply {
++            this[6] = sequence.toByte()
++            this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++        }
++        val initial = watermark()
++        repeat(20) { assertTrue(phone.sendControl(Iap2Csm.encode(0x5000), tick())) }
++        val lastSent = field("sentSequence") as Int
++        phone.takeOutput()
++        assertEquals(20, outstanding())
++        phone.feed(ack(initial), tick())
++        phone.feed(ack((lastSent + 1) and 255), tick())
++        phone.feed(ack((initial - 1) and 255), tick())
++        assertEquals(20, outstanding())
++        assertEquals(initial, watermark())
++        phone.feed(ack(lastSent), tick())
++        assertEquals(0, outstanding())
++        assertEquals(lastSent, watermark())
++    }
++
++    @Test
++    fun cumulativeAcknowledgementSurvivesSequenceWrap() {
++        val phone = normalHandshake().phone
++        fun watermark(): Int = phone.javaClass.getDeclaredField("lastSentAcknowledged").apply { isAccessible = true }.get(phone) as Int
++        repeat(300) {
++            assertTrue(phone.sendControl(Iap2Csm.encode(0x5000), tick()))
++            val sent = parseFrames(phone.takeOutput()).single().sequence
++            val ack = ackFrame().apply {
++                this[6] = sent.toByte()
++                this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++            }
++            phone.feed(ack, tick())
++            assertEquals(sent, watermark())
++        }
++    }
++
+     @Test
+     fun corruptPayloadFollowedByValidFrameDoesNotLoseTheValidFrame() {
+         val sender = Iap2LinkEngine()
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+@@ -20,6 +20,26 @@
+  */
+ class Iap2SenderSessionTest {
+     @Test
++    fun startSessionArrivingDuringAuthenticationOrHidWaitIsPreserved() {
++        for (earlyAtChallenge in listOf(true, false)) {
++            val pair = InMemoryStreamPair()
++            val phone = Iap2LinkChannel(pair.sideA, name = "early-phone")
++            val peer = Iap2LinkChannel(pair.sideB, name = "early-peer")
++            val accessory = MockAccessory(peer, earlyAtChallenge = earlyAtChallenge, earlyAtHid = !earlyAtChallenge)
++            val thread = Thread { accessory.run() }.apply { isDaemon = true; start() }
++            try {
++                val endpoint = Iap2SenderSession(phone, log = {}, bluetoothMac = "34:86:DA:86:BB:96", deviceName = "early-test").run(15_000L)
++                assertEquals(49152, endpoint.airPlayPort)
++                assertEquals("mock-device-id", endpoint.deviceIdentifier)
++            } finally {
++                phone.close()
++                peer.close()
++                thread.join(2_000L)
++            }
++        }
++    }
++
++    @Test
+     fun fullBringUpAgainstMockAccessory() {
+         val pair = InMemoryStreamPair()
+         val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
+@@ -41,7 +61,7 @@
+             ).run(timeoutMillis = 10_000L)
+ 
+         assertEquals(
+-            listOf(ConnectionMilestone.BT_LINK, ConnectionMilestone.IAP2_IDENTIFIED, ConnectionMilestone.IAP2_AUTHENTICATED),
++            listOf(ConnectionMilestone.BT_LINK, ConnectionMilestone.IAP2_IDENTIFIED, ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED),
+             synchronized(milestones) { milestones.toList() },
+         )
+         assertEquals("MockAP", endpoint.ssid)
+@@ -70,7 +90,7 @@
+         val endpoint =
+             cheryBringUp(wifi, providesStartSession = false, milestones = milestones) { credentials ->
+                 assertEquals(
+-                    listOf(ConnectionMilestone.BT_LINK, ConnectionMilestone.IAP2_IDENTIFIED, ConnectionMilestone.IAP2_AUTHENTICATED),
++                    listOf(ConnectionMilestone.BT_LINK, ConnectionMilestone.IAP2_IDENTIFIED, ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED),
+                     milestones,
+                 )
+                 delivered += credentials
+@@ -1160,6 +1180,8 @@
+         private val closeAfterWifiRequest: Boolean = false,
+         /** ≥0 = 发出 0x4301 后延迟这么久再补发 0x5703（旧协议凭据晚到，PR #71 审查 P2）。 */
+         private val lateWifiConfigurationAfterMs: Long = -1L,
++        private val earlyAtChallenge: Boolean = false,
++        private val earlyAtHid: Boolean = false,
+     ) {
+         private val parser = Iap2Csm.Parser()
+         private val pending = ArrayDeque<Iap2Csm.Frame>()
+@@ -1249,6 +1271,7 @@
+                     .parseParams(challenge.body)
+                     .single { it.id == 0 }
+                     .value.size
++            if (earlyAtChallenge) sendStartSession()
+             send(Iap2MessageIds.MFI_RESPONSE, Iap2Csm.param(0, ByteArray(70) { (it * 7).toByte() }))
+             expect(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
+ 
+@@ -1265,6 +1288,7 @@
+ 
+             // 订阅 + StartHID（奥迪/宝马/CT5 形态不发，发送端应直接跳过等待）
+             if (!legacyHid) {
++                if (earlyAtHid) sendStartSession()
+                 send(Iap2MessageIds.START_NOW_PLAYING_UPDATES)
+                 send(Iap2MessageIds.START_POWER_UPDATES)
+                 send(
+@@ -1354,7 +1378,7 @@
+ 
+             // CarPlay 启动
+             expect(Iap2MessageIds.CARPLAY_AVAILABILITY)
+-            if (providesStartSession && !lateStartSession) {
++            if (providesStartSession && !lateStartSession && !earlyAtChallenge && !earlyAtHid) {
+                 sendStartSession()
+             }
+ 

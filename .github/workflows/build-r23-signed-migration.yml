@@ -1,0 +1,161 @@
+name: R23 verified release candidate for offline signing
+
+on:
+  push:
+    branches:
+      - feature/r23-signed-migration-build
+    paths:
+      - 'r20-patch/**'
+      - 'r22-build/**'
+      - 'r23-build/**'
+      - '.github/workflows/build-r23-signed-migration.yml'
+  pull_request:
+    branches:
+      - feature/r22-e2lb-debug-apk
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: r23-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - name: Retrieve exact pinned R19 full-source baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-R19-complete-source
+          run-id: 44990721353
+          github-token: ${{ github.token }}
+          path: baseline
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Prepare Android SDK 35
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          yes | "$sdkmanager" --sdk_root="$sdk" --licenses > /dev/null || true
+          "$sdkmanager" --sdk_root="$sdk" --install 'platforms;android-35' 'build-tools;35.0.0'
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Reconstruct EXACT audited R20 source from pinned R19
+        run: |
+          set -euo pipefail
+          cat kit/r20-patch/part*.txt | tr -d '\n\r' | base64 --decode | xz --decompress > r20.patch
+          echo 'c7c94575be31374612d60a060b21ac58faef3ab2b2be3c9ce026760d7c684684  r20.patch' | sha256sum --check --status
+          test -f baseline/mcarplay-project/gradlew
+          cd baseline/mcarplay-project
+          git apply -p3 --check "$GITHUB_WORKSPACE/r20.patch"
+          git apply -p3 "$GITHUB_WORKSPACE/r20.patch"
+          test -s app/src/main/java/com/mcarplay/app/audio/ExternalPcmAligner.kt
+          test -s app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
+          test -s app/src/test/java/com/mcarplay/app/bt/BluetoothSessionArbiterTest.kt
+          echo "Exact R20 baseline patch applied"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/fix_ktlint_comments.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/post_audit_fixes.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r22-build/R21-from-R20-audited.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r22-build/R21-from-R20-audited.patch"
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r22-build/R22-from-R21.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r22-build/R22-from-R21.patch"
+          test -s app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+          test -s app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r23-build/R23-from-R22.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r23-build/R23-from-R22.patch"
+          grep -F 'val appVersionName = "0.1.9"' app/build.gradle.kts
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ("app/src/main/java/com/mcarplay/app/update/GitHubRelease.kt", "app/src/test/java/com/mcarplay/app/update/GitHubReleaseTest.kt"):
+              p=Path(name)
+              s=p.read_text()
+              assert s.count("1092679281/CarPlay-Updates")==1, name
+              p.write_text(s.replace("1092679281/CarPlay-Updates", "1092679281/Android-"))
+          p=Path("docs/UPDATES.md")
+          s=p.read_text()
+          assert s.count("wangxso/mcarplay")==2
+          p.write_text(s.replace("wangxso/mcarplay", "1092679281/Android-"))
+          p=Path("CHANGELOG.md")
+          s=p.read_text()
+          anchor="## [v0.1.7-test.1] - 2026-11-13"
+          assert s.count(anchor)==1
+          notes="## [v0.1.9-test.1] - 2026-11-24\n\n> Experimental signing migration; not vehicle-validated.\n> 实验签名迁移版，尚未实车验证。\n\n### English\n- Correct iAP2 ACK validation, early message handling and endpoint provenance.\n- Configure the project update repository. E2LB connection remains unverified.\n\n### 简体中文\n- 修正 iAP2 ACK 验证、提前消息处理及端点来源判断。\n- 配置项目更新仓库，E2LB 连接仍待实车验证。\n\n"
+          p.write_text(s.replace(anchor, notes+anchor))
+          PY
+          echo "R23 source reconstruction and verified update-repository configuration completed"
+      - name: Full Kotlin/JVM tests, formatting, Android Lint and real APK compilation
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.releaseTag=v0.1.9-test.1 :app:assembleStandardRelease
+      - name: Strictly verify R23 critical regression test suites ran and passed
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root=Path('baseline/mcarplay-project/app/build/test-results/testStandardDebugUnitTest')
+          names=['com.mcarplay.app.bt.BluetoothSessionArbiterTest','com.mcarplay.app.video.VideoEncoderAbrTest','com.mcarplay.app.audio.ExternalPcmAlignerTest','com.mcarplay.app.airplay.StreamFrameCipherTest','com.mcarplay.app.iap2.Iap2LinkEngineTest','com.mcarplay.app.iap2.E2lbAvailabilityBodyPolicyTest','com.mcarplay.app.iap2.CarPlayBringupStateTest','com.mcarplay.app.iap2.Iap2SenderSessionTest','com.mcarplay.app.update.GitHubReleaseTest','com.mcarplay.app.update.ApkUpdateVerifierTest']
+          total=0
+          for cls in names:
+              f=root/('TEST-'+cls+'.xml')
+              if not f.is_file(): raise SystemExit('Missing mandatory R23 JUnit suite: '+str(f))
+              suite=ET.parse(f).getroot()
+              tests=suite.findall('testcase')
+              errors=[x for x in tests if x.find('failure') is not None or x.find('error') is not None or x.find('skipped') is not None]
+              if len(tests)<2 or errors: raise SystemExit(f'R23 mandatory suite rejected: {cls}: {len(tests)} cases, {len(errors)} bad')
+              total+=len(tests)
+              print(cls, 'PASS', len(tests))
+          print('R23 mandatory source tests passed:', total)
+          PY
+      - name: Verify intermediate release APK and export official SDK signer for offline signing
+        run: |
+          set -euo pipefail
+          apk='baseline/mcarplay-project/app/build/outputs/apk/standard/release/app-standard-release.apk'
+          sdktools="$ANDROID_HOME/build-tools/35.0.0"
+          test -s "$apk"
+          unzip -tqq "$apk"
+          "$sdktools/apksigner" verify --verbose --print-certs "$apk"
+          "$sdktools/aapt" dump badging "$apk" | sed -n '1p' | grep -F "package: name='com.mcarplay.app' versionCode='1090000' versionName='0.1.9'"
+          mkdir -p dist
+          cp "$apk" dist/R23-intermediate-NOT-FOR-INSTALL.apk
+          cp "$sdktools/lib/apksigner.jar" dist/apksigner.jar
+          (cd dist; sha256sum R23-intermediate-NOT-FOR-INSTALL.apk apksigner.jar > SHA256SUMS.txt)
+          printf 'CI intermediate; must be re-signed offline with persistent key and verified. Do not distribute as upgrade.\n' > dist/BUILD-SCOPE.txt
+      - name: Upload intermediate and SDK signing utility (no private key)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R23-offline-signing-input
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Preserve exact patched R23 source
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R23-verified-complete-source
+          path: |
+            baseline/mcarplay-project/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Preserve JUnit and Lint evidence on any result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R23-junit-lint-evidence
+          path: |
+            baseline/mcarplay-project/app/build/test-results/
+            baseline/mcarplay-project/app/build/reports/tests/
+            baseline/mcarplay-project/app/build/reports/lint-results-*
+          if-no-files-found: ignore
+          retention-days: 14
