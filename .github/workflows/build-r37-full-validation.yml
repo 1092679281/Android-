@@ -1,0 +1,562 @@
+name: R37 projection interaction and Lacrosse Android verification
+
+on:
+  push:
+    branches:
+      - feature/r26-full-validation
+    paths:
+      - 'r37-build/**'
+      - '.github/workflows/build-r37-full-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: r37-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+      - name: Retrieve exact pinned R19 full-source baseline
+        uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-R19-complete-source
+          run-id: 44990721353
+          github-token: ${{ github.token }}
+          path: baseline
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Prepare Android SDK 35
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          yes | "$sdkmanager" --sdk_root="$sdk" --licenses > /dev/null || true
+          "$sdkmanager" --sdk_root="$sdk" --install 'platforms;android-35' 'build-tools;35.0.0'
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Reconstruct exact R26 source and verify fingerprint
+        run: |
+          set -euo pipefail
+          cat kit/r20-patch/part*.txt | tr -d '\n\r' | base64 --decode | xz --decompress > r20.patch
+          echo 'c7c94575be31374612d60a060b21ac58faef3ab2b2be3c9ce026760d7c684684  r20.patch' | sha256sum --check --status
+          test -f baseline/mcarplay-project/gradlew
+          cd baseline/mcarplay-project
+          git apply -p3 --check "$GITHUB_WORKSPACE/r20.patch"
+          git apply -p3 "$GITHUB_WORKSPACE/r20.patch"
+          test -s app/src/main/java/com/mcarplay/app/audio/ExternalPcmAligner.kt
+          test -s app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
+          test -s app/src/test/java/com/mcarplay/app/bt/BluetoothSessionArbiterTest.kt
+          echo "Exact R20 baseline patch applied"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/fix_ktlint_comments.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          python3 "$GITHUB_WORKSPACE/kit/r20-patch/post_audit_fixes.py" "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r22-build/R21-from-R20-audited.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r22-build/R21-from-R20-audited.patch"
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r22-build/R22-from-R21.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r22-build/R22-from-R21.patch"
+          test -s app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+          test -s app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
+          git apply -p1 --check "$GITHUB_WORKSPACE/kit/r23-build/R23-from-R22.patch"
+          git apply -p1 "$GITHUB_WORKSPACE/kit/r23-build/R23-from-R22.patch"
+          grep -F 'val appVersionName = "0.1.9"' app/build.gradle.kts
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ("app/src/main/java/com/mcarplay/app/update/GitHubRelease.kt", "app/src/test/java/com/mcarplay/app/update/GitHubReleaseTest.kt"):
+              p=Path(name)
+              s=p.read_text()
+              assert s.count("1092679281/CarPlay-Updates")==1, name
+              p.write_text(s.replace("1092679281/CarPlay-Updates", "1092679281/Android-"))
+          p=Path("docs/UPDATES.md")
+          s=p.read_text()
+          assert s.count("wangxso/mcarplay")==2
+          p.write_text(s.replace("wangxso/mcarplay", "1092679281/Android-"))
+          p=Path("CHANGELOG.md")
+          s=p.read_text()
+          anchor="## [v0.1.7-test.1] - 2026-11-13"
+          assert s.count(anchor)==1
+          notes="## [v0.1.9-test.1] - 2026-11-24\n\n> Experimental signing migration; not vehicle-validated.\n> 实验签名迁移版，尚未实车验证。\n\n### English\n- Correct iAP2 ACK validation, early message handling and endpoint provenance.\n- Configure the project update repository. E2LB connection remains unverified.\n\n### 简体中文\n- 修正 iAP2 ACK 验证、提前消息处理及端点来源判断。\n- 配置项目更新仓库，E2LB 连接仍待实车验证。\n\n"
+          p.write_text(s.replace(anchor, notes+anchor))
+          PY
+          # Validate exact local R26 deltas before applying; signing helpers are intentionally local-only.
+          cd "$GITHUB_WORKSPACE/kit/r26-build"
+          sha256sum -c <<'SUMS'
+          6771428a94c811de81c2df0d517e145868bfad2317c3ba14b1604a76e99ed00b  R23-round2-ctrl-lifecycle.patch
+          5679044eb5272ba5d96842f365849d1fa26a8c91498cc235ec97a1a24d2b492a  R24-0.1.11-from-0.1.10.patch
+          5162501e2b89c31628427e7c502d6e861ce14053765b29ce7380256bb34b06ea  R25-0.1.12-from-R24.patch
+          6260e66bf9dac896c19470b0571dd4aa9e532991be257b851f480119b36ee494  R26-0.1.13-from-R25.patch
+          SUMS
+          cd "$GITHUB_WORKSPACE/baseline/mcarplay-project"
+          for delta in R23-round2-ctrl-lifecycle.patch R24-0.1.11-from-0.1.10.patch R25-0.1.12-from-R24.patch R26-0.1.13-from-R25.patch; do
+            git apply -p1 --exclude='build-*.ps1' --check "$GITHUB_WORKSPACE/kit/r26-build/$delta"
+            git apply -p1 --exclude='build-*.ps1' "$GITHUB_WORKSPACE/kit/r26-build/$delta"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'),Path('CHANGELOG.md'),Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          print("Pre-format source fingerprint",len(paths),h.hexdigest())
+          manifest=Path("r26-source-fingerprint.tsv")
+          manifest.write_text("".join(f"{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n" for p in paths))
+          for p in paths[-3:]:
+              print("Critical file",p,sha256(p.read_bytes()).hexdigest())
+          # Local R26 was independently normalized with the existing R20 CI fixes.
+          # All 603 per-file digests matched the downloaded CI manifest.
+          assert len(paths)==603 and h.hexdigest()=="a45186491113b533fa7c56c3ff3735b75550b166b120ecb5b50fa81a3f3aa2d5", "R26 source does not match local validated snapshot"
+          PY
+          grep -F 'val appVersionName = "0.1.13"' app/build.gradle.kts
+          echo "Exact R26 app source reconstruction completed"
+      - name: Apply exact reviewed R28 delta and verify app fingerprint
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r28-build/R28-from-R26.patch"
+          test -f "$patch" || { echo "::error::R28 delta has not yet been uploaded"; exit 1; }
+          echo "a0515024efd17896978ec7e1fa448831c9e919411979c4614642f9596ddec970  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r28-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==612 and h.hexdigest()=="c5e5a3b16b120ef6e958d49b8597e30e3deb2cdb1bce8806ecd419e322496a60", (len(paths),h.hexdigest())
+          print("Exact R28 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.15"' app/build.gradle.kts
+      - name: Apply exact R32 Lacrosse recovery delta
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r32-build/R32-from-R28-app.patch"
+          echo "42eaf0e1fa305d3bdde9edbd3767ddaa1d385e02ef6146e8413f24ea80b8b589  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r32-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==623 and h.hexdigest()=="7a013206d67b6e4a7ddc613ec1163c184b26988de1fd63fe6418e1ed81ed15ee", (len(paths),h.hexdigest())
+          print("Exact R32 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.19"' app/build.gradle.kts
+      - name: Apply reviewed R32 recovery and formatting fixes
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r32-build/R32-recovery-ci-fix.patch"
+          echo "699a90d9f8da530ddc4a0a2218fd613fbac092a5fa16a3475d9cf14a02f3e885  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r32-fixed-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==623 and h.hexdigest()=="9119b22e8a0042615d33baf14dc6b84f41bdf77124d53be25926e1f30d143bfa", (len(paths),h.hexdigest())
+          print("Exact reviewed R32 source",len(paths),h.hexdigest())
+          PY
+      - name: Apply reviewed controller line-length refactor
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r32-build/R32-format-final.patch"
+          echo "a45ea8bb3d58491e12de97bfe22216b5d5c06aad97a43913e229e55a2459e87c  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r32-controller-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==623 and h.hexdigest()=="fc897ab9ff00629563b5b09c17a8a85b0db258fc4b88a1fa15191add85dbc443", (len(paths),h.hexdigest())
+          print("Exact controller-refactored R32 source",len(paths),h.hexdigest())
+          PY
+      - name: Apply exact reviewed R33 60 FPS delta
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r33-build/R33-from-R32.patch"
+          echo "a2fea199b440e5a825a51e3e53f41e5cb1164981cdcf01b95a000d675b065214  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r33-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==623 and h.hexdigest()=="3805e48d5edfd985112f1f4aac5105496afdd1918dfd7c94cfc56a04d1c1b41f", (len(paths),h.hexdigest())
+          print("Exact R33 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.20"' app/build.gradle.kts
+      - name: Apply and verify exact R34 app delta
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r36-build/R34-from-R33-app.patch"
+          echo "cbb15a06012108dac53f47d44b6ba76198a8b4670f012388d4320f50a45da8a5  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r34-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==627 and h.hexdigest()=="57096a08dde95d8a474062736b1870aacaf4ba498109d6495c03261836f4f53d", (len(paths),h.hexdigest())
+          print("Exact R34 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.21"' app/build.gradle.kts
+      - name: Apply and verify exact R35 app delta
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r36-build/R35-from-R34-app.patch"
+          echo "5b83adc0b4b300d9bdc6a24a5d5a90ccce39fa146da77e3c7dd9dc55e3854e4d  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r35-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==628 and h.hexdigest()=="630f941bc62828b3c786ec825734a22cd55059a01290def7b82a296e2a37342f", (len(paths),h.hexdigest())
+          print("Exact R35 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.22"' app/build.gradle.kts
+      - name: Apply and verify exact R36 app delta
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          packed="$GITHUB_WORKSPACE/kit/r36-build/R36-from-R35-app.patch.xz"
+          echo "6381e04579b6c768d3384902a18967d6ee051eb3c0ece0fff4ebbe7fbc9f5bd3  $packed" | sha256sum --check
+          patch="$RUNNER_TEMP/R36-from-R35-app.patch"
+          xz -dc "$packed" > "$patch"
+          echo "919cfa21f9c43dc9696ec786f13ecf8c5c64c57c99cef056ae349828b529e699  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r36-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==630 and h.hexdigest()=="c21c0496e1cd4ff18f7615f992e2de92aec6f12def2dc58a606b57aaba34b0f0", (len(paths),h.hexdigest())
+          print("Exact R36 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.23"' app/build.gradle.kts
+      - name: Apply and verify exact R37 interaction delta
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r37-build/R37-from-R36-app.patch"
+          echo "6dd6c3b89eb3419ecb4b9dac751826fdb71d875b7b92d7d8558e6c32c3b9248f  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r37-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==632 and h.hexdigest()=="ca27c44351677205fd289b654ff31afee447cd26827627734b1b92877a5dcaa3", (len(paths),h.hexdigest())
+          print("Exact R37 source",len(paths),h.hexdigest())
+          PY
+          grep -F 'val appVersionName = "0.1.24"' app/build.gradle.kts
+      - name: Normalize source formatting and enforce Spotless
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          set -euo pipefail
+          # Ktlint can require multiple formatting passes; never suppress a real violation.
+          for pass in 1 2 3; do
+            bash ./gradlew --no-daemon spotlessApply
+            if bash ./gradlew --no-daemon spotlessCheck; then break; fi
+          done
+          bash ./gradlew --no-daemon spotlessCheck
+      - name: CarPlay synthetic receiver and connection fault simulation
+        id: carplay_sim
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon :app:testStandardDebugUnitTest \
+            --tests 'com.mcarplay.app.iap2.Iap2SenderSessionTest' \
+            --tests 'com.mcarplay.app.iap2.Iap2LinkEngineTest' \
+            --tests 'com.mcarplay.app.iap2.CarPlayBringupStateTest' \
+            --tests 'com.mcarplay.app.iap2.WifiHandoffPolicyTest' \
+            --tests 'com.mcarplay.app.iap2.Iap2AvailabilityProgressTest' \
+            --tests 'com.mcarplay.app.iap2.R12WifiHandoffIsolationTest' \
+            --tests 'com.mcarplay.app.bt.BluetoothSessionArbiterTest' \
+            --tests 'com.mcarplay.app.bt.ReconnectCircuitBreakerTest' \
+            --tests 'com.mcarplay.app.transport.Iap2LinkChannelRestartTest' \
+            --tests 'com.mcarplay.app.net.CtrlInviteGateTest' \
+            --tests 'com.mcarplay.app.net.NetworkBindingTest' \
+            --tests 'com.mcarplay.app.airplay.VirtualIap2LinkTest' \
+            --tests 'com.mcarplay.app.airplay.AirPlayPairingTest' \
+            --tests 'com.mcarplay.app.airplay.AirPlayRecordLifecycleTest' \
+            --tests 'com.mcarplay.app.airplay.ReceiverCompatibilityIntegrationTest'
+      - name: Verify simulation evidence and preserve focused JUnit results
+        if: always() && (steps.carplay_sim.outcome == 'success' || steps.carplay_sim.outcome == 'failure')
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          mkdir -p carplay-simulation-evidence
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import xml.etree.ElementTree as ET
+          root = Path('app/build/test-results/testStandardDebugUnitTest')
+          output = Path('carplay-simulation-evidence')
+          expected = ["com.mcarplay.app.iap2.Iap2SenderSessionTest","com.mcarplay.app.iap2.Iap2LinkEngineTest","com.mcarplay.app.iap2.CarPlayBringupStateTest","com.mcarplay.app.iap2.WifiHandoffPolicyTest","com.mcarplay.app.iap2.Iap2AvailabilityProgressTest","com.mcarplay.app.iap2.R12WifiHandoffIsolationTest","com.mcarplay.app.bt.BluetoothSessionArbiterTest","com.mcarplay.app.bt.ReconnectCircuitBreakerTest","com.mcarplay.app.transport.Iap2LinkChannelRestartTest","com.mcarplay.app.net.CtrlInviteGateTest","com.mcarplay.app.net.NetworkBindingTest","com.mcarplay.app.airplay.VirtualIap2LinkTest","com.mcarplay.app.airplay.AirPlayPairingTest","com.mcarplay.app.airplay.AirPlayRecordLifecycleTest","com.mcarplay.app.airplay.ReceiverCompatibilityIntegrationTest"]
+          failures = []
+          total = 0
+          for cls in expected:
+              p = root / ('TEST-' + cls + '.xml')
+              if not p.is_file():
+                  failures.append(cls + ': missing')
+                  continue
+              shutil.copy2(p, output / p.name)
+              cases = ET.parse(p).getroot().findall('testcase')
+              bad = [t for t in cases if any(t.find(k) is not None for k in ('failure', 'error', 'skipped'))]
+              total += len(cases)
+              if not cases or bad:
+                  failures.append(f'{cls}: {len(cases)} cases, {len(bad)} failed/skipped')
+              print(cls, len(cases), 'PASS' if cases and not bad else 'FAIL')
+          print('Synthetic connection cases:', total)
+          assert not failures, failures
+          PY
+      - name: Archive focused CarPlay simulation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R37-carplay-simulation-evidence
+          path: baseline/mcarplay-project/carplay-simulation-evidence/
+          if-no-files-found: warn
+      - name: Lacrosse display, recovery, and hotspot regression
+        id: lacrosse_sim
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon :app:testStandardDebugUnitTest \
+            --tests 'com.mcarplay.app.video.LacrosseProjectionPolicyTest' \
+            --tests 'com.mcarplay.app.video.SourceFpsPolicyTest' \
+            --tests 'com.mcarplay.app.video.R34RuntimePolicyTest' \
+            --tests 'com.mcarplay.app.video.ProjectionShellTest' \
+            --tests 'com.mcarplay.app.video.ProjectionGlassTest' \
+            --tests 'com.mcarplay.app.video.ProjectionFocusTest' \
+            --tests 'com.mcarplay.app.video.ProjectionFramePacerTest' \
+            --tests 'com.mcarplay.app.video.ProjectionRecoveryPolicyTest' \
+            --tests 'com.mcarplay.app.video.ProjectedDashboardLayoutTest' \
+            --tests 'com.mcarplay.app.video.TranscodePolicyTest' \
+            --tests 'com.mcarplay.app.video.VideoEncoderAbrTest' \
+            --tests 'com.mcarplay.app.video.VideoQueueBudgetTest' \
+            --tests 'com.mcarplay.app.video.VideoScreenOwnershipTest' \
+            --tests 'com.mcarplay.app.architecture.HotspotDialogDismissTest'
+      - name: Preserve and verify Lacrosse regression evidence
+        if: always() && (steps.lacrosse_sim.outcome == 'success' || steps.lacrosse_sim.outcome == 'failure')
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          mkdir -p lacrosse-test-evidence
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import xml.etree.ElementTree as ET
+          root=Path('app/build/test-results/testStandardDebugUnitTest')
+          output=Path('lacrosse-test-evidence')
+          total=0
+          for cls in ["com.mcarplay.app.video.R34RuntimePolicyTest","com.mcarplay.app.video.ProjectionShellTest","com.mcarplay.app.video.ProjectionGlassTest","com.mcarplay.app.video.ProjectionFocusTest", "com.mcarplay.app.video.LacrosseProjectionPolicyTest","com.mcarplay.app.video.SourceFpsPolicyTest","com.mcarplay.app.video.ProjectionFramePacerTest","com.mcarplay.app.video.ProjectionRecoveryPolicyTest","com.mcarplay.app.video.ProjectedDashboardLayoutTest","com.mcarplay.app.video.TranscodePolicyTest","com.mcarplay.app.video.VideoEncoderAbrTest","com.mcarplay.app.video.VideoQueueBudgetTest","com.mcarplay.app.video.VideoScreenOwnershipTest","com.mcarplay.app.architecture.HotspotDialogDismissTest"]:
+              p=root/('TEST-'+cls+'.xml')
+              assert p.is_file(), ('missing',cls)
+              shutil.copy2(p, output/p.name)
+              cases=ET.parse(p).getroot().findall('testcase')
+              assert cases and not any(t.find(k) is not None for t in cases for k in ('failure','error','skipped')), cls
+              total+=len(cases)
+              print(cls, len(cases), 'PASS')
+          print('Lacrosse focused cases:',total)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcarplay-R37-lacrosse-test-evidence
+          path: baseline/mcarplay-project/lacrosse-test-evidence/
+          if-no-files-found: warn
+      - name: Strict Android tests, lint and debug APK compilation
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug :app:lintRemoteDebug :app:assembleStandardDebug :app:assembleRemoteDebug
+      - name: Strictly verify inherited R26 regression suites and both R28 variants
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root=Path('baseline/mcarplay-project/app/build/test-results/testStandardDebugUnitTest')
+          names=['com.mcarplay.app.bt.BluetoothSessionArbiterTest','com.mcarplay.app.video.VideoEncoderAbrTest','com.mcarplay.app.audio.ExternalPcmAlignerTest','com.mcarplay.app.airplay.StreamFrameCipherTest','com.mcarplay.app.iap2.Iap2LinkEngineTest','com.mcarplay.app.iap2.E2lbAvailabilityBodyPolicyTest','com.mcarplay.app.iap2.CarPlayBringupStateTest','com.mcarplay.app.iap2.Iap2SenderSessionTest','com.mcarplay.app.update.GitHubReleaseTest','com.mcarplay.app.update.ApkUpdateVerifierTest','com.mcarplay.app.WifiPromptBrokerTest','com.mcarplay.app.net.NetworkBindingTest','com.mcarplay.app.net.CtrlRequestTest','com.mcarplay.app.transport.Iap2LinkChannelRestartTest','com.mcarplay.app.iap2.Iap2AvailabilityProgressTest']
+          total=0
+          for cls in names:
+              f=root/('TEST-'+cls+'.xml')
+              if not f.is_file(): raise SystemExit('Missing mandatory R26 JUnit suite: '+str(f))
+              suite=ET.parse(f).getroot()
+              tests=suite.findall('testcase')
+              errors=[x for x in tests if x.find('failure') is not None or x.find('error') is not None or x.find('skipped') is not None]
+              if len(tests)<2 or errors: raise SystemExit(f'R26 mandatory suite rejected: {cls}: {len(tests)} cases, {len(errors)} bad')
+              total+=len(tests)
+              print(cls, 'PASS', len(tests))
+          sender=ET.parse(root/'TEST-com.mcarplay.app.iap2.Iap2SenderSessionTest.xml').getroot()
+          assert any(t.get('name')=='interruptedIdentificationWaitEndsWithoutWaitingForTheDeadline' and not any(t.find(k) is not None for k in ('failure','error','skipped')) for t in sender.findall('testcase')), 'Missing R26 cancellation test'
+          for variant in ('testStandardDebugUnitTest','testRemoteDebugUnitTest'):
+              suites=[ET.parse(p).getroot() for p in (root.parent/variant).glob('TEST-*.xml')]
+              cases=[t for s in suites for t in s.findall('testcase')]
+              bad=[t for t in cases if any(t.find(k) is not None for k in ('failure','error','skipped'))]
+              assert cases and not bad, (variant,len(cases),len(bad))
+              print(variant,len(cases),'PASS')
+          print('R26 mandatory source tests passed:', total)
+          PY
+      - name: Verify R28 UI regression suite ran
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root=Path('baseline/mcarplay-project/app/build/test-results/testStandardDebugUnitTest')
+          path=root/'TEST-com.mcarplay.app.ui.kit.UiLayoutPolicyTest.xml'
+          tests=ET.parse(path).getroot().findall('testcase')
+          assert any(t.get('name')=='compactOrLargeTextUsesScrollableHero' and not any(t.find(k) is not None for k in ('failure','error','skipped')) for t in tests)
+          PY
+      - name: Verify debug APK identities
+        run: |
+          set -euo pipefail
+          for variant in standard remote; do
+            apk="baseline/mcarplay-project/app/build/outputs/apk/$variant/debug/app-$variant-debug.apk"
+            test -s "$apk"
+            unzip -tqq "$apk"
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$apk"
+            "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk" | sed -n '1p'
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcarplay-R37-verification-evidence
+          path: |
+            baseline/mcarplay-project/r28-source-fingerprint.tsv
+            baseline/mcarplay-project/r32-source-fingerprint.tsv
+            baseline/mcarplay-project/r32-fixed-source-fingerprint.tsv
+            baseline/mcarplay-project/r32-controller-source-fingerprint.tsv
+            baseline/mcarplay-project/r33-source-fingerprint.tsv
+            baseline/mcarplay-project/r34-source-fingerprint.tsv
+            baseline/mcarplay-project/r35-source-fingerprint.tsv
+            baseline/mcarplay-project/r36-source-fingerprint.tsv
+            baseline/mcarplay-project/r37-source-fingerprint.tsv
+            baseline/mcarplay-project/app/build/test-results/
+            baseline/mcarplay-project/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: mcarplay-R37-debug-apks-NOT-FOR-RELEASE
+          path: baseline/mcarplay-project/app/build/outputs/apk/**/debug/*.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: mcarplay-R37-verified-complete-source
+          path: |
+            baseline/mcarplay-project/
+            !baseline/mcarplay-project/**/build/**
+            !baseline/mcarplay-project/.gradle/**
+          if-no-files-found: error
+          retention-days: 30
+
+  emulator-smoke:
+    needs: verify-and-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-R37-debug-apks-NOT-FOR-RELEASE
+          path: apks
+      - name: Start API 35 emulator and exercise application startup
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p emulator-evidence
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          avdmanager="$(dirname "$sdkmanager")/avdmanager"
+          export PATH="$sdk/platform-tools:$sdk/emulator:$PATH"
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" --install 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+          echo no | "$avdmanager" create avd -n lacrosse-smoke -k 'system-images;android-35;google_apis;x86_64' --force
+          emulator -avd lacrosse-smoke -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect >emulator-evidence/emulator.log 2>&1 &
+          trap 'adb logcat -d >emulator-evidence/logcat.txt 2>&1 || true; adb emu kill || true' EXIT
+          timeout 240 adb wait-for-device
+          timeout 300 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = 1 ]; do sleep 3; done'
+          adb shell input keyevent 82
+          apk="$(find apks -name 'app-standard-debug.apk' -print -quit)"
+          test -s "$apk"
+          adb install -g "$apk"
+          adb logcat -c
+          adb shell am start -W -n com.mcarplay.app/.MainActivity | tee emulator-evidence/launch.txt
+          grep -F 'Status: ok' emulator-evidence/launch.txt
+          sleep 5
+          adb shell pidof com.mcarplay.app
+          adb exec-out screencap -p >emulator-evidence/portrait.png
+          adb shell settings put system accelerometer_rotation 0
+          adb shell settings put system user_rotation 1
+          sleep 5
+          adb shell pidof com.mcarplay.app
+          adb exec-out screencap -p >emulator-evidence/landscape.png
+          adb logcat -b crash -d >emulator-evidence/crash.txt
+          ! grep -F 'Process: com.mcarplay.app,' emulator-evidence/crash.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcarplay-R37-emulator-smoke-evidence
+          path: emulator-evidence/
+          if-no-files-found: warn
