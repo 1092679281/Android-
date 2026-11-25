@@ -1,0 +1,528 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 754c9eab72b5eb7f395c4bb008ccf7a1bd664c16..02b6a9477a73bdb826fe25ec03a04ec42f55c658 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.30-test.1] - 2026-11-25
++
++> R43 — opt-in navigation notification card candidate.
++
++### English
++- Display real ongoing navigation notifications from a restricted map-app allowlist in existing letterbox space, only after explicit opt-in.
++- Clear on disable, disconnect or removal; no route inference, storage, logging or new network requests.
++- Preserve source recovery indicators and original video geometry; independent map routing remains unavailable.
++
++### 简体中文
++- 用户单独开启后，在原导航留白区显示受限地图应用的持续导航通知真实文字。
++- 关闭、断开或通知撤销时清除，不推断路线、不持久化、不写日志或新增联网请求。
++- 保留源恢复提示和原视频几何，尚不具备独立地图路线引擎。
++
+ ## [v0.1.29-test.1] - 2026-11-25
+ 
+ > R42 — projected navigation source status candidate.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 2460f06c1581721eb9d0d82f2d013892839494d6..ee68bc90971cc48768a7f8ffe9a2b611e2e64fc5 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.29"
++val appVersionName = "0.1.30"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+index b54a0c152904544477ab08f59ea1659c2a722aa0..b72975f5f15033fd9bb116238a5a010ef0dbf462 100644
+--- a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
++++ b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+@@ -1,5 +1,6 @@
+ package com.mcarplay.app.media
+ 
++import android.app.Notification
+ import android.content.ComponentName
+ import android.media.MediaMetadata
+ import android.media.session.MediaController
+@@ -13,11 +14,14 @@ import com.mcarplay.app.video.ProjectionArtworkBudget
+ import com.mcarplay.app.video.ProjectionArtworkGate
+ import com.mcarplay.app.video.ProjectionMediaCapabilities
+ import com.mcarplay.app.video.ProjectionMediaClock
++import com.mcarplay.app.settings.DisplayPrefs
++import com.mcarplay.app.video.ProjectionNavigationNoticePolicy
++import com.mcarplay.app.video.projectionNavigationNotices
+ 
+ /**
+  * 通知监听服务：借通知使用权枚举系统活跃媒体会话，向应用提供「正在播放」状态
+  * （歌名/歌手/播放中）。音乐卡片（仪表盘）据此渲染与控制；同一通知监听器也只读
+- * 观察 CarWith 是否出现通知，用于区分入口阶段故障，不保存通知内容。
++ * 观察 CarWith 是否出现通知；导航通知仅在用户单独开启后读取，不持久化。
+  *
+  * **为什么必须有通知使用权**：`MediaSessionManager.getActiveSessions()` 在未授权时
+  * 仍会返回会话（所以播放状态拿得到），但 `metadata` 恒为 null——表现为「播放状态在变、
+@@ -42,6 +46,8 @@ class MediaListenerService : NotificationListenerService() {
+         NotificationAccess.markConnected()
+         MediaSessionsState.accessGranted = true
+         CarWithNotificationProbe.onListenerConnected(runCatching { activeNotifications }.getOrNull())
++        projectionNavigationNotices.setConnected(true)
++        refreshNavigationNotices()
+         try {
+             manager.addOnActiveSessionsChangedListener(
+                 sessionListener,
+@@ -98,11 +104,37 @@ class MediaListenerService : NotificationListenerService() {
+     override fun onNotificationPosted(notification: StatusBarNotification?) {
+         super.onNotificationPosted(notification)
+         CarWithNotificationProbe.onNotificationPosted(notification)
++        if (notification?.notification?.category == Notification.CATEGORY_NAVIGATION) refreshNavigationNotices()
+     }
+ 
+     override fun onNotificationRemoved(notification: StatusBarNotification?) {
+         super.onNotificationRemoved(notification)
+         CarWithNotificationProbe.onNotificationRemoved(notification)
++        if (notification != null && notification.notification.category == Notification.CATEGORY_NAVIGATION) refreshNavigationNotices(notification.key)
++    }
++
++    private fun refreshNavigationNotices(excludeKey: String? = null) {
++        projectionNavigationNotices.setEnabled(DisplayPrefs.navigationNotices(this))
++        if (!connected) return
++        val epoch = projectionNavigationNotices.requestEpoch() ?: return
++        val notice = runCatching {
++            activeNotifications.orEmpty()
++                .filter { it.key != excludeKey && it.notification.category == Notification.CATEGORY_NAVIGATION }
++                .sortedByDescending { it.postTime }
++                .firstNotNullOfOrNull { entry ->
++                val n = entry.notification
++                val provider = ProjectionNavigationNoticePolicy.provider(
++                    entry.packageName, n.category, entry.isOngoing,
++                    n.visibility == Notification.VISIBILITY_SECRET,
++                    n.flags and Notification.FLAG_GROUP_SUMMARY != 0,
++                ) ?: return@firstNotNullOfOrNull null
++                ProjectionNavigationNoticePolicy.notice(
++                    provider, n.extras.getCharSequence(Notification.EXTRA_TITLE),
++                    n.extras.getCharSequence(Notification.EXTRA_TEXT),
++                )
++            }
++        }.getOrNull()
++        projectionNavigationNotices.publish(epoch, notice)
+     }
+ 
+     override fun onDestroy() {
+@@ -126,6 +158,7 @@ class MediaListenerService : NotificationListenerService() {
+ 
+     private fun disconnectMedia() {
+         connected = false
++        projectionNavigationNotices.setConnected(false)
+         mainHandler.removeCallbacks(periodicRefresh)
+         MediaSessionsState.accessGranted = false
+         MediaSessionsState.resyncHook = null
+@@ -147,6 +180,7 @@ class MediaListenerService : NotificationListenerService() {
+             override fun run() {
+                 if (!connected) return
+                 refresh()
++                refreshNavigationNotices()
+                 if (connected) mainHandler.postDelayed(this, 1_000)
+             }
+         }
+diff --git a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+index 20328f0eeb6996af38936d91688007f12d47202b..9dd2589a491caf55eb3dfc855926017e73e90a40 100644
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+@@ -298,6 +298,12 @@ class DisplayPanelFragment : SettingsPanelFragment() {
+             hostToast(getString(R.string.r29_projection_next_connection))
+         }
+ 
++        bindToggle(
++            view.findViewById(R.id.btnNavigationNoticesOn),
++            view.findViewById(R.id.btnNavigationNoticesOff),
++            DisplayPrefs.navigationNotices(ctx),
++        ) { enabled -> DisplayPrefs.setNavigationNotices(ctx, enabled) }
++
+         fun applyFps(fps: Int) {
+             DisplayPrefs.setFps(ctx, fps)
+             refreshFps(fps < 60)
+diff --git a/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt b/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
+index 9c7be069305439329523f3ba04862de5e6fb17d3..a5d7b8b7598399a3efa48cb217e34306735325d2 100644
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
+@@ -36,6 +36,14 @@ object DisplayPrefs {
+     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
+     private const val KEY_HID_RAW_LOG = "hid_raw_log"
+ 
++    fun navigationNotices(context: Context): Boolean =
++        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean("projection_navigation_notices", false)
++
++    fun setNavigationNotices(context: Context, enabled: Boolean) {
++        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean("projection_navigation_notices", enabled).apply()
++        com.mcarplay.app.video.projectionNavigationNotices.setEnabled(enabled)
++    }
++
+     fun fullContentProjection(context: Context): Boolean =
+         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean("full_content_projection", false)
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+index c924e95bf7201dd82739dc3343e0616b03abad28..0b4ea66da49babe469a4574e22b56794e4d2f892 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -85,7 +85,13 @@ internal class ProjectedDashboardRenderer(
+         private set
+     var textureUpdates = 0L
+         private set
+-    private data class Snapshot(val key: DashboardVisualKey, val now: MediaSessionsState.NowPlaying?)
++    private val navigationOwner = Any()
++    private var displayedNavigation: ProjectionNavigationNotice? = null
++    private data class Snapshot(
++        val key: DashboardVisualKey,
++        val now: MediaSessionsState.NowPlaying?,
++        val navigation: ProjectionNavigationNotice?,
++    )
+     // Include the antialiased edges of the progress track, without touching title/controls.
+     private val progressBounds get() = layout.panel.let { r ->
+         val x = r.left + r.width * .09f
+@@ -171,12 +177,14 @@ internal class ProjectedDashboardRenderer(
+             uploadedPixels += layout.width.toLong() * layout.height
+             textureUpdates++
+             lastKey = initial.key
++            displayedNavigation = initial.navigation
+             displayedMedia = initial.now.takeIf { layout.showsMedia }
+             displayedCapabilities = initial.key.capabilities
+         } finally {
+             canvas = Canvas()
+             full.recycle()
+         }
++        if (layout.shell && !layout.fullContent) projectionNavigationNotices.attach(navigationOwner)
+     }
+ 
+     private fun isNight(): Boolean = ProjectionThemePolicy.isNight(
+@@ -219,7 +227,8 @@ internal class ProjectedDashboardRenderer(
+         val key = pendingSnapshot?.key ?: return false
+         val dirty = key.changesFrom(lastKey)
+         val widgetsDirty = layout.page == ProjectionPage.WIDGETS && key.widgetsChangedFrom(lastKey)
+-        return dirty.rail || (layout.showsMedia && (dirty.panel || dirty.progress)) || widgetsDirty
++        val navigationDirty = layout.navigationStatus != null && pendingSnapshot?.navigation != displayedNavigation
++        return dirty.rail || (layout.showsMedia && (dirty.panel || dirty.progress)) || widgetsDirty || navigationDirty
+     }
+ 
+     fun draw(next: ProjectedDashboardLayout, nextSourceStatus: ProjectionSourceStatus, pressed: ProjectionRect?, focused: ProjectionRect?) {
+@@ -265,6 +274,7 @@ internal class ProjectedDashboardRenderer(
+                 uploadedPixels += layout.width.toLong() * layout.height
+                 textureUpdates++
+                 lastKey = current.key
++                displayedNavigation = current.navigation
+                 displayedMedia = current.now.takeIf { layout.showsMedia }
+                 displayedCapabilities = current.key.capabilities
+             } finally {
+@@ -284,11 +294,11 @@ internal class ProjectedDashboardRenderer(
+                     val pixels = railBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { railBitmap = it }
+                     uploadRegion(r, pixels) { renderRail(current) }
+                 }
+-                if (sourceChanged) {
++                if (sourceChanged || it.navigation != displayedNavigation) {
+                     layout.navigationStatus?.let { r ->
+                         val pixels = navigationBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888)
+                             .also { navigationBitmap = it }
+-                        uploadRegion(r, pixels) { renderNavigationStatus() }
++                        uploadRegion(r, pixels) { renderNavigationStatus(current.navigation) }
+                     }
+                 }
+                 val widgetsDirty = layout.page == ProjectionPage.WIDGETS && it.key.widgetsChangedFrom(lastKey)
+@@ -307,6 +317,7 @@ internal class ProjectedDashboardRenderer(
+                     uploadRegion(r, pixels) { renderProgress(current) }
+                 }
+                 lastKey = current.key
++                displayedNavigation = current.navigation
+                 pendingSnapshot = null
+             }
+         }
+@@ -374,7 +385,8 @@ internal class ProjectedDashboardRenderer(
+         } else -1
+         return Snapshot(DashboardVisualKey(clock.format(at), date.format(at), now?.title, now?.artist,
+             now?.playing == true, access, progress, now?.art, now?.sessionToken, widgets, playbackTime,
+-            now?.projectionCapabilities() ?: ProjectionMediaCapabilities.NONE), now)
++            now?.projectionCapabilities() ?: ProjectionMediaCapabilities.NONE), now,
++            projectionNavigationNotices.snapshot(navigationOwner).takeIf { layout.navigationStatus != null })
+     }
+ 
+     private fun uploadRegion(bounds: ProjectionRect, pixels: Bitmap, render: () -> Unit) {
+@@ -541,7 +553,7 @@ internal class ProjectedDashboardRenderer(
+             ProjectionPage.DASHBOARD, ProjectionPage.MUSIC -> renderPanel(snapshot)
+             ProjectionPage.NAVIGATION -> {
+                 if (layout.showsMedia) renderPanel(snapshot)
+-                renderNavigationStatus()
++                renderNavigationStatus(snapshot.navigation)
+             }
+             ProjectionPage.HOME -> {
+                 label(pageName(layout.page), w.left+h*.06f,w.top+h*.12f,h*.065f,w.width-h*.12f,bold=true)
+@@ -566,7 +578,7 @@ internal class ProjectedDashboardRenderer(
+         ProjectionSourceStatus.RECOVERING -> if (chinese) "恢复中" else "SYNC"
+     }
+ 
+-    private fun renderNavigationStatus() {
++    private fun renderNavigationStatus(notice: ProjectionNavigationNotice?) {
+         val r = layout.navigationStatus ?: return
+         val pad = r.height * .18f
+         val x = r.left + pad
+@@ -575,6 +587,17 @@ internal class ProjectedDashboardRenderer(
+         canvas.drawRoundRect(rect(r), radius, radius, paint)
+         paint.color = sourceColor()
+         canvas.drawCircle(x + r.height * .06f, r.top + r.height * .32f, r.height * .045f, paint)
++        if (notice != null && (sourceStatus == ProjectionSourceStatus.UPDATING || sourceStatus == ProjectionSourceStatus.STILL)) {
++            val provider = notice.provider.substringBefore(" / ").takeIf { chinese } ?: notice.provider.substringAfter(" / ")
++            val content = listOf(notice.title, notice.body).filter { it.isNotEmpty() }.joinToString(" · ")
++            val title = if (chinese) "$provider · 导航通知" else "$provider · Navigation notice"
++            label(
++                title, x + r.height * .19f, r.top + r.height * .34f,
++                r.height * .20f, r.width - pad * 2 - r.height * .19f, bold = true,
++            )
++            label(content, x, r.top + r.height * .75f, r.height * .29f, r.width - pad * 2)
++            return
++        }
+         val titleX = x + r.height * .19f
+         val title = if (chinese) "导航源 · ${sourceLabel()}" else "Source · ${sourceLabel()}"
+         label(title, titleX, r.top + r.height * .43f, r.height * .24f, r.right - titleX - pad, bold = true)
+@@ -714,6 +737,9 @@ internal class ProjectedDashboardRenderer(
+         }
+     }
+     fun release() {
++        projectionNavigationNotices.detach(navigationOwner)
++        displayedNavigation = null
++        pendingSnapshot = null
+         if (texture != 0) GL.glDeleteTextures(1, intArrayOf(texture), 0)
+         if (wallpaper != 0) GL.glDeleteTextures(1, intArrayOf(wallpaper), 0)
+         if (program != 0) GL.glDeleteProgram(program)
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionNavigationNotice.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionNavigationNotice.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..a1c1e2daf97c94adf04b13f4a861b41c863150d7
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionNavigationNotice.kt
+@@ -0,0 +1,82 @@
++package com.mcarplay.app.video
++
++/** Only explicitly classified ongoing navigation notices from supported map apps are eligible. */
++internal data class ProjectionNavigationNotice(val provider: String, val title: String, val body: String)
++
++internal object ProjectionNavigationNoticePolicy {
++    private val providers = mapOf(
++        "com.autonavi.minimap" to "高德地图 / Amap",
++        "com.baidu.BaiduMap" to "百度地图 / Baidu Maps",
++        "com.tencent.map" to "腾讯地图 / Tencent Maps",
++        "com.google.android.apps.maps" to "Google Maps",
++    )
++
++    fun provider(packageName: String, category: String?, ongoing: Boolean, secret: Boolean, summary: Boolean): String? =
++        providers[packageName]?.takeIf { category == "navigation" && ongoing && !secret && !summary }
++
++    private fun clean(value: CharSequence?): String =
++        value?.take(160)?.toString()?.map { ch ->
++            if (ch.isWhitespace() || ch.isISOControl() || Character.getType(ch) == Character.FORMAT.toInt()) ' ' else ch
++        }?.joinToString("")?.trim()?.replace(Regex(" +"), " ").orEmpty()
++
++    fun notice(provider: String, title: CharSequence?, body: CharSequence?): ProjectionNavigationNotice? {
++        val t = clean(title)
++        val b = clean(body).takeUnless { it == t }.orEmpty()
++        return if (t.isEmpty() && b.isEmpty()) null else ProjectionNavigationNotice(provider, t, b)
++    }
++}
++
++/** In-memory only. A projection owner and epoch prevent results crossing sessions. */
++internal class ProjectionNavigationNoticeStore {
++    private var enabled = false
++    private var connected = false
++    private var owner: Any? = null
++    private var epoch = 0L
++    private var value: ProjectionNavigationNotice? = null
++
++    private fun invalidate() {
++        epoch++
++        value = null
++    }
++
++    @Synchronized
++    fun setEnabled(next: Boolean) {
++        if (enabled != next) {
++            enabled = next
++            invalidate()
++        }
++    }
++
++    @Synchronized
++    fun setConnected(next: Boolean) {
++        connected = next
++        invalidate()
++    }
++
++    @Synchronized
++    fun attach(next: Any) {
++        owner = next
++        invalidate()
++    }
++
++    @Synchronized
++    fun detach(previous: Any) {
++        if (owner === previous) {
++            owner = null
++            invalidate()
++        }
++    }
++
++    @Synchronized
++    fun requestEpoch(): Long? = epoch.takeIf { enabled && connected && owner != null }
++
++    @Synchronized
++    fun publish(request: Long, notice: ProjectionNavigationNotice?) {
++        if (request == requestEpoch()) value = notice
++    }
++
++    @Synchronized
++    fun snapshot(forOwner: Any): ProjectionNavigationNotice? = value.takeIf { owner === forOwner && enabled && connected }
++}
++
++internal val projectionNavigationNotices = ProjectionNavigationNoticeStore()
+diff --git a/app/src/main/res/layout/fragment_panel_display.xml b/app/src/main/res/layout/fragment_panel_display.xml
+index 9688a382953e1afacfd27dfc6c193f5f23e8713a..416622d60140f87c8706fc93b4ad3c5ed7e8000c 100644
+--- a/app/src/main/res/layout/fragment_panel_display.xml
++++ b/app/src/main/res/layout/fragment_panel_display.xml
+@@ -18,6 +18,12 @@
+                 <TextView android:id="@+id/btnFullContentOff" android:layout_width="wrap_content" android:layout_height="wrap_content" android:minHeight="48dp" android:gravity="center" android:paddingHorizontal="18dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" />
+             </LinearLayout>
+             <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/r34_full_content_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
++            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="@string/r43_navigation_notices" android:textColor="@color/ui_text" android:textSize="16sp" android:textStyle="bold" />
++            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
++                <TextView android:id="@+id/btnNavigationNoticesOn" android:layout_width="wrap_content" android:layout_height="wrap_content" android:minHeight="48dp" android:gravity="center" android:paddingHorizontal="18dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" />
++                <TextView android:id="@+id/btnNavigationNoticesOff" android:layout_width="wrap_content" android:layout_height="wrap_content" android:minHeight="48dp" android:gravity="center" android:paddingHorizontal="18dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" />
++            </LinearLayout>
++            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/r43_navigation_notices_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+         </LinearLayout>
+ 
+         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:background="@drawable/ui_bg_card" android:orientation="vertical" android:padding="16dp"><TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/lay_screen_off" android:textColor="@color/ui_text" android:textSize="16sp" android:layout_marginTop="0dp" android:textStyle="bold" />
+diff --git a/app/src/main/res/values-en/r29_projection.xml b/app/src/main/res/values-en/r29_projection.xml
+index 1dfbd8e2a8cba16198cc57b5c197fa118be7bb75..2e84819946e1f6cd69ecc52b8477c9c62d13ea10 100644
+--- a/app/src/main/res/values-en/r29_projection.xml
++++ b/app/src/main/res/values-en/r29_projection.xml
+@@ -5,4 +5,6 @@
+     <string name="r29_projection_next_connection">Applies on next connection</string>
+     <string name="r34_full_content">Full-screen HD content (experimental)</string>
+     <string name="r34_full_content_desc">Requires experimental projection. Hide the dock and additional panels, and fit live CarWith content to the screen. Reconnect to apply.</string>
++    <string name="r43_navigation_notices">Navigation notification card (experimental)</string>
++    <string name="r43_navigation_notices_desc">Off by default. Shows explicitly classified ongoing navigation notices from supported map apps, with notification access and available space. Addresses may be visible to passengers; no storage or upload.</string>
+ </resources>
+diff --git a/app/src/main/res/values/r29_projection.xml b/app/src/main/res/values/r29_projection.xml
+index 87c3bc4ef58b8d76e17e7decb989804d96b85392..63ce456ae79b880da170b97180345664190a733a 100644
+--- a/app/src/main/res/values/r29_projection.xml
++++ b/app/src/main/res/values/r29_projection.xml
+@@ -5,4 +5,6 @@
+     <string name="r29_projection_next_connection">下次连接生效</string>
+     <string name="r34_full_content">全屏高清内容（实验）</string>
+     <string name="r34_full_content_desc">仅在启用实验车机界面时生效。隐藏 Dock 与附加面板，按源比例扩大 CarWith 内容；重新连接生效。</string>
++    <string name="r43_navigation_notices">导航通知卡（实验）</string>
++    <string name="r43_navigation_notices_desc">默认关闭。仅显示受支持地图应用明确标记的持续导航通知，需要通知使用权及车机导航页留白。通知可能含地址，会显示给车内乘客；不保存、不上传。</string>
+ </resources>
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionNavigationNoticeTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionNavigationNoticeTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..59ad5efa9f3fd9288c3d25ae7fb304e81dd4c91f
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionNavigationNoticeTest.kt
+@@ -0,0 +1,101 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionNavigationNoticeTest {
++    @Test
++    fun onlyExplicitOngoingNavigationFromSupportedPackages() {
++        val pkg = "com.autonavi.minimap"
++        assertNotNull(ProjectionNavigationNoticePolicy.provider(pkg, "navigation", true, false, false))
++        for (category in listOf(null, "msg", "call", "service", "transport", "Navigation")) {
++            assertNull(ProjectionNavigationNoticePolicy.provider(pkg, category, true, false, false))
++        }
++        assertNull(ProjectionNavigationNoticePolicy.provider("evil.$pkg", "navigation", true, false, false))
++        assertNull(ProjectionNavigationNoticePolicy.provider(pkg, "navigation", false, false, false))
++        assertNull(ProjectionNavigationNoticePolicy.provider(pkg, "navigation", true, true, false))
++        assertNull(ProjectionNavigationNoticePolicy.provider(pkg, "navigation", true, false, true))
++    }
++
++    @Test
++    fun textIsBoundedAndControlCharactersAreRemoved() {
++        val n = ProjectionNavigationNoticePolicy.notice("map", "前方\n右转\u202e", "  800 米\t")!!
++        assertEquals("前方 右转", n.title)
++        assertEquals("800 米", n.body)
++        assertEquals("", ProjectionNavigationNoticePolicy.notice("map", "same", "same")!!.body)
++        assertNull(ProjectionNavigationNoticePolicy.notice("map", " \n\t", null))
++        assertEquals(160, ProjectionNavigationNoticePolicy.notice("map", "a".repeat(10000), null)!!.title.length)
++    }
++
++    @Test
++    fun consentAndListenerLifecycleGateData() {
++        val store = ProjectionNavigationNoticeStore()
++        val owner = Any()
++        val newer = Any()
++        val n = ProjectionNavigationNotice("map", "right", "")
++        assertNull(store.requestEpoch())
++        store.attach(owner)
++        store.setConnected(true)
++        assertNull(store.requestEpoch())
++        store.setEnabled(true)
++        val epoch = store.requestEpoch()!!
++        store.publish(epoch, n)
++        assertEquals(n, store.snapshot(owner))
++        store.publish(epoch, null)
++        assertNull(store.snapshot(owner))
++        store.setEnabled(false)
++        store.publish(epoch, n)
++        assertNull(store.snapshot(owner))
++        store.setEnabled(true)
++        store.publish(epoch, n)
++        assertNull(store.snapshot(owner))
++        val next = store.requestEpoch()!!
++        store.attach(newer)
++        store.publish(next, n)
++        assertNull(store.snapshot(newer))
++        store.detach(owner)
++        store.publish(store.requestEpoch()!!, n)
++        assertEquals(n, store.snapshot(newer))
++        store.detach(newer)
++        assertNull(store.requestEpoch())
++        assertNull(store.snapshot(newer))
++    }
++
++    @Test
++    fun randomizedConsentAndConnectionTransitions() {
++        val store = ProjectionNavigationNoticeStore()
++        val owner = Any()
++        store.attach(owner)
++        val random = Random(43)
++        var enabled = false
++        var connected = false
++        var expected: ProjectionNavigationNotice? = null
++        repeat(10000) {
++            when (random.nextInt(4)) {
++                0 -> {
++                    enabled = random.nextBoolean()
++                    store.setEnabled(enabled)
++                    if (!enabled) expected = null
++                }
++                1 -> {
++                    connected = random.nextBoolean()
++                    store.setConnected(connected)
++                    expected = null
++                }
++                else -> {
++                    val n = if (random.nextBoolean()) ProjectionNavigationNotice("map", "$it", "") else null
++                    store.requestEpoch()?.let { epoch -> store.publish(epoch, n) }
++                    if (enabled && connected) expected = n
++                }
++            }
++            assertEquals(expected, store.snapshot(owner))
++            assertEquals(enabled && connected, store.requestEpoch() != null)
++        }
++        println("navigation consent transitions: 10000")
++    }
++}
