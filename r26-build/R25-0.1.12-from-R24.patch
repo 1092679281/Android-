@@ -1,0 +1,841 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,21 @@
+ 
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
++
++## [v0.1.12-test.1] - 2026-11-25
++
++> Experimental receiver-specific transport hardening; no confirmed E2LB connection fix.
++> 接收端专项传输加固实验，尚未证实 E2LB 连接成功。
++
++### English
++- Limit reliable bursts conservatively on identified E2LB receivers, without changing the advertised negotiation values.
++- Permit at most two rate-limited replies to consecutive startup DETECT markers while the observed startup packet is unconfirmed; no SYN or authentication replay.
++- Validate restart SYN structure, bound control queues and retire pending controls on transport close.
++
++### 简体中文
++- E2LB 专项保守限流，不改变协商声明值。
++- 启动消息未确认时，连续 DETECT 最多限频应答两次；不主动重发 SYN 或认证消息。
++- 校验重协商 SYN 结构，限制控制队列容量，关闭链路时清理积压控制消息。
+ 
+ ## [v0.1.11-test.1] - 2026-11-25
+ 
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.11"
++val appVersionName = "0.1.12"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+@@ -111,6 +111,47 @@
+ 
+     private var observedControl: ControlReceipt? = null
+ 
++    // Receiver-specific conservative startup policy, NOT a protocol-mandated receive window.
++    private var conservativeStartup = false
++    private var consecutiveStartupDetects = 0
++    private var lastStartupProbeAt: Long? = null
++    private var startupProbePending = false
++    var startupProbeReplies = 0
++        private set
++
++    /** Enable only on an identified receiver whose startup is known to stall. */
++    fun enableConservativeStartup() {
++        conservativeStartup = true
++    }
++
++    private fun awaitingObservedAck(): Boolean =
++        conservativeStartup && state == State.NORMAL && observedControl?.state == ControlReceipt.State.FRAME_GENERATED
++
++    private fun observeStartupDetect(nowMillis: Long) {
++        if (!awaitingObservedAck()) return
++        consecutiveStartupDetects = (consecutiveStartupDetects + 1).coerceAtMost(3)
++        val last = lastStartupProbeAt
++        if (consecutiveStartupDetects >= 3 && startupProbeReplies < 2 &&
++            (last == null || nowMillis - last >= 1_500L)
++        ) startupProbePending = true
++    }
++
++    private fun resetStartupDetectStreak() {
++        consecutiveStartupDetects = 0
++        startupProbePending = false
++    }
++
++    private fun flushStartupProbe(nowMillis: Long) {
++        val pending = startupProbePending
++        startupProbePending = false
++        // Do not reply if the same read already contained a valid frame. No SYN or CSM replay.
++        if (pending && awaitingObservedAck() && appendOutput(MARKER)) {
++            startupProbeReplies++
++            lastStartupProbeAt = nowMillis
++            consecutiveStartupDetects = 0
++        }
++    }
++
+     private class Packet(
+         var sequence: Int,
+         val payload: ByteArray,
+@@ -317,6 +358,7 @@
+                 // 排空所有完整帧
+             }
+         }
++        flushStartupProbe(nowMillis)
+     }
+ 
+     fun feedEof() = die(null)
+@@ -394,6 +436,10 @@
+         val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
+         if (limit <= 0 || bytes.size > limit) {
+             die("control payload ${bytes.size} exceeds negotiated limit $limit")
++            return false
++        }
++        if (sendBacklog.size >= 256) {
++            die("control send backlog overflow")
+             return false
+         }
+         sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck, receipt = receipt)
+@@ -416,21 +462,25 @@
+                 if (matches) {
+                     detectMarkers++
+                     receive.discard(MARKER.size)
++                    observeStartupDetect(nowMillis)
+                     continue
+                 }
+             }
++            resetStartupDetectStreak()
+             discardedNoiseBytes++
+             receive.discard(1)
+         }
+         if (receive.size < HEADER_BYTES) return false
+         val header = receive.peek(HEADER_BYTES)
+         if (!checksumValid(header)) {
++            resetStartupDetectStreak()
+             invalidHeaderChecksums++
+             receive.discard(1)
+             return true
+         }
+         val length = readU16(header, 2)
+         if (length < HEADER_BYTES) {
++            resetStartupDetectStreak()
+             invalidLengths++
+             receive.discard(1)
+             return true
+@@ -442,6 +492,7 @@
+             // receive.take(length) ALREADY consumed the whole corrupt frame.
+             // Discarding one more byte would destroy the FF5A header of a
+             // valid frame immediately following it in the same TCP/RFCOMM read.
++            resetStartupDetectStreak()
+             invalidPayloadChecksums++
+             return true
+         }
+@@ -471,6 +522,7 @@
+         nowMillis: Long,
+     ) {
+         onFrameReceived?.invoke(control, sequence, ack, sessionId, payload?.size ?: 0)
++        resetStartupDetectStreak()
+         if (control and CONTROL_RESET != 0) {
+             die("peer sent reset")
+             return
+@@ -487,6 +539,14 @@
+             // 双方互回 SYN|ACK 的无限乒乓（单测暴露：两个引擎互相喂帧时协商永不收敛）。
+             val isPureSyn = (control and CONTROL_ACKNOWLEDGEMENT) == 0
+             if (sync != null && isPureSyn && state == State.NORMAL && !echoFirst && rebuildOnNewSyn) {
++                // A malformed or ambiguous SYN must not retire a healthy session.
++                if (control != CONTROL_SYNCHRONIZE || sessionId != 0 ||
++                    payload?.size != 10 + 3 * sync.sessions.size ||
++                    sync.maxOutgoing !in 1..127 || sync.maxLength < 64 ||
++                    sync.sessions.count { it.kind == CONTROL_KIND } != 1 ||
++                    sync.sessions.any { it.id == 0 || it.kind !in 0..2 || it.version == 0 } ||
++                    sync.sessions.map { it.id }.distinct().size != sync.sessions.size
++                ) return
+                 val sameAdoptedSyn =
+                     sequence == lastEchoPeerSequence &&
+                         sync == lastEchoPeerSync
+@@ -720,7 +780,13 @@
+         while (sendBacklog.isNotEmpty()) {
+             val packet = sendBacklog.first()
+             val peer = peerSynchronization
+-            val window = declaredMaxOutgoing
++            // E2LB compatibility experiment: retain the advertised LSP values but limit
++            // the actual reliable burst. Leave zero-ACK tunnels and other receivers unchanged.
++            val window = if (conservativeStartup && peer != null && peer.maxRetransmissions > 0) {
++                minOf(declaredMaxOutgoing, peer.maxOutgoing.coerceIn(1, 127))
++            } else {
++                declaredMaxOutgoing
++            }
+             if (lastSentAcknowledged != null &&
+                 sequenceDistance(sentSequence, lastSentAcknowledged!!) >= window
+             ) {
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -336,6 +336,10 @@
+         send(Iap2MessageIds.START_IDENTIFICATION)
+         val identification = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
+         logIdentification(identification)
++        if (isE2lb()) {
++            channel.enableConservativeStartup()
++            log("BT-LINK: E2LB conservative reliable burst and bounded startup probe policy enabled")
++        }
+         send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
+         log("iap2 tx=0x1d02 identification-accepted")
+         bringup.onIdentified()
+@@ -654,7 +658,8 @@
+             )
+             // Never carry a detect-only, unacknowledged E2LB startup into Wi-Fi discovery.
+             // Throw before handing off an endpoint: the existing Bluetooth ownership and
+-            // reconnect circuit breaker dispose of this attempt. Do not inject SYN or replay auth.
++            // reconnect circuit breaker dispose of this attempt. The bounded probe policy
++            // does not inject SYN, replay auth, or authorize a new application session.
+             if (Iap2AvailabilityProgress.shouldStopBeforeEndpoint(
+                     isE2lb = isE2lb(),
+                     state = outcome,
+@@ -1183,7 +1188,8 @@
+     }
+ 
+     /** 0x4301 是否已在等待旧协议凭据期间先行到达（暂存区里等后续消费）。 */
+-    private fun startSessionPending(): Boolean = pendingFrames.any { it.messageId == Iap2MessageIds.CARPLAY_START_SESSION }
++    private fun startSessionPending(): Boolean =
++        channel.isAlive && pendingFrames.any { it.messageId == Iap2MessageIds.CARPLAY_START_SESSION }
+ 
+     /**
+      * 等 0x5703，但可被先行到达的 0x4301 提前结束（[stopOnStartSession]）。
+@@ -1223,9 +1229,9 @@
+         if (channel.isAlive) return "iAP2 发送 $id 失败：链路仍在线，写入被拒"
+         val reason = channel.terminationReason?.takeIf { it.isNotBlank() }
+         return if (reason == null) {
+-            "iAP2 发送 $id 失败：链路已被对端关闭（不是 $id 导致拆链）"
++            "iAP2 发送 $id 失败：链路已结束（关闭来源未确定）"
+         } else {
+-            "iAP2 发送 $id 失败：链路已被对端关闭（$reason；不是 $id 导致拆链）"
++            "iAP2 发送 $id 失败：链路已结束（$reason）"
+         }
+     }
+ 
+@@ -1364,6 +1370,7 @@
+         messageId: Int,
+         deadlineNanos: Long,
+     ): Iap2Csm.Frame? {
++        if (!channel.isAlive) return null
+         pendingFrames.firstOrNull { it.messageId == messageId }?.let {
+             pendingFrames.remove(it)
+             return it
+@@ -1419,6 +1426,7 @@
+      * （保持到达顺序：暂存 > 新解析），再读新帧。
+      */
+     private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
++        if (!channel.isAlive) return null
+         pendingFrames.firstOrNull()?.let {
+             pendingFrames.removeFirst()
+             return it
+@@ -1428,6 +1436,7 @@
+ 
+     /** 只取新帧（先已解析队列、再读 socket）；绝不返回暂存区的帧。 */
+     private fun recvNewFrame(timeoutMillis: Long): Iap2Csm.Frame? {
++        if (!channel.isAlive) return null
+         receivedFrames.firstOrNull()?.let {
+             receivedFrames.removeFirst()
+             return it
+--- a/app/src/main/java/com/mcarplay/app/transport/DuplexStream.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/DuplexStream.kt
+@@ -36,9 +36,14 @@
+     }
+ 
+     override fun close() {
+-        runCatching { input.close() }
+-        runCatching { output.close() }
+-        onClose()
++        // For RFCOMM the owner closes the BluetoothSocket, which aborts blocked reads/writes.
++        // Do this before closing buffered stream wrappers that may themselves wait on I/O.
++        try {
++            onClose()
++        } finally {
++            runCatching { input.close() }
++            runCatching { output.close() }
++        }
+     }
+ }
+ 
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -4,8 +4,8 @@
+ import java.io.Closeable
+ import java.io.IOException
+ import java.util.concurrent.CountDownLatch
+-import java.util.concurrent.LinkedBlockingQueue
+ import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+ /**
+  * 链路通道：一个读线程 + 一个节奏线程驱动 [Iap2LinkEngine]，向会话层暴露
+@@ -18,12 +18,16 @@
+ ) : Closeable {
+     private val engine = Iap2LinkEngine()
+     private val lock = Object()
+-    private val controls = LinkedBlockingQueue<ByteArray?>()
++    private val controls = ArrayDeque<ByteArray>()
+     private val readyLatch = CountDownLatch(1)
+     private val terminatedLatch = CountDownLatch(1)
+ 
+     @Volatile
+     private var terminated = false
++
++    @Volatile
++    private var localCloseRequested = false
++    private val streamCloseStarted = AtomicBoolean(false)
+     private var readySignalled = false
+ 
+     /** 链路被引擎终止时的原因；null = 正常 close 或仍在运行。 */
+@@ -46,7 +50,7 @@
+     private var rxFrameLogs = 0
+     private var txFrameLogs = 0
+ 
+-    val isAlive: Boolean get() = !terminated
++    val isAlive: Boolean get() = !terminated && !localCloseRequested
+ 
+     init {
+         engine.onPeerSynchronizationAdopted = { sync ->
+@@ -94,7 +98,7 @@
+     /** 等待链路协商完成（会话 10 可写）。 */
+     fun awaitReady(timeoutMillis: Long): Boolean {
+         if (!readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)) return false
+-        return !terminated
++        return isAlive
+     }
+ 
+     /** 对端最后一帧距今的毫秒数；从未收到过对端帧返回 null。只用于诊断日志。 */
+@@ -104,6 +108,11 @@
+     fun peerFrameCount(): Long = synchronized(lock) { receivedPeerFrameCount }
+ 
+     fun parserStats(): Iap2LinkEngine.ParserStats = synchronized(lock) { engine.parserStats() }
++
++    /** Scoped by the sender after matching the receiver identity. */
++    fun enableConservativeStartup() = synchronized(lock) {
++        if (isAlive) engine.enableConservativeStartup()
++    }
+ 
+     data class LinkSnapshot(
+         val peerFrames: Long,
+@@ -114,22 +123,22 @@
+ 
+     /** Counters and receipt belong to the same reader/pacer lock acquisition. */
+     fun snapshot(receipt: Iap2LinkEngine.ControlReceipt? = null): LinkSnapshot = synchronized(lock) {
+-        LinkSnapshot(receivedPeerFrameCount, engine.parserStats(), !terminated, receipt?.state)
++        LinkSnapshot(receivedPeerFrameCount, engine.parserStats(), isAlive, receipt?.state)
+     }
+ 
+     /** Passive ACK attribution is not supported by an explicitly negotiated no-ACK link. */
+     fun supportsObservedControl(): Boolean = synchronized(lock) {
+-        !terminated && engine.state == Iap2LinkEngine.State.NORMAL && (engine.peerSynchronization?.maxRetransmissions ?: 0) > 0
++        isAlive && engine.state == Iap2LinkEngine.State.NORMAL && (engine.peerSynchronization?.maxRetransmissions ?: 0) > 0
+     }
+ 
+     /** Capture baseline and enqueue under one lock; no unobserved interval before submission. */
+     fun submitObservedControl(bytes: ByteArray): Pair<LinkSnapshot, Iap2LinkEngine.ControlReceipt>? = synchronized(lock) {
+-        if (terminated) return@synchronized null
++        if (!isAlive) return@synchronized null
+         val before = snapshot()
+         val receipt = engine.sendObservedControl(bytes, nowMillis()) ?: return@synchronized null
+         processEventsLocked()
+         drainOutputLocked()
+-        if (terminated) null else before to receipt
++        if (!isAlive) null else before to receipt
+     }
+ 
+     /**
+@@ -147,28 +156,43 @@
+         awaitAck: Boolean = true,
+     ): Boolean {
+         synchronized(lock) {
+-            if (terminated) return false
++            if (!isAlive) return false
+             val accepted = engine.sendControl(bytes, nowMillis(), awaitAck)
++            processEventsLocked()
+             drainOutputLocked()
+-            return accepted && !terminated
++            return accepted && isAlive
+         }
+     }
+ 
+     /** 取下一个控制载荷；超时或链路结束返回 null。 */
+     fun recvControl(timeoutMillis: Long): ByteArray? {
+-        if (timeoutMillis == 0L && terminated && controls.isEmpty()) return null
+-        val polled =
+-            try {
+-                controls.poll(timeoutMillis, TimeUnit.MILLISECONDS)
+-            } catch (_: InterruptedException) {
+-                Thread.currentThread().interrupt()
+-                return null
+-            }
+-        return if (polled === null || polled === POISON) null else polled
++        val started = nowMillis()
++        synchronized(lock) {
++            while (isAlive && controls.isEmpty()) {
++                val remaining = timeoutMillis - (nowMillis() - started)
++                if (remaining <= 0) return null
++                try {
++                    lock.wait(remaining)
++                } catch (_: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    return null
++                }
++            }
++            // Queue extraction and termination share one lock. Never drain a retired channel.
++            return if (!isAlive) null else controls.removeFirstOrNull()
++        }
+     }
+ 
+     override fun close() {
++        localCloseRequested = true
++        // The writer can hold lock while blocked in RFCOMM write. Close the underlying
++        // transport first, without that lock, so cancellation can interrupt the I/O.
++        closeStreamOnce()
+         finish(null)
++    }
++
++    private fun closeStreamOnce() {
++        if (streamCloseStarted.compareAndSet(false, true)) runCatching { stream.close() }
+     }
+ 
+     // ---- 内部 ----
+@@ -176,6 +200,7 @@
+     private fun runReader() {
+         try {
+             synchronized(lock) {
++                if (!isAlive) return
+                 engine.start(nowMillis())
+                 drainOutputLocked()
+             }
+@@ -188,9 +213,13 @@
+                 }
+                 if (count == 0) continue
+                 synchronized(lock) {
+-                    if (terminated) return
++                    if (!isAlive) return
+                     dumpInbound(buffer.copyOf(count))
++                    val previousProbeReplies = engine.startupProbeReplies
+                     engine.feed(buffer.copyOf(count), nowMillis())
++                    if (engine.startupProbeReplies > previousProbeReplies) {
++                        log("BT-LINK: E2LB bounded startup DETECT reply=${engine.startupProbeReplies}/2; not a session reset")
++                    }
+                     processEventsLocked()
+                     drainOutputLocked()
+                     signalReadyLocked()
+@@ -213,10 +242,10 @@
+     }
+ 
+     private fun runPacer() {
+-        while (!terminated) {
++        while (isAlive) {
+             val deadline: Long?
+             synchronized(lock) {
+-                if (terminated) return
++                if (!isAlive) return
+                 engine.advanceTime(nowMillis())
+                 processEventsLocked()
+                 drainOutputLocked()
+@@ -246,10 +275,12 @@
+         while (true) {
+             when (val event = engine.pollEvent() ?: return) {
+                 is Iap2LinkEngine.Event.Control -> {
+-                    if (!controls.offer(event.bytes)) {
+-                        engine.feedEof()
++                    if (controls.size >= 256) {
++                        finishLocked(IOException("control receive queue overflow"))
+                         return
+                     }
++                    controls.add(event.bytes)
++                    lock.notifyAll()
+                 }
+ 
+                 is Iap2LinkEngine.Event.Dead -> {
+@@ -262,6 +293,7 @@
+     }
+ 
+     private fun drainOutputLocked() {
++        if (!isAlive) return
+         val bytes = engine.takeOutput()
+         if (bytes.isEmpty()) return
+         dumpOutbound(bytes)
+@@ -281,7 +313,7 @@
+     }
+ 
+     private fun signalReadyLocked() {
+-        if (!readySignalled && engine.state == Iap2LinkEngine.State.NORMAL) {
++        if (isAlive && !readySignalled && engine.state == Iap2LinkEngine.State.NORMAL) {
+             readySignalled = true
+             readyLatch.countDown()
+         }
+@@ -294,11 +326,12 @@
+     private fun finishLocked(failure: IOException?) {
+         if (terminated) return
+         terminated = true
+-        terminationReason = failure?.message
+-        controls.offer(POISON) // 哨兵：唤醒阻塞的接收方（LBQ 不接受 null）
++        terminationReason = if (localCloseRequested) null else failure?.message
++        engine.feedEof() // End passive receipts and clear pending output even on local close/IO failure.
++        controls.clear()
+         readyLatch.countDown()
+         lock.notifyAll()
+-        runCatching { stream.close() }
++        closeStreamOnce()
+         terminatedLatch.countDown()
+         val stats = engine.parserStats()
+         log(
+@@ -307,8 +340,8 @@
+                 "noiseBytes=${stats.discardedNoiseBytes} peerFrames=$receivedPeerFrameCount " +
+                 "(counters only, no raw wire payload)",
+         )
+-        if (failure != null) {
+-            log("LINK closed: ${failure.message}")
++        if (terminationReason != null) {
++            log("LINK closed: $terminationReason")
+         } else {
+             log("LINK closed")
+         }
+@@ -329,7 +362,5 @@
+         /** 逐帧摘要日志上限（每方向每连接）。 */
+         const val FRAME_LOG_LIMIT = 40
+ 
+-        /** 链路终结哨兵；真实控制载荷至少包含一段 CSM 帧，不会为空。 */
+-        val POISON = ByteArray(0)
+     }
+ }
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+@@ -8,6 +8,118 @@
+ 
+ /** 两个链路引擎通过直接交换输出字节完成握手与数据往返（无线程、无 I/O）。 */
+ class Iap2LinkEngineTest {
++    @Test
++    fun conservativeWindowQueuesExtraFramesAndIgnoresFutureAck() {
++        val phone = normalHandshake(peerWindow = 5).phone
++        phone.takeOutput()
++        val syncSeq = phone.javaClass.getDeclaredField("sentSequence").apply { isAccessible = true }.getInt(phone)
++        phone.feed(ackFor(syncSeq), tick())
++        phone.takeOutput()
++        phone.enableConservativeStartup()
++        repeat(7) { assertTrue(phone.sendControl(Iap2Csm.encode(0x5000 + it), tick())) }
++        val first = parseFrames(phone.takeOutput())
++        assertEquals(5, first.size)
++        phone.feed(ackFor(first.last().sequence + 1), tick())
++        assertTrue(phone.takeOutput().isEmpty())
++        phone.feed(ackFor(first[1].sequence), tick())
++        val next = parseFrames(phone.takeOutput())
++        assertEquals(2, next.size)
++        assertEquals((first.last().sequence + 1) and 255, next.first().sequence)
++        phone.feed(ackFor(next.last().sequence), tick())
++        assertTrue(phone.takeOutput().isEmpty())
++    }
++
++    @Test
++    fun conservativeWindowDoesNotChangeZeroRetransmissionLink() {
++        val phone = normalHandshake(peerWindow = 5, peerRetransmissions = 0).phone
++        phone.takeOutput()
++        phone.enableConservativeStartup()
++        repeat(7) { assertTrue(phone.sendControl(Iap2Csm.encode(0x5000 + it), tick())) }
++        assertEquals(7, parseFrames(phone.takeOutput()).size)
++    }
++
++    @Test
++    fun probeRepliesAreBoundedAndNeverReplayControl() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        phone.enableConservativeStartup()
++        phone.feed(Iap2LinkEngine.MARKER, 100L)
++        assertTrue(phone.takeOutput().isEmpty())
++        val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), 200L)!!
++        val seq = parseFrames(phone.takeOutput()).single().sequence
++        repeat(8) { phone.feed(Iap2LinkEngine.MARKER, 1_000L + it * 1_000L) }
++        assertArrayEquals(Iap2LinkEngine.MARKER + Iap2LinkEngine.MARKER, phone.takeOutput())
++        assertEquals(2, phone.startupProbeReplies)
++        assertEquals(Iap2LinkEngine.State.NORMAL, phone.state)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.state)
++        phone.feed(ackFor(seq), 10_000L)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.PEER_ACKED, receipt.state)
++        phone.feed(Iap2LinkEngine.MARKER, 11_000L)
++        assertTrue(phone.takeOutput().isEmpty())
++    }
++
++    @Test
++    fun validAckInSameReadCancelsProbeAndUnscopedEngineDoesNotReply() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        val seq = parseFrames(phone.takeOutput()).single().sequence
++        repeat(8) { phone.feed(Iap2LinkEngine.MARKER, tick()) }
++        assertTrue(phone.takeOutput().isEmpty())
++        phone.enableConservativeStartup()
++        val burst = Iap2LinkEngine.MARKER + Iap2LinkEngine.MARKER + Iap2LinkEngine.MARKER
++        phone.feed(burst + ackFor(seq), 10_000L)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.PEER_ACKED, receipt.state)
++        assertEquals(0, phone.startupProbeReplies)
++        assertTrue(phone.takeOutput().isEmpty())
++    }
++
++    @Test
++    fun corruptedProbeStreakCannotTriggerReply() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        phone.enableConservativeStartup()
++        phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        phone.takeOutput()
++        repeat(2) { phone.feed(Iap2LinkEngine.MARKER, tick()) }
++        // Noise splits the streak; only complete consecutive markers are evidence.
++        phone.feed(byteArrayOf(1, 2) + Iap2LinkEngine.MARKER, tick())
++        assertTrue(phone.takeOutput().isEmpty())
++        phone.feed(Iap2LinkEngine.MARKER, tick())
++        assertTrue(phone.takeOutput().isEmpty())
++        phone.feed(Iap2LinkEngine.MARKER, tick())
++        assertArrayEquals(Iap2LinkEngine.MARKER, phone.takeOutput())
++    }
++
++    @Test
++    fun malformedRestartSynCannotRetireNormalLink() {
++        val phone = normalHandshake().phone
++        phone.rebuildOnNewSyn = true
++        phone.sendControl(Iap2Csm.encode(0x5000), tick())
++        phone.takeOutput()
++        phone.feed(synFrameWithMaxOutgoing(peerSequence = 161, maxOutgoing = 0), tick())
++        assertFalse(phone.isDead)
++        assertTrue(phone.takeOutput().isEmpty())
++        phone.feed(synFrame(peerSequence = 162), tick())
++        assertTrue(phone.isDead)
++    }
++
++    @Test
++    fun boundedBacklogEndsWithoutUnboundedMemoryGrowth() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        phone.enableConservativeStartup()
++        repeat(270) { phone.sendControl(Iap2Csm.encode(0x5000), tick()) }
++        assertTrue(phone.isDead)
++        assertTrue(phone.takeOutput().isEmpty())
++        assertFalse(phone.sendControl(Iap2Csm.encode(0x5000), tick()))
++    }
++
++    private fun ackFor(seq: Int): ByteArray = ackFrame().apply {
++        this[6] = seq.toByte()
++        this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++    }
++
+     @Test
+     fun observedControlNeedsItsOwnValidCumulativeAck() {
+         val phone = normalHandshake().phone
+@@ -289,15 +401,19 @@
+ 
+         val frames = (0 until 5).map { Iap2Csm.encode(0x5000 + it) }
+         frames.forEach { assertTrue(phone.sendControl(it, 10)) }
+-        // 窗口 2：只有前 2 帧立即发出，其余积压；ACK 后由 handleAcknowledgement 冲刷
++        // Collect across reads and cap the test loop; never silently discard already received frames.
++        val delivered = ArrayList<ByteArray>()
+         var now = 11L
+-        while (pollControls(accessory).size < 5) {
++        repeat(20) {
+             exchange(phone, accessory)
++            delivered += pollControls(accessory)
+             now += 1
+             phone.advanceTime(now)
+             accessory.advanceTime(now)
+             assertTrue(!phone.isDead && !accessory.isDead)
+         }
++        assertEquals(frames.size, delivered.size)
++        frames.zip(delivered).forEach { (expected, actual) -> assertArrayEquals(expected, actual) }
+     }
+ 
+     // ---- 协商细节回归 ----
+@@ -619,9 +735,9 @@
+         val firstEcho: ByteArray,
+     )
+ 
+-    private fun normalHandshake(): NormalHandshake {
+-        val phone = Iap2LinkEngine()
+-        val accessory = Iap2LinkEngine()
++    private fun normalHandshake(peerWindow: Int = 4, peerRetransmissions: Int = 4): NormalHandshake {
++        val phone = Iap2LinkEngine()
++        val accessory = Iap2LinkEngine(maxOutgoing = peerWindow, maxRetransmissions = peerRetransmissions)
+         phone.start(0)
+         accessory.start(0)
+         val phoneSyn = phone.takeOutput()
+--- a/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
++++ b/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
+@@ -7,6 +7,104 @@
+ import org.junit.Test
+ 
+ class Iap2LinkChannelRestartTest {
++    @Test
++    fun closeDiscardsAlreadyBufferedControls() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA, name = "close-phone")
++        val peer = Iap2LinkChannel(pair.sideB, name = "close-peer")
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            val baseline = phone.peerFrameCount()
++            assertTrue(peer.sendControl(byteArrayOf(9, 9, 9)))
++            val deadline = System.nanoTime() + 2_000_000_000L
++            while (phone.peerFrameCount() <= baseline && System.nanoTime() < deadline) Thread.sleep(5)
++            assertTrue(phone.peerFrameCount() > baseline)
++            phone.close()
++            assertTrue(phone.recvControl(0) == null)
++            assertTrue(phone.recvControl(2_000) == null)
++        } finally {
++            phone.close()
++            peer.close()
++        }
++    }
++
++    @Test
++    fun cancellationInterruptsBlockedWriteWithoutWaitingForChannelMonitor() {
++        val pair = InMemoryStreamPair()
++        val blockWrites = java.util.concurrent.atomic.AtomicBoolean(false)
++        val writeEntered = java.util.concurrent.CountDownLatch(1)
++        val transportClosed = java.util.concurrent.CountDownLatch(1)
++        val writeFinished = java.util.concurrent.CountDownLatch(1)
++        val closeFinished = java.util.concurrent.CountDownLatch(1)
++        val accepted = java.util.concurrent.atomic.AtomicBoolean(true)
++        val blockedStream = object : DuplexStream by pair.sideA {
++            override fun write(bytes: ByteArray) {
++                if (blockWrites.get()) {
++                    writeEntered.countDown()
++                    transportClosed.await(5, java.util.concurrent.TimeUnit.SECONDS)
++                    throw java.io.IOException("cancelled blocked write")
++                }
++                pair.sideA.write(bytes)
++            }
++
++            override fun close() {
++                transportClosed.countDown()
++                pair.sideA.close()
++            }
++        }
++        val phone = Iap2LinkChannel(blockedStream, name = "cancel-phone")
++        val peer = Iap2LinkChannel(pair.sideB, name = "cancel-peer")
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            blockWrites.set(true)
++            Thread {
++                accepted.set(phone.sendControl(byteArrayOf(9, 9, 9)))
++                writeFinished.countDown()
++            }.apply { isDaemon = true; start() }
++            assertTrue(writeEntered.await(2, java.util.concurrent.TimeUnit.SECONDS))
++            Thread {
++                phone.close()
++                closeFinished.countDown()
++            }.apply { isDaemon = true; start() }
++            assertTrue(closeFinished.await(2, java.util.concurrent.TimeUnit.SECONDS))
++            assertTrue(writeFinished.await(2, java.util.concurrent.TimeUnit.SECONDS))
++            assertFalse(accepted.get())
++            assertTrue(phone.awaitTerminated(2_000))
++            assertTrue(phone.terminationReason == null)
++        } finally {
++            transportClosed.countDown()
++            phone.close()
++            peer.close()
++        }
++    }
++
++    @Test
++    fun sendFailsImmediatelyWhenTransportWriteFails() {
++        val pair = InMemoryStreamPair()
++        val failWrites = java.util.concurrent.atomic.AtomicBoolean(false)
++        val failingStream = object : DuplexStream by pair.sideA {
++            override fun write(bytes: ByteArray) {
++                if (failWrites.get()) throw java.io.IOException("injected write failure")
++                pair.sideA.write(bytes)
++            }
++        }
++        val phone = Iap2LinkChannel(failingStream, name = "write-failure-phone")
++        val peer = Iap2LinkChannel(pair.sideB, name = "write-failure-peer")
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            failWrites.set(true)
++            assertFalse(phone.sendControl(byteArrayOf(9, 9, 9)))
++            assertTrue(phone.awaitTerminated(2_000))
++            assertTrue(phone.terminationReason?.contains("injected write failure") == true)
++        } finally {
++            phone.close()
++            peer.close()
++        }
++    }
++
+     @Test
+     fun passiveReceiptTracksRealPeerAckAcrossThreadedLoopback() {
+         val pair = InMemoryStreamPair()
+--- a/build-r23-signed.ps1
++++ /dev/null
+@@ -1,31 +0,0 @@
+-# R24 local release build. Requires Android SDK, JDK, and keystore.properties.
+-# Never sends a key or password to the network. Requires the R23 long-term signer.
+-param(
+-    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
+-)
+-$ErrorActionPreference = 'Stop'
+-Set-Location $PSScriptRoot
+-if ($ExpectedCertSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected certificate SHA-256 must contain exactly 64 hex characters.' }
+-if (!(Test-Path 'keystore.properties')) { throw 'Missing private keystore.properties. Configure your existing signing key locally; never commit it.' }
+-$sdk = $env:ANDROID_HOME
+-if (!$sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+-if (!$sdk) { throw 'Set ANDROID_HOME to your Android SDK directory.' }
+-$signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
+-$aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
+-if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
+-& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.11-test.1 :app:assembleStandardRelease
+-if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
+-$apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
+-if (!(Test-Path $apk)) { throw 'Release APK missing.' }
+-$verify = & $signer verify --verbose --print-certs $apk
+-if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
+-$verify | Write-Output
+-$cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
+-if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
+-$meta = & $aapt dump badging $apk
+-if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1110000'")) { throw 'Unexpected package name or versionCode.' }
+-New-Item -ItemType Directory -Force dist | Out-Null
+-$out = 'dist\mcarplay-0.1.11.apk'
+-Copy-Item $apk $out -Force
+-Get-FileHash $out -Algorithm SHA256
+-Write-Output 'Signed APK verified against expected certificate and package/version.'
+--- /dev/null
++++ b/build-r25-signed.ps1
+@@ -0,0 +1,31 @@
++# R25 local release build. Requires Android SDK, JDK, and keystore.properties.
++# Never sends a key or password to the network. Requires the R23 long-term signer.
++param(
++    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
++)
++$ErrorActionPreference = 'Stop'
++Set-Location $PSScriptRoot
++if ($ExpectedCertSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected certificate SHA-256 must contain exactly 64 hex characters.' }
++if (!(Test-Path 'keystore.properties')) { throw 'Missing private keystore.properties. Configure your existing signing key locally; never commit it.' }
++$sdk = $env:ANDROID_HOME
++if (!$sdk) { $sdk = $env:ANDROID_SDK_ROOT }
++if (!$sdk) { throw 'Set ANDROID_HOME to your Android SDK directory.' }
++$signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
++$aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
++if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
++& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.12-test.1 :app:assembleStandardRelease
++if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
++$apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
++if (!(Test-Path $apk)) { throw 'Release APK missing.' }
++$verify = & $signer verify --verbose --print-certs $apk
++if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
++$verify | Write-Output
++$cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
++if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
++$meta = & $aapt dump badging $apk
++if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1120000'")) { throw 'Unexpected package name or versionCode.' }
++New-Item -ItemType Directory -Force dist | Out-Null
++$out = 'dist\mcarplay-0.1.12.apk'
++Copy-Item $apk $out -Force
++Get-FileHash $out -Algorithm SHA256
++Write-Output 'Signed APK verified against expected certificate and package/version.'
