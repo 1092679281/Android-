@@ -1,0 +1,1230 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,22 @@
+ 
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
++
++## [v0.1.22-test.1] - 2026-11-25
++
++> R35 — experimental projected shell; not receiver/GPU validated.
++
++### English
++- Interactive projected dashboard, home, navigation feed, music and local clock/date widgets; shared page and touch geometry.
++- Local-time light/dark palette, translucent wallpaper cards and a short GPU brightness transition; not optical refraction.
++- Independent local UI refresh while a previously established source is idle, with an idle indicator and screen ownership gate.
++- Target the rendered Android media session only, without forwarding card actions to another player.
++
++### 简体中文
++- 新增车机仪表盘、主页、导航源画面、音乐及本地时钟日历组件，统一触控布局。
++- 本地时段昼夜主题、半透明卡片及短暂 GPU 亮度过渡，非真实折射。
++- 已出画后源视频静止仍可更新本地界面，显示未更新状态并保留主屏仲裁。
++- 媒体卡片仅操作对应 Android 媒体会话，不跨播放器回退。
+ 
+ ## [v0.1.21-test.1] - 2026-11-25
+ 
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.21"
++val appVersionName = "0.1.22"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -4888,7 +4888,9 @@
+                                                         DashboardAction.NEXT -> KeyEvent.KEYCODE_MEDIA_NEXT
+                                                     }
+                                                     if (action == DashboardAction.PLAY_PAUSE) autoPlaySuppressor.disarm()
+-                                                    routeCarMediaKey(key, "projected dashboard")
++                                                    if (videoSender?.dispatchProjectedMedia(key, projected.mediaIdentity) != true) {
++                                                        appendLog("EVENT: R35 projected media action unavailable; no cross-player fallback")
++                                                    }
+                                                 }
+                                                 val point = if (projected != null) projected.point else
+                                                     mapCarLifeTouch(
+diff --git a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+--- a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
++++ b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+@@ -40,17 +40,28 @@
+                 componentName(this),
+             )
+             MediaSessionsState.resyncHook = { mainHandler.post { refresh() } }
++            MediaSessionsState.projectedMediaHook = { token, key ->
++                val controller = manager.getActiveSessions(componentName(this)).firstOrNull { it.sessionToken == token }
++                controller != null && MediaSessionsState.nowPlaying?.sessionToken == token &&
++                    controller.dispatchMediaButtonEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, key)).let { down ->
++                        val up = controller.dispatchMediaButtonEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, key))
++                        down && up
++                    }
++            }
+             update(manager.getActiveSessions(componentName(this)))
+             mainHandler.post(periodicRefresh)
+         } catch (_: SecurityException) {
+             // 通知使用权被撤销：静默（授权后系统会重新绑定本服务）
+             MediaSessionsState.accessGranted = false
++            MediaSessionsState.projectedMediaHook = null
+         }
+     }
+ 
+     override fun onListenerDisconnected() {
+         super.onListenerDisconnected()
+         MediaSessionsState.accessGranted = false
++        MediaSessionsState.projectedMediaHook = null
++        mainHandler.removeCallbacks(periodicRefresh)
+         NotificationAccess.markDisconnected()
+         CarWithNotificationProbe.onListenerDisconnected()
+         // 必须清空：否则卡片会保留断开前的歌名/播放状态，出现「正在播放 + 未在播放」
+@@ -72,6 +83,8 @@
+ 
+     override fun onDestroy() {
+         mainHandler.removeCallbacks(periodicRefresh)
++        MediaSessionsState.projectedMediaHook = null
++        MediaSessionsState.accessGranted = false
+         runCatching { manager.removeOnActiveSessionsChangedListener(sessionListener) }
+         CarWithNotificationProbe.onListenerDisconnected()
+         MediaSessionsState.publish(null)
+@@ -167,6 +180,7 @@
+                     playbackSpeed = if (playing) (state?.playbackSpeed ?: 1f) else 0f,
+                     durationMs = meta?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
+                     anchoredAtMs = android.os.SystemClock.elapsedRealtime(),
++                    sessionToken = controller.sessionToken,
+                 )
+             }
+         MediaSessionsState.publish(now)
+@@ -255,6 +269,7 @@
+         val durationMs: Long = 0L,
+         /** 位置采样的 SystemClock.elapsedRealtime 锚点。 */
+         val anchoredAtMs: Long = 0L,
++        val sessionToken: android.media.session.MediaSession.Token? = null,
+     ) {
+         /** 渲染时刻的推算播放位置（播放中按速度外推，钳制在时长内）。 */
+         fun displayPositionAt(elapsedRealtimeMs: Long): Long {
+@@ -321,6 +336,16 @@
+     @Volatile
+     var resyncHook: (() -> Unit)? = null
+ 
++    @Volatile
++    internal var projectedMediaHook: ((android.media.session.MediaSession.Token, Int) -> Boolean)? = null
++
++    /** Never route a visible card's action to a different player or to CarWith hardware keys. */
++    internal fun dispatchProjected(expected: NowPlaying?, keyCode: Int): Boolean {
++        val token = expected?.sessionToken ?: return false
++        if (!accessGranted || nowPlaying?.sessionToken != token) return false
++        return runCatching { projectedMediaHook?.invoke(token, keyCode) == true }.getOrDefault(false)
++    }
++
+     fun requestResync() {
+         resyncHook?.invoke()
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -54,6 +54,35 @@
+     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+     private var dashboard: ProjectedDashboardRenderer? = null
++    private val pages = dashboardLayout?.let { ProjectionPageState<com.mcarplay.app.media.MediaSessionsState.NowPlaying>(it) }
++    fun touchLayout(): ProjectedDashboardLayout? = dashboardLayout?.takeIf { it.fullContent } ?: pages?.touchLayout()
++    fun selectPage(page: ProjectionPage) {
++        if (pages?.select(page) == true) glHandler.post { if (mayRefreshIdle()) scheduleRender() }
++    }
++    fun mediaIdentity(): Any? = pages?.sentMedia()?.sessionToken
++    fun dispatchProjectedMedia(keyCode: Int, expected: Any?): Boolean {
++        val media = pages?.sentMedia() ?: return false
++        return expected != null && expected == media.sessionToken &&
++            com.mcarplay.app.media.MediaSessionsState.dispatchProjected(media, keyCode)
++    }
++    @Volatile private var inputSyncRetry = false
++    private var unmatchedFrameCount = 0
++    fun onProjectedFrameSent(ptsUs: Long) {
++        if (dashboardLayout?.fullContent == true) return
++        if (pages?.markSent(ptsUs) == true) {
++            unmatchedFrameCount = 0
++            return
++        }
++        if (++unmatchedFrameCount >= 3) {
++            fail("R35 encoder PTS mismatch; page input disabled")
++        } else {
++            inputSyncRetry = true
++            log("VIDEO: R35 unmatched encoder PTS; requesting local UI resync")
++            glHandler.post { if (mayRefreshIdle()) scheduleRender() }
++        }
++    }
++    fun invalidateProjectedInput() { pages?.invalidate() }
++
+     private var program = 0
+     private var aPositionLoc = -1
+     private var aTexCoordLoc = -1
+@@ -97,12 +126,12 @@
+             if (!running.get() || failure != null) return
+             if (mayRefreshIdle()) {
+                 try {
+-                    if (dashboard?.hasVisualChange(android.os.SystemClock.uptimeMillis()) == true) scheduleRender()
++                    if (needsDashboardRefresh()) scheduleRender()
+                 } catch (error: Exception) {
+                     fail("dashboard tick: ${error.message}")
+                 }
+             }
+-            if (running.get() && failure == null) glHandler.postDelayed(this, 250)
++            if (running.get() && failure == null) glHandler.postDelayed(this, if (dashboard?.animating() == true) 16 else 100)
+         }
+     }
+ 
+@@ -120,7 +149,14 @@
+     }
+ 
+     private fun mayRefreshIdle(): Boolean = dashboard != null && lastTexturePts != null &&
+-        System.nanoTime() - lastSourceNs <= 2_000_000_000L && runCatching { allowIdleDashboard() }.getOrDefault(false)
++        runCatching { allowIdleDashboard() }.getOrDefault(false)
++
++    private fun needsDashboardRefresh(): Boolean {
++        val renderer = dashboard ?: return false
++        if (inputSyncRetry) return true
++        val now = android.os.SystemClock.uptimeMillis()
++        return renderer.needsRefresh(pages?.requested ?: return false, now, System.nanoTime() - lastSourceNs > 2_000_000_000L)
++    }
+ 
+     @Volatile
+     private var decoder: MediaCodec? = null
+@@ -450,9 +486,12 @@
+             latchErrors = 0
+             if (dashboardLayout == null) {
+                 drawFrame(source = true)
+-            } else {
++            } else if (pages?.requested?.showsVideo != false) {
+                 pacer.sourceArrived()
+                 coalescedFrames = pacer.coalesced
++                scheduleRender()
++            } else if (mayRefreshIdle() && needsDashboardRefresh()) {
++                // Keep the decoder current, but do not encode identical local pages on each source frame.
+                 scheduleRender()
+             }
+         } catch (error: Exception) {
+@@ -471,7 +510,7 @@
+     private fun renderIfDue() {
+         if (!running.get() || failure != null) return
+         val source = pacer.sourcePending
+-        if (!source && (!mayRefreshIdle() || dashboard?.hasVisualChange(android.os.SystemClock.uptimeMillis()) != true)) return
++        if (!source && (!mayRefreshIdle() || !needsDashboardRefresh())) return
+         val startNs = System.nanoTime()
+         pacer.updateRate(runtimeFps().coerceIn(1, outputFps))
+         if (pacer.delayMs(startNs) > 0) {
+@@ -480,62 +519,70 @@
+         }
+         pacer.rendered(startNs)
+         drawFrame(source)
++        if (dashboard?.animating() == true && mayRefreshIdle()) scheduleRender()
+     }
+ 
+     private fun drawFrame(source: Boolean) {
+         if (!running.get() || failure != null) return
+         val startNs = System.nanoTime()
++        inputSyncRetry = false
+         try {
+             if (dashboardLayout?.fullContent == true) {
+                 GLES20.glViewport(0, 0, outWidth, outHeight)
+                 GLES20.glClearColor(0f, 0f, 0f, 1f)
+                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+             }
+-            dashboard?.draw()
+-            val viewport = dashboardLayout?.video
+-            val drawWidth = viewport?.width ?: outWidth
+-            val drawHeight = viewport?.height ?: outHeight
+-            GLES20.glViewport(viewport?.left ?: 0, viewport?.let { outHeight - it.bottom } ?: 0, drawWidth, drawHeight)
+-            GLES20.glUseProgram(program)
+-            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
+-            GLES20.glEnableVertexAttribArray(aPositionLoc)
+-            GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quad)
+-            GLES20.glEnableVertexAttribArray(aTexCoordLoc)
+-            GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texCoords)
+-            GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix, 0)
+-            GLES20.glUniform1i(sTextureLoc, 0)
+-            val downscale = sourceWidth > drawWidth || sourceHeight > drawHeight
+-            GLES20.glUniform1i(uDownsampleLoc, if (downscale) 1 else 0)
+-            if (downscale) {
+-                val safeSrcW = sourceWidth.coerceAtLeast(1).toFloat()
+-                val safeSrcH = sourceHeight.coerceAtLeast(1).toFloat()
+-                val du = (safeSrcW / drawWidth.coerceAtLeast(1).toFloat()) / safeSrcW
+-                val dv = (safeSrcH / drawHeight.coerceAtLeast(1).toFloat()) / safeSrcH
+-                GLES20.glUniform2f(uTexStepXLoc, texMatrix[0] * du, texMatrix[1] * du)
+-                GLES20.glUniform2f(uTexStepYLoc, texMatrix[4] * dv, texMatrix[5] * dv)
+-                val halfDu = 0.5f / safeSrcW
+-                val halfDv = 0.5f / safeSrcH
+-                var minU = Float.POSITIVE_INFINITY
+-                var minV = Float.POSITIVE_INFINITY
+-                var maxU = Float.NEGATIVE_INFINITY
+-                var maxV = Float.NEGATIVE_INFINITY
+-                for (i in 0 until 4) {
+-                    val cx = if ((i and 1) == 0) halfDu else 1f - halfDu
+-                    val cy = if ((i and 2) == 0) halfDv else 1f - halfDv
+-                    val tx = texMatrix[0] * cx + texMatrix[4] * cy + texMatrix[12]
+-                    val ty = texMatrix[1] * cx + texMatrix[5] * cy + texMatrix[13]
+-                    if (tx < minU) minU = tx
+-                    if (tx > maxU) maxU = tx
+-                    if (ty < minV) minV = ty
+-                    if (ty > maxV) maxV = ty
+-                }
+-                GLES20.glUniform4f(uUvBoundsLoc, minU, minV, maxU, maxV)
+-            }
+-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
++            val currentLayout = pages?.requested
++            dashboard?.let { renderer ->
++                renderer.draw(currentLayout ?: error("missing dashboard layout"), System.nanoTime() - lastSourceNs > 2_000_000_000L)
++            }
++            val viewport = currentLayout?.video
++            if (currentLayout == null || currentLayout.showsVideo) {
++                val drawWidth = viewport?.width ?: outWidth
++                val drawHeight = viewport?.height ?: outHeight
++                GLES20.glViewport(viewport?.left ?: 0, viewport?.let { outHeight - it.bottom } ?: 0, drawWidth, drawHeight)
++                GLES20.glUseProgram(program)
++                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
++                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId)
++                GLES20.glEnableVertexAttribArray(aPositionLoc)
++                GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quad)
++                GLES20.glEnableVertexAttribArray(aTexCoordLoc)
++                GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texCoords)
++                GLES20.glUniformMatrix4fv(uTexMatrixLoc, 1, false, texMatrix, 0)
++                GLES20.glUniform1i(sTextureLoc, 0)
++                val downscale = sourceWidth > drawWidth || sourceHeight > drawHeight
++                GLES20.glUniform1i(uDownsampleLoc, if (downscale) 1 else 0)
++                if (downscale) {
++                    val safeSrcW = sourceWidth.coerceAtLeast(1).toFloat()
++                    val safeSrcH = sourceHeight.coerceAtLeast(1).toFloat()
++                    val du = (safeSrcW / drawWidth.coerceAtLeast(1).toFloat()) / safeSrcW
++                    val dv = (safeSrcH / drawHeight.coerceAtLeast(1).toFloat()) / safeSrcH
++                    GLES20.glUniform2f(uTexStepXLoc, texMatrix[0] * du, texMatrix[1] * du)
++                    GLES20.glUniform2f(uTexStepYLoc, texMatrix[4] * dv, texMatrix[5] * dv)
++                    val halfDu = 0.5f / safeSrcW
++                    val halfDv = 0.5f / safeSrcH
++                    var minU = Float.POSITIVE_INFINITY
++                    var minV = Float.POSITIVE_INFINITY
++                    var maxU = Float.NEGATIVE_INFINITY
++                    var maxV = Float.NEGATIVE_INFINITY
++                    for (i in 0 until 4) {
++                        val cx = if ((i and 1) == 0) halfDu else 1f - halfDu
++                        val cy = if ((i and 2) == 0) halfDv else 1f - halfDv
++                        val tx = texMatrix[0] * cx + texMatrix[4] * cy + texMatrix[12]
++                        val ty = texMatrix[1] * cx + texMatrix[5] * cy + texMatrix[13]
++                        if (tx < minU) minU = tx
++                        if (tx > maxU) maxU = tx
++                        if (ty < minV) minV = ty
++                        if (ty > maxV) maxV = ty
++                    }
++                    GLES20.glUniform4f(uUvBoundsLoc, minU, minV, maxU, maxV)
++                }
++                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
++            }
+             check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "GL composition failed" }
+             lastPresentationNs = maxOf(lastPresentationNs + 1, System.nanoTime())
+             check(EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, lastPresentationNs)) { "eglPresentationTimeANDROID" }
++            currentLayout?.let { pages?.submit(it, lastPresentationNs / 1_000L, dashboard?.displayedMedia) }
+             check(EGL14.eglSwapBuffers(eglDisplay, eglSurface)) { "eglSwapBuffers" }
+             framesRendered++
+             if (!source) dashboardOnlyFrames++
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+@@ -8,14 +8,51 @@
+ }
+ 
+ internal enum class DashboardAction { PREVIOUS, PLAY_PAUSE, NEXT }
++internal enum class ProjectionPage { DASHBOARD, HOME, NAVIGATION, MUSIC, WIDGETS }
++
++/** Track the local frame that was actually written to the video socket, not a receiver ACK. */
++internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
++    @Volatile var requested = initial
++        private set
++    private data class Frame<T>(val layout: ProjectedDashboardLayout, val media: T?)
++    private val frames = LinkedHashMap<Long, Frame<T>>()
++    private var sent: Frame<T>? = null
++    private var lastSentPts = Long.MIN_VALUE
++
++    @Synchronized fun select(page: ProjectionPage): Boolean {
++        if (requested.fullContent || requested.page == page || sent?.layout !== requested) return false
++        requested = requested.withPage(page)
++        return true
++    }
++
++    @Synchronized fun submit(layout: ProjectedDashboardLayout, ptsUs: Long, media: T?) {
++        frames[ptsUs] = Frame(layout, media)
++        while (frames.size > 64) frames.remove(frames.keys.first())
++    }
++
++    @Synchronized fun markSent(ptsUs: Long): Boolean {
++        if (ptsUs <= lastSentPts) return sent != null
++        lastSentPts = ptsUs
++        // Unknown or rewritten timestamps must not enable input against unconfirmed geometry.
++        sent = frames[ptsUs]
++        frames.entries.removeAll { it.key <= ptsUs }
++        return sent != null
++    }
++
++    @Synchronized fun invalidate() { sent = null; frames.clear() }
++    @Synchronized fun touchLayout(): ProjectedDashboardLayout? = sent?.layout?.takeIf { it === requested }
++    @Synchronized fun sentMedia(): T? = sent?.takeIf { it.layout === requested }?.media
++}
+ 
+ internal class ProjectedDashboardLayout(
+     val width: Int,
+     val height: Int,
+-    sourceWidth: Int,
+-    sourceHeight: Int,
+-    wideReceiver: Boolean = false,
++    private val sourceWidth: Int,
++    private val sourceHeight: Int,
++    private val wideReceiver: Boolean = false,
+     val fullContent: Boolean = false,
++    val page: ProjectionPage = ProjectionPage.DASHBOARD,
++    val shell: Boolean = false,
+ ) {
+     init {
+         require(supports(width, height) && sourceWidth > 0 && sourceHeight > 0)
+@@ -25,6 +62,10 @@
+             width >= 640 && height >= 360 && width.toLong() * height <= 3_000_000L &&
+                 width.toDouble() / height in 1.2..3.5
+     }
++    fun withPage(next: ProjectionPage) =
++        ProjectedDashboardLayout(width, height, sourceWidth, sourceHeight, wideReceiver, fullContent, next, shell)
++    val showsVideo = fullContent || page == ProjectionPage.DASHBOARD || page == ProjectionPage.NAVIGATION
++    val showsMedia get() = !fullContent && (page == ProjectionPage.DASHBOARD || page == ProjectionPage.MUSIC || miniPanel != null)
+     private val gap = (height * 0.025).toInt().coerceAtLeast(4)
+     private val railWidth = (height * if (wideReceiver) 0.15 else 0.12).toInt().coerceAtLeast(28)
+     val rail = ProjectionRect(gap, gap, railWidth + gap, height - gap)
+@@ -32,8 +73,30 @@
+         // Keep media controls readable while reserving more width for the live content on ultra-wide displays.
+         width - gap - minOf((width * 0.28).toInt(), (height * 0.65).toInt())
+     } else (width * 0.72).toInt()
+-    val panel = ProjectionRect(panelLeft, gap, width - gap, height - gap)
+-    val content = ProjectionRect(rail.right + gap, gap, panel.left - gap, height - gap)
++    val workspace = ProjectionRect(rail.right + gap, gap, width - gap, height - gap)
++    val panel: ProjectionRect
++    val miniPanel: ProjectionRect?
++    val musicArt: ProjectionRect?
++    val content = if (page == ProjectionPage.NAVIGATION) workspace else ProjectionRect(rail.right + gap, gap, panelLeft - gap, height - gap)
++    val dock = if (shell && !fullContent) ProjectionPage.entries.mapIndexed { i, dest ->
++        val top = rail.top + rail.height * 22 / 100
++        val span = rail.bottom - top - gap
++        dest to ProjectionRect(rail.left, top + span * i / 5, rail.right, top + span * (i + 1) / 5)
++    } else emptyList()
++    val tiles = if (shell && page == ProjectionPage.HOME) {
++        val destinations = listOf(ProjectionPage.DASHBOARD, ProjectionPage.NAVIGATION, ProjectionPage.MUSIC, ProjectionPage.WIDGETS)
++        val cols = if (workspace.width >= workspace.height * 1.6) 4 else 2
++        val rows = (destinations.size + cols - 1) / cols
++        val top = workspace.top + workspace.height / 5
++        val span = workspace.bottom - top - gap
++        destinations.mapIndexed { i, dest ->
++            val c = i % cols
++            val r = i / cols
++            dest to ProjectionRect(workspace.left + workspace.width * c / cols + gap, top + span * r / rows + gap,
++                workspace.left + workspace.width * (c + 1) / cols - gap, top + span * (r + 1) / rows - gap)
++        }
++    } else emptyList()
++    fun pageAt(x: Int, y: Int): ProjectionPage? = (dock + tiles).firstOrNull { it.second.contains(x, y) }?.first
+     val video: ProjectionRect
+     val controls: List<Pair<DashboardAction, ProjectionRect>>
+     init {
+@@ -43,12 +106,32 @@
+         val fit = minOf(area.width.toDouble() / sourceWidth, area.height.toDouble() / sourceHeight)
+         val w = (sourceWidth * fit).toInt().coerceIn(1, area.width)
+         val h = (sourceHeight * fit).toInt().coerceIn(1, area.height)
+-        val x = area.left + (area.width - w) / 2
++        val spare = area.width - w
++        val useMini = shell && !fullContent && page == ProjectionPage.NAVIGATION && spare >= height * .45f + gap * 2
++        val x = if (useMini) area.left else area.left + spare / 2
+         val y = area.top + (area.height - h) / 2
+         video = ProjectionRect(x, y, x + w, y + h)
++        miniPanel = if (useMini) {
++            val left = video.right + gap
++            val cardW = minOf(workspace.right - left - gap, (height * .70f).toInt())
++            val cardH = minOf(workspace.height - gap * 2, (height * .76f).toInt())
++            val cardX = left + (workspace.right - left - cardW) / 2
++            val cardY = workspace.top + (workspace.height - cardH) / 2
++            ProjectionRect(cardX, cardY, cardX + cardW, cardY + cardH)
++        } else null
++        musicArt = if (page == ProjectionPage.MUSIC && !fullContent) {
++            val artArea = workspace.width * 43 / 100
++            val size = minOf(artArea - gap * 3, (workspace.height * .70f).toInt()).coerceAtLeast(1)
++            val artX = workspace.left + (artArea - size) / 2
++            val artY = workspace.top + (workspace.height - size) / 2
++            ProjectionRect(artX, artY, artX + size, artY + size)
++        } else null
++        panel = miniPanel ?: if (page == ProjectionPage.MUSIC) {
++            ProjectionRect(workspace.left + workspace.width * 43 / 100 + gap, workspace.top, workspace.right, workspace.bottom)
++        } else ProjectionRect(panelLeft, gap, width - gap, height - gap)
+         val top = panel.top + (panel.height * 0.72).toInt()
+         val bottom = panel.top + (panel.height * 0.90).toInt()
+-        controls = if (fullContent) emptyList() else DashboardAction.entries.mapIndexed { index, action ->
++        controls = if (!showsMedia) emptyList() else DashboardAction.entries.mapIndexed { index, action ->
+             val l = panel.left + panel.width * index / 3
+             val r = panel.left + panel.width * (index + 1) / 3
+             action to ProjectionRect(l, top, r, bottom)
+@@ -68,7 +151,7 @@
+ 
+     fun actionAt(x: Int, y: Int): DashboardAction? = controls.firstOrNull { it.second.contains(x, y) }?.first
+     fun sourcePoint(x: Int, y: Int, targetWidth: Int, targetHeight: Int): Pair<Int, Int>? {
+-        if (targetWidth <= 0 || targetHeight <= 0) return null
++        if (!showsVideo || targetWidth <= 0 || targetHeight <= 0) return null
+         return ((x.coerceIn(video.left, video.right - 1) - video.left).toLong() * targetWidth / video.width).toInt() to
+             ((y.coerceIn(video.top, video.bottom - 1) - video.top).toLong() * targetHeight / video.height).toInt()
+     }
+@@ -76,23 +159,34 @@
+ 
+ /** Capture one gesture on its original target; never forward a dock press as an app touch. */
+ internal class DashboardTouchRouter {
+-    data class Result(val point: Pair<Int, Int>? = null, val action: DashboardAction? = null, val cancelSource: Boolean = false)
++    data class Result(
++        val point: Pair<Int, Int>? = null,
++        val action: DashboardAction? = null,
++        val cancelSource: Boolean = false,
++        val page: ProjectionPage? = null,
++        val mediaIdentity: Any? = null,
++    )
+     private var active = false
+     private var source = false
+     private var action: DashboardAction? = null
+     private var cancelled = false
++    private var page: ProjectionPage? = null
+     @Synchronized
+-    fun reset() {
++    fun reset(): Boolean {
++        val cancelSource = active && source
+         active = false
+         source = false
+         action = null
++        page = null
+         cancelled = false
++        return cancelSource
+     }
+     @Synchronized
+     fun route(layout: ProjectedDashboardLayout, x: Int, y: Int, down: Boolean, targetWidth: Int, targetHeight: Int): Result {
+         if (down && !active) {
+             active = true
+-            source = layout.video.contains(x, y)
++            page = layout.pageAt(x, y)
++            source = page == null && layout.showsVideo && layout.video.contains(x, y)
+             action = layout.actionAt(x, y)
+             cancelled = false
+         }
+@@ -102,9 +196,9 @@
+             if (!down) active = false
+             return Result(point = point)
+         }
+-        if (layout.actionAt(x, y) != action) cancelled = true
++        if (layout.actionAt(x, y) != action || layout.pageAt(x, y) != page) cancelled = true
+         if (down) return Result()
+         active = false
+-        return Result(action = action.takeUnless { cancelled })
+-    }
+-}
++        return Result(action = action.takeUnless { cancelled }, page = page.takeUnless { cancelled })
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -21,9 +21,18 @@
+ import java.util.Locale
+ 
+ /** GL-thread-only background compositor. Source video is drawn over its allocated rectangle. */
+-internal class ProjectedDashboardRenderer(private val layout: ProjectedDashboardLayout) {
++internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboardLayout) {
+     private var program = 0
+     private var texture = 0
++    private var night = true
++    private var desiredNight = true
++    private var stale = false
++    private var transitionStart = -1L
++    private var brightness = -1
++    var displayedMedia: MediaSessionsState.NowPlaying? = null
++        private set
++    private val foreground get() = if (night) Color.WHITE else 0xFF132C45.toInt()
++    private val secondary get() = if (night) 0xFFC0D7EF.toInt() else 0xFF425B76.toInt()
+     private var lastKey: DashboardVisualKey? = null
+     private var pendingSnapshot: Snapshot? = null
+     private var lastPoll = -1L
+@@ -40,7 +49,7 @@
+         private set
+     private data class Snapshot(val key: DashboardVisualKey, val now: MediaSessionsState.NowPlaying?)
+     // Include the antialiased edges of the progress track, without touching title/controls.
+-    private val progressBounds = layout.panel.let { r ->
++    private val progressBounds get() = layout.panel.let { r ->
+         val x = r.left + r.width * .09f
+         val y = r.top + r.height * .66f
+         ProjectionRect((x - 2).toInt(), (y - 2).toInt(),
+@@ -62,7 +71,11 @@
+         val vs = compile(GL.GL_VERTEX_SHADER, "attribute vec2 p; attribute vec2 t; varying vec2 v; void main(){gl_Position=vec4(p,0.,1.);v=t;}")
+         var fs = 0
+         try {
+-            fs = compile(GL.GL_FRAGMENT_SHADER, "precision mediump float; varying vec2 v; uniform sampler2D s; void main(){gl_FragColor=texture2D(s,v);}")
++            fs = compile(
++                GL.GL_FRAGMENT_SHADER,
++                "precision mediump float; varying vec2 v; uniform sampler2D s; uniform float b; " +
++                    "void main(){vec4 c=texture2D(s,v);gl_FragColor=vec4(c.rgb*b,c.a);}",
++            )
+             program = GL.glCreateProgram()
+             GL.glAttachShader(program, vs)
+             GL.glAttachShader(program, fs)
+@@ -86,58 +99,112 @@
+         p = GL.glGetAttribLocation(program, "p")
+         t = GL.glGetAttribLocation(program, "t")
+         sampler = GL.glGetUniformLocation(program, "s")
++        brightness = GL.glGetUniformLocation(program, "b")
++        night = isNight()
++        desiredNight = night
+         val initial = snapshot()
+         val full = Bitmap.createBitmap(layout.width, layout.height, Bitmap.Config.ARGB_8888)
+         try {
+             canvas = Canvas(full)
+             renderBase()
+             renderRail(initial)
+-            renderPanel(initial)
++            renderPage(initial)
+             GLUtils.texImage2D(GL.GL_TEXTURE_2D, 0, full, 0)
+             check(GL.glGetError() == GL.GL_NO_ERROR) { "dashboard initial upload failed" }
+             uploadedPixels += layout.width.toLong() * layout.height
+             textureUpdates++
+             lastKey = initial.key
++            displayedMedia = initial.now.takeIf { layout.showsMedia }
+         } finally {
+             canvas = Canvas()
+             full.recycle()
+         }
+     }
+ 
+-    /** Poll at most four times a second; the independent GL tick also uses this path. */
+-    fun hasVisualChange(nowMs: Long): Boolean {
++    private fun isNight(): Boolean = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY) !in 6..17
++
++    fun animating(): Boolean = transitionStart >= 0
++
++    fun needsRefresh(next: ProjectedDashboardLayout, nowMs: Long, sourceStale: Boolean): Boolean {
++        if (next !== layout || sourceStale != stale || animating()) return true
+         if (lastPoll < 0 || nowMs - lastPoll >= 250) {
+             lastPoll = nowMs
+             pendingSnapshot = snapshot()
+-        }
+-        return pendingSnapshot?.key?.changesFrom(lastKey)?.any == true
+-    }
+-
+-    fun draw() {
++            desiredNight = isNight()
++        }
++        if (desiredNight != night) return true
++        val dirty = pendingSnapshot?.key?.changesFrom(lastKey) ?: return false
++        return dirty.rail || (layout.showsMedia && (dirty.panel || dirty.progress)) ||
++            (layout.page == ProjectionPage.WIDGETS && dirty.panel)
++    }
++
++    fun draw(next: ProjectedDashboardLayout, sourceStale: Boolean) {
+         GL.glViewport(0, 0, layout.width, layout.height)
+         GL.glUseProgram(program)
+         GL.glActiveTexture(GL.GL_TEXTURE0)
+         GL.glBindTexture(GL.GL_TEXTURE_2D, texture)
+-        hasVisualChange(SystemClock.uptimeMillis())
+-        pendingSnapshot?.let { current ->
+-            val dirty = current.key.changesFrom(lastKey)
+-            if (dirty.rail) {
+-                val r = layout.rail
+-                val pixels = railBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { railBitmap = it }
+-                uploadRegion(r, pixels) { renderRail(current) }
+-            }
+-            if (dirty.panel) {
+-                val r = layout.panel
+-                val pixels = panelBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { panelBitmap = it }
+-                uploadRegion(r, pixels) { renderPanel(current) }
+-            } else if (dirty.progress) {
+-                val r = progressBounds
+-                val pixels = progressBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { progressBitmap = it }
+-                uploadRegion(r, pixels) { renderProgress(current) }
+-            }
+-            lastKey = current.key
++        val now = SystemClock.uptimeMillis()
++        val pageChanged = layout !== next
++        needsRefresh(next, now, sourceStale)
++        val nightNow = desiredNight
++        if (pageChanged || nightNow != night) {
++            layout = next
++            night = nightNow
++            stale = sourceStale
++            if (pageChanged) transitionStart = now
++            railBitmap?.recycle(); railBitmap = null
++            panelBitmap?.recycle(); panelBitmap = null
++            progressBitmap?.recycle(); progressBitmap = null
++            val current = snapshot()
++            val pixels = Bitmap.createBitmap(layout.width, layout.height, Bitmap.Config.ARGB_8888)
++            try {
++                canvas = Canvas(pixels)
++                renderBase()
++                renderRail(current)
++                renderPage(current)
++                GLUtils.texSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, pixels)
++                check(GL.glGetError() == GL.GL_NO_ERROR) { "shell upload failed" }
++                uploadedPixels += layout.width.toLong() * layout.height
++                textureUpdates++
++                lastKey = current.key
++                displayedMedia = current.now.takeIf { layout.showsMedia }
++            } finally {
++                canvas = Canvas()
++                pixels.recycle()
++            }
+             pendingSnapshot = null
+-        }
++        } else {
++            val staleChanged = stale != sourceStale
++            stale = sourceStale
++            needsRefresh(layout, now, sourceStale)
++            val current = pendingSnapshot ?: if (staleChanged) snapshot() else null
++            current?.let {
++                val dirty = it.key.changesFrom(lastKey)
++                if (dirty.rail || staleChanged) {
++                    val r = layout.rail
++                    val pixels = railBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { railBitmap = it }
++                    uploadRegion(r, pixels) { renderRail(current) }
++                }
++                if ((layout.showsMedia && dirty.panel) || (layout.page == ProjectionPage.WIDGETS && (dirty.rail || dirty.panel))) {
++                    val r = if (layout.page == ProjectionPage.WIDGETS || layout.page == ProjectionPage.MUSIC) {
++                        layout.workspace
++                    } else layout.panel
++                    val pixels = panelBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { panelBitmap = it }
++                    uploadRegion(r, pixels) { renderPage(current) }
++                    displayedMedia = current.now.takeIf { layout.showsMedia }
++                } else if (layout.showsMedia && dirty.progress) {
++                    val r = progressBounds
++                    val pixels = progressBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888)
++                        .also { progressBitmap = it }
++                    uploadRegion(r, pixels) { renderProgress(current) }
++                }
++                lastKey = current.key
++                pendingSnapshot = null
++            }
++        }
++        val fraction = if (transitionStart < 0) 1f else ((now - transitionStart) / 160f).coerceIn(0f, 1f)
++        if (fraction >= 1f) transitionStart = -1L
++        GL.glUniform1f(brightness, .86f + .14f * (1f - (1f - fraction) * (1f - fraction)))
+         GL.glEnableVertexAttribArray(p)
+         GL.glEnableVertexAttribArray(t)
+         positions.position(0)
+@@ -158,7 +225,7 @@
+             (now.displayPositionAt(SystemClock.elapsedRealtime()).toDouble() / duration * (layout.panel.width * .82f)).toInt()
+         } else -1
+         return Snapshot(DashboardVisualKey(clock.format(at), date.format(at), now?.title, now?.artist,
+-            now?.playing == true, MediaSessionsState.accessGranted, progress, now?.art), now)
++            now?.playing == true, MediaSessionsState.accessGranted, progress, now?.art, now?.sessionToken), now)
+     }
+ 
+     private fun uploadRegion(bounds: ProjectionRect, pixels: Bitmap, render: () -> Unit) {
+@@ -180,16 +247,21 @@
+     private fun glass(r: ProjectionRect, radius: Float) {
+         val b = rect(r)
+         paint.color = Color.WHITE
+-        paint.shader = LinearGradient(b.left, b.top, b.right, b.bottom, intArrayOf(0xFF415778.toInt(), 0xFF17263E.toInt()), null, Shader.TileMode.CLAMP)
++        val colors = if (night) intArrayOf(0xB34D7096.toInt(), 0xB31C304C.toInt())
++        else intArrayOf(0xDDEFFFFF.toInt(), 0xB3CEE1F5.toInt())
++        paint.shader = LinearGradient(b.left, b.top, b.right, b.bottom, colors, null, Shader.TileMode.CLAMP)
+         canvas.drawRoundRect(b, radius, radius, paint)
+         paint.shader = null
+         paint.style = Paint.Style.STROKE
+         paint.strokeWidth = 1.5f
+-        paint.color = 0x668DAFD1
++        paint.color = if (night) 0x998DAFD1.toInt() else 0xCCFFFFFF.toInt()
+         canvas.drawRoundRect(b, radius, radius, paint)
+         paint.style = Paint.Style.FILL
+     }
+-    private fun label(value: String, x: Float, baseline: Float, size: Float, maxWidth: Float, color: Int = Color.WHITE, bold: Boolean = false) {
++    private fun label(
++        value: String, x: Float, baseline: Float, size: Float, maxWidth: Float,
++        color: Int = foreground, bold: Boolean = false,
++    ) {
+         textPaint.textSize = size
+         textPaint.color = color
+         textPaint.typeface = Typeface.create("sans-serif", if (bold) Typeface.BOLD else Typeface.NORMAL)
+@@ -199,13 +271,21 @@
+         val w = layout.width.toFloat()
+         val h = layout.height.toFloat()
+         paint.color = Color.WHITE
+-        paint.shader = LinearGradient(0f, 0f, w, h, intArrayOf(0xFF132C50.toInt(), 0xFF354769.toInt(), 0xFF171C35.toInt()), null, Shader.TileMode.CLAMP)
++        val colors = if (night) intArrayOf(0xFF132C50.toInt(), 0xFF354769.toInt(), 0xFF171C35.toInt())
++        else intArrayOf(0xFFB8D6ED.toInt(), 0xFFF1F6FA.toInt(), 0xFF9BB9DB.toInt())
++        paint.shader = LinearGradient(0f, 0f, w, h, colors, null, Shader.TileMode.CLAMP)
+         canvas.drawRect(0f, 0f, w, h, paint)
+         paint.shader = null
+         val radius = h * .035f
+         glass(layout.rail, radius)
+-        glass(layout.content, radius)
+-        glass(layout.panel, radius)
++        when (layout.page) {
++            ProjectionPage.DASHBOARD -> { glass(layout.content, radius); glass(layout.panel, radius) }
++            ProjectionPage.NAVIGATION -> {
++                glass(layout.content, radius)
++                layout.miniPanel?.let { glass(it, radius) }
++            }
++            else -> glass(layout.workspace, radius)
++        }
+     }
+     private fun renderRail(snapshot: Snapshot) {
+         val h = layout.height.toFloat()
+@@ -213,10 +293,97 @@
+         val railX = rail.left + rail.width * .10f
+         label(snapshot.key.clock, railX, rail.top + h * .085f, rail.width * .26f, rail.width * .8f, bold = true)
+         // Connection indicator is local composition status, not claimed GPS or phone signal.
+-        paint.color = 0xFF71E6B2.toInt()
++        paint.color = if (stale) 0xFFE9AE55.toInt() else 0xFF71E6B2.toInt()
+         canvas.drawCircle(rail.left + rail.width * .5f, rail.top + h * .13f, rail.width * .065f, paint)
+-        label(if (chinese) "实时" else "LIVE", railX, rail.top + h * .20f, rail.width * .19f, rail.width * .8f)
+-    }
++        label(if (stale) { if (chinese) "未更新" else "IDLE" } else { if (chinese) "实时" else "LIVE" },
++            railX, rail.top + h * .20f, rail.width * .19f, rail.width * .8f)
++        for ((page, bounds) in layout.dock) icon(page, bounds, page == layout.page)
++
++    }
++    private fun pageName(page: ProjectionPage): String = when (page) {
++        ProjectionPage.DASHBOARD -> if (chinese) "仪表盘" else "Dashboard"
++        ProjectionPage.HOME -> if (chinese) "主页" else "Home"
++        ProjectionPage.NAVIGATION -> if (chinese) "导航画面" else "Navigation feed"
++        ProjectionPage.MUSIC -> if (chinese) "音乐" else "Music"
++        ProjectionPage.WIDGETS -> if (chinese) "小组件" else "Widgets"
++    }
++
++    private fun icon(page: ProjectionPage, bounds: ProjectionRect, active: Boolean, tile: Boolean = false) {
++        val b = rect(bounds)
++        val size = minOf(b.width() * .76f, b.height() * (if (tile) .62f else .86f))
++        val cx = b.centerX()
++        val cy = if (tile) b.top + b.height() * .39f else b.centerY()
++        val d = size / 2
++        val r = RectF(cx-d, cy-d, cx+d, cy+d)
++        paint.color = when (page) {
++            ProjectionPage.NAVIGATION -> 0xFF187CF3.toInt()
++            ProjectionPage.MUSIC -> 0xFFCF3865.toInt()
++            ProjectionPage.WIDGETS -> 0xFF387D8E.toInt()
++            else -> if (night) 0xFF56728F.toInt() else 0xFF587B9C.toInt()
++        }
++        canvas.drawRoundRect(r, d*.38f, d*.38f, paint)
++        if (active) {
++            paint.style = Paint.Style.STROKE
++            paint.strokeWidth = (d*.08f).coerceAtLeast(1f)
++            paint.color = Color.WHITE
++            canvas.drawRoundRect(r, d*.38f, d*.38f, paint)
++            paint.style = Paint.Style.FILL
++        }
++        paint.color = Color.WHITE
++        when (page) {
++            ProjectionPage.NAVIGATION -> {
++                val path = android.graphics.Path().apply {
++                    moveTo(cx, cy-d*.65f); lineTo(cx+d*.55f,cy+d*.52f); lineTo(cx,cy+d*.27f)
++                    lineTo(cx-d*.55f,cy+d*.52f); close()
++                }
++                canvas.drawPath(path,paint)
++            }
++            ProjectionPage.MUSIC -> {
++                canvas.drawRect(cx+d*.12f,cy-d*.55f,cx+d*.27f,cy+d*.36f,paint)
++                canvas.drawOval(RectF(cx-d*.40f,cy+d*.12f,cx+d*.27f,cy+d*.57f),paint)
++                canvas.drawRect(cx+d*.12f,cy-d*.55f,cx+d*.65f,cy-d*.38f,paint)
++            }
++            else -> {
++                val n = if (page == ProjectionPage.DASHBOARD) 1 else 2
++                if (n == 1) {
++                    canvas.drawRoundRect(cx-d*.64f,cy-d*.55f,cx+d*.12f,cy+d*.55f,d*.13f,d*.13f,paint)
++                    for (i in 0..1) canvas.drawRoundRect(cx+d*.25f,cy-d*.55f+i*d*.62f,cx+d*.65f,cy-d*.04f+i*d*.62f,d*.10f,d*.10f,paint)
++                } else for (i in 0..3) {
++                    val x = cx-d*.62f+(i%2)*d*.70f
++                    val y = cy-d*.62f+(i/2)*d*.70f
++                    canvas.drawRoundRect(x,y,x+d*.53f,y+d*.53f,d*.14f,d*.14f,paint)
++                }
++            }
++        }
++        if (tile) {
++            val name = pageName(page)
++            val sizeText = minOf(layout.height * .045f,b.width()*.15f)
++            textPaint.textSize = sizeText
++            label(name, b.left + (b.width()-textPaint.measureText(name)).coerceAtLeast(0f)/2,
++                b.bottom-b.height()*.12f,sizeText,b.width())
++        }
++    }
++
++    private fun renderPage(snapshot: Snapshot) {
++        val w = layout.workspace
++        val h = layout.height.toFloat()
++        when (layout.page) {
++            ProjectionPage.DASHBOARD, ProjectionPage.MUSIC -> renderPanel(snapshot)
++            ProjectionPage.NAVIGATION -> if (layout.showsMedia) renderPanel(snapshot) else Unit
++            ProjectionPage.HOME -> {
++                label(pageName(layout.page), w.left+h*.06f,w.top+h*.12f,h*.065f,w.width-h*.12f,bold=true)
++                for ((page,bounds) in layout.tiles) icon(page,bounds,false,true)
++            }
++            ProjectionPage.WIDGETS -> {
++                val x = w.left+h*.07f
++                label(pageName(layout.page),x,w.top+h*.12f,h*.06f,w.width-h*.14f,bold=true)
++                label(snapshot.key.clock,x,w.top+h*.42f,h*.18f,w.width-h*.14f,bold=true)
++                label(snapshot.key.date,x,w.top+h*.56f,h*.065f,w.width-h*.14f,secondary)
++                label(if (chinese) "手机本地时间" else "Phone local time",x,w.top+h*.70f,h*.045f,w.width-h*.14f,secondary)
++            }
++        }
++    }
++
+     private fun renderPanel(snapshot: Snapshot) {
+         val h = layout.height.toFloat()
+         val radius = h * .035f
+@@ -229,10 +396,14 @@
+         } else {
+             if (chinese) "媒体信息不可用" else "Media info unavailable"
+         }
+-        label(if (chinese) "正在播放" else "NOW PLAYING", x, p.top + p.height * .09f, p.width * .072f, available, 0xFFC0D7EF.toInt(), true)
+-        val artSize = minOf(p.width * .62f, p.height * .30f)
+-        val artX = p.left + (p.width - artSize) / 2
+-        val artY = p.top + p.height * .14f
++        label(
++            if (chinese) "正在播放" else "NOW PLAYING", x, p.top + p.height * .09f,
++            minOf(p.width * .072f, h * .05f), available, secondary, true,
++        )
++        val independentMusic = layout.musicArt
++        val artSize = independentMusic?.width?.toFloat() ?: minOf(p.width * .62f, p.height * .30f)
++        val artX = independentMusic?.left?.toFloat() ?: (p.left + (p.width - artSize) / 2)
++        val artY = independentMusic?.top?.toFloat() ?: (p.top + p.height * .14f)
+         val artRect = RectF(artX, artY, artX + artSize, artY + artSize)
+         paint.color = 0xFF354F78.toInt()
+         canvas.drawRoundRect(artRect, radius, radius, paint)
+@@ -249,15 +420,19 @@
+         } else {
+             label("♪", artX + artSize * .31f, artY + artSize * .70f, artSize * .55f, artSize * .65f)
+         }
+-        label(title, x, p.top + p.height * .53f, p.width * .085f, available, bold = true)
+-        label(now?.artist.orEmpty(), x, p.top + p.height * .61f, p.width * .067f, available, 0xFFC0D7EF.toInt())
++        val titleY = if (independentMusic != null) .38f else .53f
++        val artistY = if (independentMusic != null) .48f else .61f
++        label(title, x, p.top + p.height * titleY, minOf(p.width * .085f, h * .065f), available, bold = true)
++        label(now?.artist.orEmpty(), x, p.top + p.height * artistY, minOf(p.width * .067f, h * .045f), available, secondary)
+         renderProgress(snapshot)
+         for ((action, bounds) in layout.controls) {
+             val b = rect(bounds)
+             val cx = b.centerX()
+             val cy = b.centerY()
+             val r = minOf(b.width(), b.height()) * .37f
+-            paint.color = if (action == DashboardAction.PLAY_PAUSE) 0xFFEDF5FF.toInt() else 0xFF385477.toInt()
++            val enabled = now?.sessionToken != null && snapshot.key.hasAccess
++            paint.color = if (!enabled) 0xFF8793A1.toInt()
++            else if (action == DashboardAction.PLAY_PAUSE) 0xFFEDF5FF.toInt() else 0xFF385477.toInt()
+             canvas.drawCircle(cx, cy, r, paint)
+             paint.color = if (action == DashboardAction.PLAY_PAUSE) 0xFF18304D.toInt() else Color.WHITE
+             val d = r * .45f
+@@ -276,7 +451,7 @@
+                 }
+             }
+         }
+-        label(snapshot.key.date, x, p.top + p.height * .96f, p.width * .061f, available, 0xFFC0D7EF.toInt())
++        label(snapshot.key.date, x, p.top + p.height * .96f, minOf(p.width * .061f, h * .04f), available, secondary)
+     }
+     private fun renderProgress(snapshot: Snapshot) {
+         val progress = snapshot.key.progressPixels
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+@@ -48,11 +48,12 @@
+     val hasAccess: Boolean,
+     val progressPixels: Int,
+     val art: Any?,
++    val mediaIdentity: Any? = null,
+ ) {
+     fun changesFrom(old: DashboardVisualKey?): DashboardDirty {
+         if (old == null) return DashboardDirty(true, true, true)
+         val panel = date != old.date || title != old.title || artist != old.artist || playing != old.playing ||
+-            hasAccess != old.hasAccess || art !== old.art
++            hasAccess != old.hasAccess || art !== old.art || mediaIdentity != old.mediaIdentity
+         return DashboardDirty(clock != old.clock, panel, !panel && progressPixels != old.progressPixels)
+     }
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -130,6 +130,9 @@
+     private var transcoder: CarWithTranscoder? = null
+ 
+     private val dashboardTouch = DashboardTouchRouter()
++    private var suppressDashboardGesture = false
++    private var dashboardPointerDown = false
++    private var capturedMediaIdentity: Any? = null
+     @Volatile private var dashboardFrameSent = false
+     private val dashboardCancelPending = AtomicBoolean(false)
+     @Volatile private var dashboardFallback = projectedDashboard && !ProjectedDashboardLayout.supports(streamWidth, streamHeight)
+@@ -137,14 +140,35 @@
+     /** Null means the compatibility stream owns input; empty result consumes input during startup. */
+     internal fun routeDashboardTouch(x: Int, y: Int, down: Boolean, displayWidth: Int, displayHeight: Int, targetWidth: Int, targetHeight: Int): DashboardTouchRouter.Result? {
+         if (!projectedDashboard || dashboardFallback) return null
+-        val layout = transcoder?.dashboardLayout ?: return DashboardTouchRouter.Result()
++        val pipeline = transcoder ?: return DashboardTouchRouter.Result()
++        if (down && !dashboardPointerDown) capturedMediaIdentity = pipeline.mediaIdentity()
++        dashboardPointerDown = down
++        if (dashboardCancelPending.getAndSet(false)) {
++            dashboardTouch.reset()
++            suppressDashboardGesture = down
++            return DashboardTouchRouter.Result(cancelSource = true)
++        }
++        val layout = pipeline.touchLayout()
++        if (layout == null || suppressDashboardGesture) {
++            suppressDashboardGesture = down
++            val cancelled = dashboardTouch.reset()
++            return DashboardTouchRouter.Result(cancelSource = dashboardCancelPending.getAndSet(false) || cancelled)
++        }
+         if (!dashboardFrameSent || dashboardSourceSize != sourceSize || !runCatching { phoneOwnsScreen() }.getOrDefault(false)) {
+-            dashboardTouch.reset()
+-            return DashboardTouchRouter.Result(cancelSource = dashboardCancelPending.getAndSet(false))
++            val cancelled = dashboardTouch.reset()
++            suppressDashboardGesture = down
++            return DashboardTouchRouter.Result(cancelSource = dashboardCancelPending.getAndSet(false) || cancelled)
+         }
+         val (px, py) = layout.displayPoint(x, y, displayWidth, displayHeight) ?: return DashboardTouchRouter.Result()
+-        return dashboardTouch.route(layout, px, py, down, targetWidth, targetHeight).copy(cancelSource = dashboardCancelPending.getAndSet(false))
+-    }
++        val result = dashboardTouch.route(layout, px, py, down, targetWidth, targetHeight)
++        result.page?.let { pipeline.selectPage(it) }
++        val identity = capturedMediaIdentity
++        if (!down) capturedMediaIdentity = null
++        return result.copy(cancelSource = dashboardCancelPending.getAndSet(false), mediaIdentity = identity)
++    }
++
++    internal fun dispatchProjectedMedia(keyCode: Int, expected: Any?): Boolean =
++        transcoder?.dispatchProjectedMedia(keyCode, expected) == true
+ 
+     /** 转码只尝试一次：事件线程与控制动作线程都可能触发，原子认领。 */
+     private val transcodeClaimed = AtomicBoolean(false)
+@@ -750,6 +774,7 @@
+         screenSuspendedReported.set(suspended)
+         if (suspended && transcoder?.dashboardLayout != null) {
+             dashboardFrameSent = false
++            transcoder?.invalidateProjectedInput()
+             dashboardTouch.reset()
+             dashboardCancelPending.set(true)
+         }
+@@ -818,6 +843,7 @@
+             if (projectedDashboard && previousSize.first > 0) {
+                 externalQueue.clear()
+                 dashboardFrameSent = false
++                transcoder?.invalidateProjectedInput()
+                 dashboardTouch.reset()
+                 dashboardCancelPending.set(true)
+             }
+@@ -883,7 +909,7 @@
+             val layout = if (composeDashboard) {
+                 ProjectedDashboardLayout(
+                     streamWidth, streamHeight, initialSourceSize.first, initialSourceSize.second,
+-                    lacrosseProjection, fullContentProjection,
++                    lacrosseProjection, fullContentProjection, shell = true,
+                 )
+             } else null
+             pipeline =
+@@ -1237,7 +1263,10 @@
+                                     0
+                                 }
+                             if (sent > 0) {
+-                                if (transcoder?.dashboardLayout != null) dashboardFrameSent = true
++                                transcoder?.takeIf { it.dashboardLayout != null }?.let {
++                                    it.onProjectedFrameSent(bufferInfo.presentationTimeUs)
++                                    dashboardFrameSent = true
++                                }
+                                 r5Cadence.recordForwardedFrame(bufferInfo.presentationTimeUs, System.nanoTime())
+                                 r5StallLogged.set(false)
+                                 if (framesSent % 150L == 0L) log("VIDEO: R5 ${r5CadenceSummary()}")
+diff --git a/app/src/main/res/values/r29_projection.xml b/app/src/main/res/values/r29_projection.xml
+--- a/app/src/main/res/values/r29_projection.xml
++++ b/app/src/main/res/values/r29_projection.xml
+@@ -1,8 +1,8 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="r29_projection_title">车机玻璃仪表盘（实验）</string>
+-    <string name="r29_projection_desc">下次连接时合成独立投屏界面；保留 CarWith 实时内容和媒体控制。关闭即恢复原样投屏。</string>
++    <string name="r29_projection_title">CarPlay 风格车机界面（实验）</string>
++    <string name="r29_projection_desc">下次连接时启用车机主页、仪表盘、导航源画面、音乐及本地时钟组件。关闭即恢复兼容投屏。</string>
+     <string name="r29_projection_next_connection">下次连接生效</string>
+     <string name="r34_full_content">全屏高清内容（实验）</string>
+-    <string name="r34_full_content_desc">开启玻璃仪表盘后生效。隐藏附加面板，按源比例扩大 CarWith 内容；重新连接生效。</string>
++    <string name="r34_full_content_desc">仅在启用实验车机界面时生效。隐藏 Dock 与附加面板，按源比例扩大 CarWith 内容；重新连接生效。</string>
+ </resources>
+diff --git a/app/src/main/res/values-en/r29_projection.xml b/app/src/main/res/values-en/r29_projection.xml
+--- a/app/src/main/res/values-en/r29_projection.xml
++++ b/app/src/main/res/values-en/r29_projection.xml
+@@ -1,8 +1,8 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <string name="r29_projection_title">Glass dashboard projection (experimental)</string>
+-    <string name="r29_projection_desc">Compose a new receiver-side dashboard on the next connection, with live CarWith content and media controls. Turn off to use compatibility projection.</string>
++    <string name="r29_projection_title">CarPlay-style projection (experimental)</string>
++    <string name="r29_projection_desc">Enable the projected home, dashboard, navigation feed, music and clock widgets on the next connection. Turn off to use compatibility projection.</string>
+     <string name="r29_projection_next_connection">Applies on next connection</string>
+     <string name="r34_full_content">Full-screen HD content (experimental)</string>
+-    <string name="r34_full_content_desc">Requires the experimental dashboard. Hide extra panels and fit live CarWith content to the screen. Reconnect to apply.</string>
++    <string name="r34_full_content_desc">Requires experimental projection. Hide the dock and additional panels, and fit live CarWith content to the screen. Reconnect to apply.</string>
+ </resources>
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt
+new file mode 100644
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt
+@@ -0,0 +1,161 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionShellTest {
++    private fun layout() = ProjectedDashboardLayout(2400, 800, 1920, 1080, true, shell = true)
++
++    @Test
++    fun onlyWrittenFramesUnlockPageInputAndMedia() {
++        val initial = layout()
++        val pages = ProjectionPageState<String>(initial)
++        assertNull(pages.touchLayout())
++        pages.submit(initial, 100, "A")
++        assertNull(pages.touchLayout())
++        pages.markSent(100)
++        assertEquals(initial, pages.touchLayout())
++        assertEquals("A", pages.sentMedia())
++        assertTrue(pages.select(ProjectionPage.MUSIC))
++        assertNull(pages.touchLayout())
++        assertNull(pages.sentMedia())
++        assertFalse(pages.select(ProjectionPage.HOME))
++        pages.submit(initial, 110, "A")
++        pages.markSent(110)
++        assertNull(pages.touchLayout())
++        val music = pages.requested
++        pages.submit(music, 120, "B")
++        pages.markSent(120)
++        assertEquals(music, pages.touchLayout())
++        assertEquals("B", pages.sentMedia())
++        pages.markSent(110)
++        assertEquals("B", pages.sentMedia())
++        pages.invalidate()
++        assertNull(pages.touchLayout())
++        assertNull(pages.sentMedia())
++        pages.submit(music, 130, "C")
++        pages.markSent(131)
++        assertNull(pages.touchLayout())
++        pages.submit(music, 140, "C")
++        pages.markSent(140)
++        assertEquals("C", pages.sentMedia())
++    }
++
++    @Test
++    fun metadataEvictionAndUnknownTimestampFailClosed() {
++        val l = layout()
++        val pages = ProjectionPageState<String>(l)
++        repeat(100) { pages.submit(l, it.toLong(), "player-$it") }
++        assertFalse(pages.markSent(0))
++        assertNull(pages.touchLayout())
++        assertTrue(pages.markSent(99))
++        assertEquals("player-99", pages.sentMedia())
++        pages.invalidate()
++        assertFalse(pages.markSent(100))
++        assertNull(pages.touchLayout())
++    }
++
++    @Test
++    fun homeAndDockActionsNeverLeakIntoSource() {
++        val home = layout().withPage(ProjectionPage.HOME)
++        assertFalse(home.showsVideo)
++        assertEquals(4, home.tiles.size)
++        for ((page, rect) in home.dock + home.tiles) {
++            val router = DashboardTouchRouter()
++            assertNull(router.route(home, rect.left, rect.top, true, 1920, 1080).point)
++            val up = router.route(home, rect.left, rect.top, false, 1920, 1080)
++            assertEquals(page, up.page)
++            assertNull(up.action)
++            assertNull(up.point)
++        }
++        val router = DashboardTouchRouter()
++        val tile = home.tiles.first().second
++        router.route(home, tile.left, tile.top, true, 1920, 1080)
++        router.route(home, -1, -1, true, 1920, 1080)
++        assertNull(router.route(home, tile.left, tile.top, false, 1920, 1080).page)
++    }
++
++    @Test
++    fun navigationAndMusicUseCorrectIndependentGeometry() {
++        val base = layout()
++        val nav = base.withPage(ProjectionPage.NAVIGATION)
++        val music = base.withPage(ProjectionPage.MUSIC)
++        assertTrue(nav.showsVideo)
++        assertTrue(nav.video.width >= base.video.width)
++        val mini = requireNotNull(nav.miniPanel)
++        assertEquals(3, nav.controls.size)
++        assertTrue(mini.left > nav.video.right)
++        assertTrue(nav.controls.all { it.second.left >= mini.left && it.second.right <= mini.right })
++        val narrow = ProjectedDashboardLayout(1280, 720, 1920, 1080, shell = true).withPage(ProjectionPage.NAVIGATION)
++        assertNull(narrow.miniPanel)
++        assertTrue(narrow.controls.isEmpty())
++        assertFalse(music.showsVideo)
++        assertEquals(3, music.controls.size)
++        assertTrue(requireNotNull(music.musicArt).right < music.panel.left)
++        assertNull(music.sourcePoint(0, 0, 1920, 1080))
++        val rect = music.controls[1].second
++        val router = DashboardTouchRouter()
++        router.route(music, rect.left, rect.top, true, 1920, 1080)
++        assertEquals(DashboardAction.PLAY_PAUSE, router.route(music, rect.left, rect.top, false, 1920, 1080).action)
++        val navRouter = DashboardTouchRouter()
++        assertEquals(0 to 0, navRouter.route(nav, nav.video.left, nav.video.top, true, 1920, 1080).point)
++        assertTrue(navRouter.reset())
++        assertNull(navRouter.route(nav, nav.video.left, nav.video.top, false, 1920, 1080).point)
++    }
++
++    @Test
++    fun fullContentRemainsLegacyAspectFit() {
++        val full = ProjectedDashboardLayout(1920, 1080, 1920, 1080, true, true, shell = true)
++        assertEquals(ProjectionRect(0, 0, 1920, 1080), full.video)
++        assertTrue(full.dock.isEmpty())
++        val pages = ProjectionPageState<String>(full)
++        pages.submit(full, 1, null)
++        pages.markSent(1)
++        assertFalse(pages.select(ProjectionPage.HOME))
++    }
++
++    @Test
++    fun randomizedPageBoundsAndHitTargets() {
++        val random = Random(35)
++        var configurations = 0
++        repeat(10000) {
++            val w = random.nextInt(640, 2561)
++            val h = random.nextInt(360, 1081)
++            if (!ProjectedDashboardLayout.supports(w, h)) return@repeat
++            val base = ProjectedDashboardLayout(w, h, random.nextInt(320, 3841), random.nextInt(180, 2161),
++                random.nextBoolean(), shell = true)
++            for (page in ProjectionPage.entries) {
++                val l = base.withPage(page)
++                val boxes = (l.dock + l.tiles).map { it.second }
++                assertTrue(boxes.all { it.left >= 0 && it.top >= 0 && it.right <= w && it.bottom <= h && it.width > 0 && it.height > 0 })
++                for (i in boxes.indices) for (j in i + 1 until boxes.size) {
++                    val a = boxes[i]; val b = boxes[j]
++                    assertTrue(a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top)
++                }
++                if (l.showsVideo) {
++                    assertTrue(l.video.left >= l.rail.right && l.video.right <= w && l.video.height > 0)
++                    assertEquals(0 to 0, l.sourcePoint(l.video.left, l.video.top, 1920, 1080))
++                }
++                l.miniPanel?.let { mini ->
++                    assertTrue(mini.left > l.video.right && mini.right <= w && mini.bottom <= h)
++                    assertTrue(l.controls.size == 3)
++                }
++                l.musicArt?.let { art -> assertTrue(art.right < l.panel.left && art.width > 0) }
++                configurations++
++            }
++        }
++        assertTrue(configurations > 30000)
++        println("Random valid page layouts: $configurations")
++    }
++
++    @Test
++    fun mediaIdentityTriggersDirtyUpdateEvenWithIdenticalTitles() {
++        val a = DashboardVisualKey("12:00", "Wed", "song", "artist", true, true, 0, null, "A")
++        assertTrue(a.copy(mediaIdentity = "B").changesFrom(a).panel)
++        assertFalse(a.copy().changesFrom(a).any)
++    }
++}
