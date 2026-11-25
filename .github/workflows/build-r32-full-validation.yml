@@ -179,6 +179,25 @@ jobs:
           assert len(paths)==623 and h.hexdigest()=="9119b22e8a0042615d33baf14dc6b84f41bdf77124d53be25926e1f30d143bfa", (len(paths),h.hexdigest())
           print("Exact reviewed R32 source",len(paths),h.hexdigest())
           PY
+      - name: Apply reviewed controller line-length refactor
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r32-build/R32-format-final.patch"
+          echo "a45ea8bb3d58491e12de97bfe22216b5d5c06aad97a43913e229e55a2459e87c  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          paths=sorted(p for p in Path('app/src').rglob('*') if p.is_file()) + [Path('app/build.gradle.kts'), Path('CHANGELOG.md'), Path('docs/UPDATES.md')]
+          h=sha256()
+          for p in paths:
+              h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
+          Path('r32-controller-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
+          assert len(paths)==623 and h.hexdigest()=="fc897ab9ff00629563b5b09c17a8a85b0db258fc4b88a1fa15191add85dbc443", (len(paths),h.hexdigest())
+          print("Exact controller-refactored R32 source",len(paths),h.hexdigest())
+          PY
       - name: Normalize source formatting and enforce Spotless
         working-directory: baseline/mcarplay-project
         run: |
@@ -346,6 +365,7 @@ jobs:
             baseline/mcarplay-project/r28-source-fingerprint.tsv
             baseline/mcarplay-project/r32-source-fingerprint.tsv
             baseline/mcarplay-project/r32-fixed-source-fingerprint.tsv
+            baseline/mcarplay-project/r32-controller-source-fingerprint.tsv
             baseline/mcarplay-project/app/build/test-results/
             baseline/mcarplay-project/app/build/reports/
           if-no-files-found: ignore

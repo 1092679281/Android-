@@ -1,0 +1,80 @@
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -5066,8 +5066,14 @@
+                                             } ?: 100
+                                     val scale = scalePct / 100f
+                                     val dashboardPreference = appContext?.let(DisplayPrefs::projectedDashboard) == true
+-                                    val dashboardRequested = dashboardPreference && projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis())
+-                                    if (dashboardPreference && !dashboardRequested) appendLog("DISPLAY: R32 local codec recovery cooldown; using compatibility projection")
++
++                                    fun dashboardAllowedForPeer(): Boolean =
++                                        projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis())
++
++                                    val dashboardRequested = dashboardPreference && dashboardAllowedForPeer()
++                                    if (dashboardPreference && !dashboardRequested) {
++                                        appendLog("DISPLAY: R32 local codec recovery cooldown; using compatibility projection")
++                                    }
+                                     val receiverIdentity = effectiveEndpoint.receiverSignals
+                                     val gmE2lb = LacrosseProjectionPolicy.matches(receiverIdentity.model, receiverIdentity.manufacturer)
+                                     val requestedFps = appContext?.let(DisplayPrefs::fps) ?: 30
+@@ -5080,16 +5086,28 @@
+                                     pendingLacrosseProjection = lacrosseOutput != null
+                                     // Only opt-in E2LB composition is specialized; unverified geometry keeps the old transport.
+                                     val dashboardEnabled = dashboardRequested && (!gmE2lb || lacrosseOutput != null)
+-                                    val streamW = lacrosseOutput?.width ?: ((setup.displayWidth * scale).toInt().coerceAtLeast(320) / 2) * 2
+-                                    val streamH = lacrosseOutput?.height ?: ((setup.displayHeight * scale).toInt().coerceAtLeast(180) / 2) * 2
++                                    val streamW = lacrosseOutput?.width
++                                        ?: ((setup.displayWidth * scale).toInt().coerceAtLeast(320) / 2) * 2
++                                    val streamH = lacrosseOutput?.height
++                                        ?: ((setup.displayHeight * scale).toInt().coerceAtLeast(180) / 2) * 2
+                                     val fps = lacrosseOutput?.fps ?: SourceFpsPolicy.effective(requestedFps, setup.maxFps)
+                                     pendingVideoFps = fps
+                                     activeScalePercent = lacrosseOutput?.scalePercent ?: scalePct
+                                     activeTargetFps = fps
+                                     if (gmE2lb && dashboardRequested) {
+-                                        appendLog("DISPLAY: R31 GM E2LB dashboard=${if (pendingLacrosseProjection) "conservative" else "compatibility fallback"}; " +
+-                                            "reportedGeometry=${setup.displayGeometryReported}; receiverMaxFPS=${setup.maxFps}; physical panel size not assumed")
+-                                        if (!dashboardEnabled) appendLog("DISPLAY: R31 unsafe or unreported geometry: passthrough only; local transcode disabled for this experiment")
++                                        val mode = if (pendingLacrosseProjection) "conservative" else "compatibility fallback"
++                                        val reported = setup.displayGeometryReported
++                                        val maxFps = setup.maxFps
++                                        appendLog(
++                                            "DISPLAY: R31 GM E2LB dashboard=$mode; reportedGeometry=$reported; " +
++                                                "receiverMaxFPS=$maxFps; physical panel size not assumed",
++                                        )
++                                        if (!dashboardEnabled) {
++                                            appendLog(
++                                                "DISPLAY: R31 unsafe or unreported geometry: passthrough only; " +
++                                                    "local transcode disabled for this experiment",
++                                            )
++                                        }
+                                     }
+                                     appendLog(
+                                         "DISPLAY: 流 ${setup.displayWidth}x${setup.displayHeight} → " +
+@@ -5116,20 +5134,20 @@
+                                                 log = { line -> appendLog(line) },
+                                                 keepAliveWithStats = setup.keepAliveSendStatsAsBody,
+                                                 externalVideoSource = carLifeSource,
+-                                                projectedDashboard =
+-                                                    dashboardEnabled &&
+-                                                        projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis()),
++                                                projectedDashboard = dashboardEnabled && dashboardAllowedForPeer(),
+                                                 lacrosseProjection = lacrosseOutput != null,
+                                                 onDashboardLocalFailure = { reason ->
+                                                     if (videoSender === sender) {
+-                                                        projectionRecovery.recordLocalFailure(peerAddress, SystemClock.uptimeMillis())
++                                                        projectionRecovery.recordLocalFailure(
++                                                            peerAddress,
++                                                            SystemClock.uptimeMillis(),
++                                                        )
+                                                         appendLog("DISPLAY: R32 local projection fault: $reason")
+                                                     }
+                                                 },
+                                                 allowCompatibilityTranscode =
+                                                     !gmE2lb || !dashboardPreference ||
+-                                                        (lacrosseOutput != null &&
+-                                                            projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis())),
++                                                        (lacrosseOutput != null && dashboardAllowedForPeer()),
+                                                 receiverMaxFps = setup.maxFps,
+                                                 // 车机拿走主屏（原车界面、倒车影像等）时暂停屏幕视频，归还后从新的 IDR 恢复
+                                                 phoneOwnsScreen = { client.modes.phoneOwnsScreen },
