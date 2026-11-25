@@ -1,0 +1,394 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a2b89d6..55d2068 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.25-test.1] - 2026-11-25
++
++> R38 — real phone status widgets; receiver and Android build validation pending.
++
++### English
++- Add a two-card glass widget layout with local clock/date, phone battery/charging status and current projection pacing target.
++- Cache battery service reads for five seconds; invalid or unavailable readings remain unknown. Refresh pacing target independently.
++- Separate widget invalidation from media metadata and follow phone time-zone changes.
++
++### 简体中文
++- 新增双卡片玻璃小组件：本地时钟日历、手机真实电量及充电状态、当前投屏调度目标。
++- 电量服务五秒缓存，异常或不可用数据不伪造；投屏目标帧率独立更新。
++- 小组件脏区与媒体元数据分离，跟随手机时区变化。
++
+ ## [v0.1.24-test.1] - 2026-11-25
+ 
+ > R37 — local projection interaction candidate; hardware validation pending.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 3c0f0c7..1667f39 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.24"
++val appVersionName = "0.1.25"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index d58fa7d..c8d838a 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -5163,6 +5163,15 @@ object SessionController {
+                                                             ?.currentThermalStatus ?: -1
+                                                     } else -1
+                                                 },
++                                                projectionPhoneStatus = {
++                                                    val battery =
++                                                        appContext?.getSystemService(android.os.BatteryManager::class.java)
++                                                    val capacity = android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY
++                                                    com.mcarplay.app.video.ProjectionPhoneStatus(
++                                                        battery?.getIntProperty(capacity),
++                                                        battery?.isCharging,
++                                                    )
++                                                },
+                                                 onDashboardLocalFailure = { reason ->
+                                                     if (videoSender === sender) {
+                                                         projectionRecovery.recordLocalFailure(
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+index 6ecd5b1..9bb0a2b 100644
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -41,6 +41,7 @@ internal class CarWithTranscoder(
+     val dashboardLayout: ProjectedDashboardLayout? = null,
+     private val outputFps: Int = 30,
+     private val runtimeFps: () -> Int = { outputFps },
++    private val projectionPhoneStatus: () -> ProjectionPhoneStatus = { ProjectionPhoneStatus(null, null) },
+     private val onRenderDuration: (Long) -> Unit = {},
+     private val allowIdleDashboard: () -> Boolean = { true },
+     /** 向 CarWith 要关键帧（解码输入断流后用；转码线程上调用，已限流）。 */
+@@ -466,7 +467,7 @@ internal class CarWithTranscoder(
+         check(EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) { "eglMakeCurrent" }
+ 
+         dashboardLayout?.takeUnless { it.fullContent }?.let { layout ->
+-            dashboard = ProjectedDashboardRenderer(layout)
++            dashboard = ProjectedDashboardRenderer(layout, projectionPhoneStatus, runtimeFps)
+             dashboard?.start()
+         }
+         program = buildProgram()
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+index 6bf2f6d..4883647 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+@@ -100,6 +100,13 @@ internal class ProjectedDashboardLayout(
+         width - gap - minOf((width * 0.28).toInt(), (height * 0.65).toInt())
+     } else (width * 0.72).toInt()
+     val workspace = ProjectionRect(rail.right + gap, gap, width - gap, height - gap)
++    val widgetCards: List<ProjectionRect> = if (page == ProjectionPage.WIDGETS && !fullContent) {
++        val middle = workspace.left + workspace.width / 2
++        listOf(
++            ProjectionRect(workspace.left, workspace.top, middle - gap / 2, workspace.bottom),
++            ProjectionRect(middle + gap / 2, workspace.top, workspace.right, workspace.bottom),
++        )
++    } else emptyList()
+     val panel: ProjectionRect
+     val miniPanel: ProjectionRect?
+     val musicArt: ProjectionRect?
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+index dfd37ea..e8683de 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -22,7 +22,12 @@ import java.util.Date
+ import java.util.Locale
+ 
+ /** GL-thread-only background compositor. Source video is drawn over its allocated rectangle. */
+-internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboardLayout) {
++internal class ProjectedDashboardRenderer(
++    private var layout: ProjectedDashboardLayout,
++    private val readPhone: () -> ProjectionPhoneStatus = { ProjectionPhoneStatus(null, null) },
++    private val runtimeFps: () -> Int = { 0 },
++) {
++    private val widgetSampler = ProjectionWidgetSampler()
+     private var program = 0
+     private var texture = 0
+     private var wallpaper = 0
+@@ -196,9 +201,10 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+             desiredNight = isNight()
+         }
+         if (desiredNight != night) return true
+-        val dirty = pendingSnapshot?.key?.changesFrom(lastKey) ?: return false
+-        return dirty.rail || (layout.showsMedia && (dirty.panel || dirty.progress)) ||
+-            (layout.page == ProjectionPage.WIDGETS && dirty.panel)
++        val key = pendingSnapshot?.key ?: return false
++        val dirty = key.changesFrom(lastKey)
++        val widgetsDirty = layout.page == ProjectionPage.WIDGETS && key.widgetsChangedFrom(lastKey)
++        return dirty.rail || (layout.showsMedia && (dirty.panel || dirty.progress)) || widgetsDirty
+     }
+ 
+     fun draw(next: ProjectedDashboardLayout, sourceStale: Boolean, pressed: ProjectionRect?, focused: ProjectionRect?) {
+@@ -261,7 +267,8 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+                     val pixels = railBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { railBitmap = it }
+                     uploadRegion(r, pixels) { renderRail(current) }
+                 }
+-                if ((layout.showsMedia && dirty.panel) || (layout.page == ProjectionPage.WIDGETS && (dirty.rail || dirty.panel))) {
++                val widgetsDirty = layout.page == ProjectionPage.WIDGETS && it.key.widgetsChangedFrom(lastKey)
++                if ((layout.showsMedia && dirty.panel) || widgetsDirty) {
+                     val r = if (layout.page == ProjectionPage.WIDGETS || layout.page == ProjectionPage.MUSIC) {
+                         layout.workspace
+                     } else layout.panel
+@@ -318,12 +325,18 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+     private fun snapshot(): Snapshot {
+         val now = MediaSessionsState.nowPlaying
+         val at = Date()
++        val zone = java.util.TimeZone.getDefault()
++        clock.timeZone = zone
++        date.timeZone = zone
++        val widgets = if (layout.page == ProjectionPage.WIDGETS) {
++            widgetSampler.sample(SystemClock.elapsedRealtime(), runtimeFps(), readPhone)
++        } else null
+         val duration = now?.durationMs ?: 0L
+         val progress = if (duration > 0 && now != null) {
+             (now.displayPositionAt(SystemClock.elapsedRealtime()).toDouble() / duration * (layout.panel.width * .82f)).toInt()
+         } else -1
+         return Snapshot(DashboardVisualKey(clock.format(at), date.format(at), now?.title, now?.artist,
+-            now?.playing == true, MediaSessionsState.accessGranted, progress, now?.art, now?.sessionToken), now)
++            now?.playing == true, MediaSessionsState.accessGranted, progress, now?.art, now?.sessionToken, widgets), now)
+     }
+ 
+     private fun uploadRegion(bounds: ProjectionRect, pixels: Bitmap, render: () -> Unit) {
+@@ -485,19 +498,50 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+                 for ((page,bounds) in layout.tiles) icon(page,bounds,false,true)
+             }
+             ProjectionPage.WIDGETS -> {
+-                val x = w.left+h*.07f
+-                label(pageName(layout.page),x,w.top+h*.12f,h*.06f,w.width-h*.14f,bold=true)
+-                val half = w.width * .5f
+-                label(if (chinese) "本地时间" else "LOCAL TIME", x, w.top+h*.28f, h*.045f, half-h*.12f, secondary, true)
+-                label(snapshot.key.clock,x,w.top+h*.54f,h*.18f,half-h*.10f,bold=true)
+-                val right = w.left + half + h*.035f
+-                label(if (chinese) "日历" else "CALENDAR", right, w.top+h*.28f,h*.045f,half-h*.10f,secondary,true)
+-                label(snapshot.key.date,right,w.top+h*.48f,h*.09f,half-h*.10f,bold=true)
+-                label(if (chinese) "手机本地时间" else "Phone local time",x,w.top+h*.77f,h*.045f,w.width-h*.14f,secondary)
++                renderWidgets(snapshot)
+             }
+         }
+     }
+ 
++    private fun renderWidgets(snapshot: Snapshot) {
++        val cards = layout.widgetCards
++        if (cards.size != 2) return
++        val h = layout.height.toFloat()
++        val left = cards[0]
++        val right = cards[1]
++        val status = snapshot.key.widgets
++        val phone = status?.phone
++        val percent = phone?.batteryPercent
++        val pad = h * .045f
++        val lx = left.left + pad
++        val rx = right.left + pad
++        val lw = left.width - pad * 2
++        val rw = right.width - pad * 2
++        fun y(card: ProjectionRect, fraction: Float) = card.top + card.height * fraction
++        label(if (chinese) "本地时间" else "LOCAL TIME", lx, y(left, .12f), h*.04f, lw, secondary, true)
++        label(snapshot.key.clock, lx, y(left, .38f), minOf(h*.17f, lw*.27f), lw, bold = true)
++        label(if (chinese) "日历" else "CALENDAR", lx, y(left, .60f), h*.04f, lw, secondary, true)
++        label(snapshot.key.date, lx, y(left, .76f), minOf(h*.085f, lw*.14f), lw, bold = true)
++        label(if (chinese) "手机电量" else "PHONE BATTERY", rx, y(right, .12f), h*.04f, rw, secondary, true)
++        label(percent?.let { "$it%" } ?: "—", rx, y(right, .34f), h*.13f, rw, bold = true)
++        val barTop = y(right, .39f)
++        val barBottom = barTop + h*.018f
++        paint.color = if (night) 0xFF526985.toInt() else 0xFFA9BED3.toInt()
++        canvas.drawRoundRect(rx, barTop, rx+rw, barBottom, h*.009f, h*.009f, paint)
++        if (percent != null && percent > 0) {
++            paint.color = if (percent <= 15) 0xFFDA7955.toInt() else 0xFF35A777.toInt()
++            canvas.drawRoundRect(rx, barTop, rx+rw*percent/100f, barBottom, h*.009f, h*.009f, paint)
++        }
++        val charge = when (phone?.charging) {
++            true -> if (chinese) "充电中" else "Charging"
++            false -> if (chinese) "未充电" else "Not charging"
++            null -> if (chinese) "状态未知" else "Unavailable"
++        }
++        label(charge, rx, y(right, .49f), h*.04f, rw, secondary)
++        label(if (chinese) "投屏调度目标" else "PACING TARGET", rx, y(right, .65f), h*.04f, rw, secondary, true)
++        label(status?.targetFps?.let { "$it FPS" } ?: "—", rx, y(right, .85f), minOf(h*.12f, rw*.19f), rw, bold = true)
++    }
++
+     private fun renderPanel(snapshot: Snapshot) {
+         val h = layout.height.toFloat()
+         val radius = h * .035f
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+index 72f23b0..8e021df 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+@@ -49,7 +49,11 @@ internal data class DashboardVisualKey(
+     val progressPixels: Int,
+     val art: Any?,
+     val mediaIdentity: Any? = null,
++    val widgets: ProjectionWidgetStatus? = null,
+ ) {
++    fun widgetsChangedFrom(old: DashboardVisualKey?): Boolean =
++        old == null || clock != old.clock || date != old.date || widgets != old.widgets
++
+     fun changesFrom(old: DashboardVisualKey?): DashboardDirty {
+         if (old == null) return DashboardDirty(true, true, true)
+         val panel = date != old.date || title != old.title || artist != old.artist || playing != old.playing ||
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt
+index 085fc02..35914bf 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt
+@@ -24,6 +24,7 @@ internal object ProjectionGlass {
+         listOf(layout.rail) + when (layout.page) {
+             ProjectionPage.DASHBOARD -> listOf(layout.content, layout.panel)
+             ProjectionPage.NAVIGATION -> listOfNotNull(layout.content, layout.miniPanel)
++            ProjectionPage.WIDGETS -> layout.widgetCards.ifEmpty { listOf(layout.workspace) }
+             else -> listOf(layout.workspace)
+         }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionWidgets.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionWidgets.kt
+new file mode 100644
+index 0000000..9335a15
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionWidgets.kt
+@@ -0,0 +1,23 @@
++package com.mcarplay.app.video
++
++/** Phone readings only. Missing or malformed values remain unavailable, never fabricated. */
++data class ProjectionPhoneStatus(val batteryPercent: Int?, val charging: Boolean?) {
++    fun validated(): ProjectionPhoneStatus = copy(batteryPercent = batteryPercent?.takeIf { it in 0..100 })
++}
++
++internal data class ProjectionWidgetStatus(val phone: ProjectionPhoneStatus, val targetFps: Int?)
++
++/** GL-thread-only sampler. Do not call Android battery services at video frame cadence. */
++internal class ProjectionWidgetSampler(private val pollMs: Long = 5_000L) {
++    private var lastPoll: Long? = null
++    private var phone = ProjectionPhoneStatus(null, null)
++
++    fun sample(nowMs: Long, targetFps: Int, readPhone: () -> ProjectionPhoneStatus): ProjectionWidgetStatus {
++        val previous = lastPoll
++        if (previous == null || nowMs < previous || nowMs - previous >= pollMs) {
++            phone = runCatching { readPhone().validated() }.getOrDefault(ProjectionPhoneStatus(null, null))
++            lastPoll = nowMs
++        }
++        return ProjectionWidgetStatus(phone, targetFps.takeIf { it in 1..120 })
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+index 8703db0..ec16b8d 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -75,6 +75,7 @@ class VideoSender(
+     private val fullContentProjection: Boolean = false,
+     private val thermalStatus: () -> Int = { -1 },
+     private val uptimeMs: () -> Long = { android.os.SystemClock.uptimeMillis() },
++    private val projectionPhoneStatus: () -> ProjectionPhoneStatus = { ProjectionPhoneStatus(null, null) },
+ ) {
+     @Volatile
+     private var width: Int = (width / 2) * 2
+@@ -966,6 +967,7 @@ class VideoSender(
+                     dashboardLayout = layout,
+                     outputFps = fps,
+                     runtimeFps = { policy?.fps() ?: fps },
++                    projectionPhoneStatus = projectionPhoneStatus,
+                     onRenderDuration = { durationNs -> policy?.recordRender(uptimeMs(), durationNs) },
+                     allowIdleDashboard = { running.get() && !quiescing.get() && !screenSuspendedReported.get() && phoneOwnsScreen() },
+                 ) {
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionWidgetsTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionWidgetsTest.kt
+new file mode 100644
+index 0000000..f431d6b
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionWidgetsTest.kt
+@@ -0,0 +1,92 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionWidgetsTest {
++    @Test
++    fun batteryIsCachedButPacingTargetChangesImmediately() {
++        val sampler = ProjectionWidgetSampler()
++        var reads = 0
++        val read = { ProjectionPhoneStatus(++reads, true) }
++        assertEquals(1, sampler.sample(0L, 60, read).phone.batteryPercent)
++        assertEquals(30, sampler.sample(4_999L, 30, read).targetFps)
++        assertEquals(1, reads)
++        assertEquals(2, sampler.sample(5_000L, 45, read).phone.batteryPercent)
++        assertEquals(3, sampler.sample(1L, 60, read).phone.batteryPercent)
++    }
++
++    @Test
++    fun unavailableAndInvalidReadingsNeverPretendToBeZero() {
++        val sampler = ProjectionWidgetSampler()
++        assertNull(sampler.sample(0L, -1) { ProjectionPhoneStatus(Int.MIN_VALUE, null) }.phone.batteryPercent)
++        assertNull(sampler.sample(1L, 121) { error("not reached") }.targetFps)
++        assertEquals(0, sampler.sample(5_000L, 30) { ProjectionPhoneStatus(0, false) }.phone.batteryPercent)
++        assertEquals(ProjectionPhoneStatus(null, null), sampler.sample(10_000L, 30) { error("service failure") }.phone)
++        assertEquals(100, sampler.sample(15_000L, 60) { ProjectionPhoneStatus(100, true) }.phone.batteryPercent)
++    }
++
++    @Test
++    fun unrelatedMusicChangesDoNotInvalidateWidgets() {
++        val status = ProjectionWidgetStatus(ProjectionPhoneStatus(72, false), 60)
++        val key = DashboardVisualKey("12:00", "Wed", "a", "b", true, true, 5, null, widgets = status)
++        assertFalse(key.copy(title = "other", progressPixels = 50, playing = false).widgetsChangedFrom(key))
++        assertTrue(key.copy(clock = "12:01").widgetsChangedFrom(key))
++        assertTrue(key.copy(date = "Thu").widgetsChangedFrom(key))
++        assertTrue(key.copy(widgets = status.copy(targetFps = 30)).widgetsChangedFrom(key))
++        assertTrue(key.copy(widgets = status.copy(phone = ProjectionPhoneStatus(72, true))).widgetsChangedFrom(key))
++    }
++
++    @Test
++    fun widgetGlassCardsFitAndDoNotOverlapAtAnySupportedAspectRatio() {
++        val random = Random(38)
++        var checked = 0
++        repeat(20_000) {
++            val w = random.nextInt(640, 3001)
++            val h = random.nextInt(360, 1081)
++            if (!ProjectedDashboardLayout.supports(w, h)) return@repeat
++            val layout = ProjectedDashboardLayout(w, h, 1920, 1080, true, shell = true).withPage(ProjectionPage.WIDGETS)
++            val (left, right) = layout.widgetCards
++            assertTrue(left.right < right.left)
++            assertEquals(layout.workspace.left, left.left)
++            assertEquals(layout.workspace.right, right.right)
++            assertTrue(left.width > h * .09f && right.width > h * .09f)
++            assertTrue(layout.rail.right < left.left)
++            assertEquals(listOf(layout.rail, left, right), ProjectionGlass.panels(layout))
++            assertFalse(layout.showsVideo)
++            checked++
++        }
++        assertTrue(checked > 10_000)
++        println("R38 widget geometry: $checked supported layouts")
++    }
++
++    @Test
++    fun randomSamplingRespectsPollingAndMissingValues() {
++        val random = Random(380)
++        val sampler = ProjectionWidgetSampler()
++        var now = 0L
++        var last: Long? = null
++        var expected: Int? = null
++        var calls = 0
++        var expectedCalls = 0
++        repeat(100_000) {
++            now += random.nextLong(0, 250)
++            val input = random.nextInt(-10, 111)
++            if (last == null || now - requireNotNull(last) >= 5_000) {
++                expected = input.takeIf { it in 0..100 }
++                last = now
++                expectedCalls++
++            }
++            val fps = listOf(24, 30, 45, 50, 60).random(random)
++            val sample = sampler.sample(now, fps) { calls++; ProjectionPhoneStatus(input, null) }
++            assertEquals(expected, sample.phone.batteryPercent)
++            assertEquals(fps, sample.targetFps)
++            assertEquals(expectedCalls, calls)
++        }
++        println("R38 widget polling: 100000 ticks, $calls phone reads")
++    }
++}
