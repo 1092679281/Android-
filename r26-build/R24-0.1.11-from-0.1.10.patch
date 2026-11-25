@@ -1,0 +1,602 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,21 @@
+ 
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
++
++## [v0.1.11-test.1] - 2026-11-25
++
++> Experimental candidate; no confirmed E2LB connection fix.
++> 实验候选版，E2LB 连接尚未证实修复。
++
++### English
++- Observe the actual availability packet's cumulative ACK, without changing the message or retransmission policy.
++- Stop an E2LB detect-only startup before speculative endpoint discovery.
++- Preserve matching partial DETECT markers and distinguish closed links from timeouts.
++
++### 简体中文
++- 跟踪启动消息的实际累计 ACK，不改变报文和重传策略。
++- E2LB 仅收到探测信号时停止本轮，不进入无依据的端点发现。
++- 保留匹配的分片探测标记，区分断链和超时。
+ 
+ ## [v0.1.10-test.1] - 2026-11-24
+ 
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.10"
++val appVersionName = "0.1.11"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
+@@ -2,7 +2,42 @@
+ 
+ /** Separates transport-level replies from a verified CarPlay-start signal. */
+ internal object Iap2AvailabilityProgress {
+-    enum class State { START_SESSION, LINK_SILENT, LINK_ACTIVITY_NO_START }
++    enum class State { START_SESSION, LINK_SILENT, LINK_ACTIVITY_NO_START, DETECT_ONLY, NOT_TRANSMITTED, LINK_ENDED }
++
++    /** This is an observation, not proof of a receiver reset or refusal. */
++    fun classifyWindow(
++        beforeFrames: Long,
++        before: Iap2LinkEngine.ParserStats,
++        afterFrames: Long,
++        after: Iap2LinkEngine.ParserStats,
++        receipt: Iap2LinkEngine.ControlReceipt.State?,
++        alive: Boolean,
++        startSessionReceived: Boolean,
++    ): State {
++        if (!alive) return State.LINK_ENDED
++        if (startSessionReceived) return State.START_SESSION
++        if (receipt == Iap2LinkEngine.ControlReceipt.State.QUEUED) return State.NOT_TRANSMITTED
++        if (receipt == Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED &&
++            afterFrames == beforeFrames && after.detectMarkers - before.detectMarkers >= 3 &&
++            after.invalidHeaderChecksums == before.invalidHeaderChecksums &&
++            after.invalidPayloadChecksums == before.invalidPayloadChecksums &&
++            after.invalidLengths == before.invalidLengths && after.discardedNoiseBytes == before.discardedNoiseBytes
++        ) return State.DETECT_ONLY
++        return classify((afterFrames - beforeFrames).coerceAtLeast(0L), false)
++    }
++
++    /** Preserve a legitimate alternative handoff; stop only the unsupported E2LB branch. */
++    fun shouldStopBeforeEndpoint(
++        isE2lb: Boolean,
++        state: State,
++        verifiedInvite: Boolean,
++        accessoryWifi: Boolean,
++    ): Boolean = isE2lb && (
++        state == State.LINK_ENDED || (
++            !verifiedInvite && !accessoryWifi &&
++                (state == State.DETECT_ONLY || state == State.NOT_TRANSMITTED)
++            )
++        )
+ 
+     fun classify(
+         framesReceivedAfterAvailability: Long,
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+@@ -98,12 +98,26 @@
+         ) : Event()
+     }
+ 
++    /** Passive evidence for one control submission. It does not request retransmission. */
++    class ControlReceipt internal constructor() {
++        enum class State { QUEUED, FRAME_GENERATED, PEER_ACKED, ENDED }
++
++        @Volatile
++        var state: State = State.QUEUED
++            internal set
++
++        internal var sequence: Int? = null
++    }
++
++    private var observedControl: ControlReceipt? = null
++
+     private class Packet(
+         var sequence: Int,
+         val payload: ByteArray,
+         var retransmissions: Int = 0,
+         var deadlineMillis: Long = 0,
+         val awaitAck: Boolean = true,
++        val receipt: ControlReceipt? = null,
+     )
+ 
+     var state: State = State.IDLE
+@@ -356,6 +370,25 @@
+         bytes: ByteArray,
+         nowMillis: Long,
+         awaitAck: Boolean = true,
++    ): Boolean = enqueueControl(bytes, nowMillis, awaitAck, null)
++
++    /** One passive observation per outstanding request, bounded by the link lifetime. */
++    fun sendObservedControl(bytes: ByteArray, nowMillis: Long): ControlReceipt? {
++        if (observedControl != null || state != State.NORMAL || peerSynchronization?.maxRetransmissions == 0) return null
++        val receipt = ControlReceipt()
++        observedControl = receipt
++        if (!enqueueControl(bytes, nowMillis, false, receipt)) {
++            observedControl = null
++            return null
++        }
++        return receipt
++    }
++
++    private fun enqueueControl(
++        bytes: ByteArray,
++        nowMillis: Long,
++        awaitAck: Boolean,
++        receipt: ControlReceipt?,
+     ): Boolean {
+         if (state == State.DEAD) return false
+         val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
+@@ -363,7 +396,7 @@
+             die("control payload ${bytes.size} exceeds negotiated limit $limit")
+             return false
+         }
+-        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck)
++        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck, receipt = receipt)
+         drainSendWindow(nowMillis)
+         return state != State.DEAD
+     }
+@@ -377,8 +410,10 @@
+             !(receive[0] == 0xFF.toByte() && receive[1] == 0x5A.toByte())
+         ) {
+             if (receive[0] == MARKER[0] && receive[1] == MARKER[1]) {
+-                if (receive.size < MARKER.size) return false
+-                if (MARKER.indices.all { receive[it] == MARKER[it] }) {
++                val prefixSize = minOf(receive.size, MARKER.size)
++                val matches = (0 until prefixSize).all { receive[it] == MARKER[it] }
++                if (matches && receive.size < MARKER.size) return false
++                if (matches) {
+                     detectMarkers++
+                     receive.discard(MARKER.size)
+                     continue
+@@ -643,6 +678,13 @@
+         // Negotiation retains its legacy completion path without accepting bogus ACK watermarks.
+         if (advance in 1..sent) {
+             lastSentAcknowledged = acknowledgement
++            observedControl?.let { receipt ->
++                val sequence = receipt.sequence
++                if (sequence != null && sequenceDistance(sequence, previous) in 1..advance) {
++                    receipt.state = ControlReceipt.State.PEER_ACKED
++                    observedControl = null
++                }
++            }
+             unacknowledged.removeAll { sequenceDistance(it.sequence, previous) in 1..advance }
+         }
+         completeNegotiationIfPending(nowMillis)
+@@ -689,6 +731,10 @@
+             packet.sequence = sentSequence
+             packet.deadlineMillis = nowMillis + retransmissionTimeoutMillis
+             writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, controlSessionId())
++            packet.receipt?.let {
++                it.sequence = packet.sequence
++                it.state = ControlReceipt.State.FRAME_GENERATED
++            }
+             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
+             if (peer == null || peer.maxRetransmissions > 0) {
+                 unacknowledged += packet
+@@ -777,6 +823,9 @@
+         output.reset()
+         pendingEvents.clear()
+         sendBacklog.clear()
++        unacknowledged.clear()
++        observedControl?.state = ControlReceipt.State.ENDED
++        observedControl = null
+         pendingEvents += Event.Dead(reason)
+     }
+ 
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -192,8 +192,11 @@
+     private var carPlayAvailabilitySent = false
+ 
+     /** Frames received before 0x4300; counts include link ACK, not evidence of session acceptance. */
+-    private var availabilityPeerFramesBefore: Long? = null
+-    private var availabilityParserBefore: Iap2LinkEngine.ParserStats? = null
++    private var availabilityBefore: Iap2LinkChannel.LinkSnapshot? = null
++    private var availabilityReceipt: Iap2LinkEngine.ControlReceipt? = null
++
++    private fun isE2lb(): Boolean = receiverSignals.model.equals("E2LB", ignoreCase = true) &&
++        receiverSignals.manufacturer.orEmpty().contains("general motors", ignoreCase = true)
+ 
+     /** 最近一次晚到 0x4301 的端点指纹（车机周期重发相同内容时不重复打详情）。 */
+     private var lastLateStartSessionSignature: Int? = null
+@@ -320,7 +323,10 @@
+     fun run(timeoutMillis: Long = 60_000L): CarPlayEndpoint {
+         val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+         if (!channel.awaitReady(remainingMillis(deadline))) {
+-            throw IOException("iAP2 链路协商超时")
++            throw IOException(
++                if (channel.isAlive) "iAP2 链路协商超时"
++                else "iAP2 链路协商期间结束: ${channel.terminationReason ?: "closed"}",
++            )
+         }
+         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
+         bringup.onLinkReady()
+@@ -628,27 +634,36 @@
+                     minOf(deadline, System.nanoTime() + startSessionWindow),
+                 )
+         }
+-        availabilityPeerFramesBefore?.let { before ->
+-            val delta = (channel.peerFrameCount() - before).coerceAtLeast(0L)
+-            val outcome =
+-                Iap2AvailabilityProgress.classify(
+-                    framesReceivedAfterAvailability = delta,
+-                    startSessionReceived = startSession != null,
++        availabilityBefore?.let { before ->
++            val after = channel.snapshot(availabilityReceipt)
++            val delta = (after.peerFrames - before.peerFrames).coerceAtLeast(0L)
++            val outcome = Iap2AvailabilityProgress.classifyWindow(
++                before.peerFrames, before.parser, after.peerFrames, after.parser,
++                after.receiptState, after.alive, startSession != null,
++            )
++            log(
++                "LINK-PARSER 0x4300 window: DETECT=${after.parser.detectMarkers - before.parser.detectMarkers} " +
++                    "badHeader=${after.parser.invalidHeaderChecksums - before.parser.invalidHeaderChecksums} " +
++                    "badPayload=${after.parser.invalidPayloadChecksums - before.parser.invalidPayloadChecksums} " +
++                    "badLength=${after.parser.invalidLengths - before.parser.invalidLengths} " +
++                    "noiseBytes=${after.parser.discardedNoiseBytes - before.parser.discardedNoiseBytes}",
++            )
++            log(
++                "iap2 0x4300 observation: peerFrames=$delta receipt=${after.receiptState} result=$outcome; " +
++                    "ACK is not CarPlay authorization",
++            )
++            // Never carry a detect-only, unacknowledged E2LB startup into Wi-Fi discovery.
++            // Throw before handing off an endpoint: the existing Bluetooth ownership and
++            // reconnect circuit breaker dispose of this attempt. Do not inject SYN or replay auth.
++            if (Iap2AvailabilityProgress.shouldStopBeforeEndpoint(
++                    isE2lb = isE2lb(),
++                    state = outcome,
++                    verifiedInvite = receiverInvited?.invoke() == true,
++                    accessoryWifi = wifiFromExchange != null,
+                 )
+-            availabilityParserBefore?.let { parserBefore ->
+-                val after = channel.parserStats()
+-                log(
+-                    "LINK-PARSER 0x4300 window: DETECT=${after.detectMarkers - parserBefore.detectMarkers} " +
+-                        "badHeader=${after.invalidHeaderChecksums - parserBefore.invalidHeaderChecksums} " +
+-                        "badPayload=${after.invalidPayloadChecksums - parserBefore.invalidPayloadChecksums} " +
+-                        "badLength=${after.invalidLengths - parserBefore.invalidLengths} " +
+-                        "noiseBytes=${after.discardedNoiseBytes - parserBefore.discardedNoiseBytes}",
+-                )
+-            }
+-            log(
+-                "iap2 0x4300 观察: peerFrames=$delta result=$outcome " +
+-                    "(peerFrames 包含纯 ACK；不代表 0x4300 已被接受；0x4301 才是启动证据)",
+-            )
++            ) {
++                throw IOException("E2LB startup stopped: $outcome; no verified CarPlay start")
++            }
+         }
+         var endpoint =
+             if (startSession != null) {
+@@ -1133,18 +1148,29 @@
+      */
+     private fun sendCarPlayAvailability() {
+         if (carPlayAvailabilitySent) return
+-        availabilityPeerFramesBefore = channel.peerFrameCount()
+-        availabilityParserBefore = channel.parserStats()
+         val availabilityShape = E2lbAvailabilityBodyPolicy.select(
+             receiverSignals.model,
+             receiverSignals.manufacturer,
+             bluetoothMac,
+             experimentalE2lbDualGroup,
+         )
+-        sendFireAndForget(
+-            Iap2MessageIds.CARPLAY_AVAILABILITY,
+-            E2lbAvailabilityBodyPolicy.body(availabilityShape, bluetoothMac),
+-        )
++        val body = E2lbAvailabilityBodyPolicy.body(availabilityShape, bluetoothMac)
++        val frame = Iap2Csm.encode(Iap2MessageIds.CARPLAY_AVAILABILITY, body)
++        if (isE2lb() && channel.supportsObservedControl() && frame.size <= (channel.peerMaxControlPayload() ?: 0)) {
++            // Observe this one specific sequence without introducing a new retransmission policy.
++            val submission = channel.submitObservedControl(frame)
++            if (submission != null) {
++                availabilityBefore = submission.first
++                availabilityReceipt = submission.second
++                log("iap2 tx=0x4300 passive receipt=${submission.second.state}")
++            } else {
++                throw IOException("E2LB availability submission unavailable; no startup authorization established")
++            }
++        } else {
++            availabilityBefore = channel.snapshot()
++            if (isE2lb()) log("iap2 0x4300 passive receipt unavailable for this negotiated transport; preserving normal send")
++            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, body)
++        }
+         log("iap2 0x4300 形态=$availabilityShape (E2LB 实验开关=$experimentalE2lbDualGroup；未证实车机已接受)")
+         carPlayAvailabilitySent = true
+         log("iap2 0x4300 已提交链路发送（awaitAck=false）；尚无证据证明车机应用层认可或已开启 CarPlay")
+@@ -1322,7 +1348,10 @@
+         deadline: Long,
+     ): Iap2Csm.Frame =
+         expectOrNull(messageId, deadline)
+-            ?: throw IOException("等待 0x${messageId.toString(16)} 超时")
++            ?: throw IOException(
++                if (channel.isAlive) "等待 0x${messageId.toString(16)} 超时"
++                else "等待 0x${messageId.toString(16)} 时链路结束: ${channel.terminationReason ?: "closed"}",
++            )
+ 
+     /**
+      * 同 [expect]，但超时返回 null（用于可选消息）。非预期帧进暂存区供后续消费。
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -104,6 +104,33 @@
+     fun peerFrameCount(): Long = synchronized(lock) { receivedPeerFrameCount }
+ 
+     fun parserStats(): Iap2LinkEngine.ParserStats = synchronized(lock) { engine.parserStats() }
++
++    data class LinkSnapshot(
++        val peerFrames: Long,
++        val parser: Iap2LinkEngine.ParserStats,
++        val alive: Boolean,
++        val receiptState: Iap2LinkEngine.ControlReceipt.State?,
++    )
++
++    /** Counters and receipt belong to the same reader/pacer lock acquisition. */
++    fun snapshot(receipt: Iap2LinkEngine.ControlReceipt? = null): LinkSnapshot = synchronized(lock) {
++        LinkSnapshot(receivedPeerFrameCount, engine.parserStats(), !terminated, receipt?.state)
++    }
++
++    /** Passive ACK attribution is not supported by an explicitly negotiated no-ACK link. */
++    fun supportsObservedControl(): Boolean = synchronized(lock) {
++        !terminated && engine.state == Iap2LinkEngine.State.NORMAL && (engine.peerSynchronization?.maxRetransmissions ?: 0) > 0
++    }
++
++    /** Capture baseline and enqueue under one lock; no unobserved interval before submission. */
++    fun submitObservedControl(bytes: ByteArray): Pair<LinkSnapshot, Iap2LinkEngine.ControlReceipt>? = synchronized(lock) {
++        if (terminated) return@synchronized null
++        val before = snapshot()
++        val receipt = engine.sendObservedControl(bytes, nowMillis()) ?: return@synchronized null
++        processEventsLocked()
++        drainOutputLocked()
++        if (terminated) null else before to receipt
++    }
+ 
+     /**
+      * 等待链路终结（[close] 或读写失败），最多 [timeoutMillis]；返回是否已终结。
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
+@@ -4,6 +4,51 @@
+ import org.junit.Test
+ 
+ class Iap2AvailabilityProgressTest {
++    private val baseline = Iap2LinkEngine.ParserStats(1L, 0L, 0L, 0L, 0L)
++
++    private fun classify(
++        markers: Long = 8L,
++        frames: Long = 0L,
++        errors: Long = 0L,
++        receipt: Iap2LinkEngine.ControlReceipt.State? = Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED,
++        alive: Boolean = true,
++        start: Boolean = false,
++    ) = Iap2AvailabilityProgress.classifyWindow(
++        8L, baseline, 8L + frames, baseline.copy(detectMarkers = 1L + markers, invalidPayloadChecksums = errors),
++        receipt, alive, start,
++    )
++
++    @Test
++    fun fiveVehicleWindowsReplayAsDetectOnly() {
++        repeat(5) { assertEquals(Iap2AvailabilityProgress.State.DETECT_ONLY, classify()) }
++    }
++
++    @Test
++    fun isolatedMarkerOrCorruptFramesAreNotDetectOnlyEvidence() {
++        assertEquals(Iap2AvailabilityProgress.State.LINK_SILENT, classify(markers = 1L))
++        assertEquals(Iap2AvailabilityProgress.State.LINK_SILENT, classify(errors = 1L))
++    }
++
++    @Test
++    fun queuedDeadAndExplicitStartRemainDistinct() {
++        assertEquals(Iap2AvailabilityProgress.State.NOT_TRANSMITTED, classify(receipt = Iap2LinkEngine.ControlReceipt.State.QUEUED))
++        assertEquals(Iap2AvailabilityProgress.State.LINK_ENDED, classify(alive = false))
++        assertEquals(Iap2AvailabilityProgress.State.START_SESSION, classify(start = true))
++        assertEquals(Iap2AvailabilityProgress.State.LINK_ACTIVITY_NO_START, classify(frames = 1L))
++    }
++
++    @Test
++    fun onlyTargetCarWithoutAlternativeEvidenceIsStopped() {
++        val state = Iap2AvailabilityProgress.State.DETECT_ONLY
++        for (target in listOf(false, true)) {
++            for (invite in listOf(false, true)) {
++                for (wifi in listOf(false, true)) {
++                    assertEquals(target && !invite && !wifi, Iap2AvailabilityProgress.shouldStopBeforeEndpoint(target, state, invite, wifi))
++                }
++            }
++        }
++    }
++
+     @Test
+     fun silentLinkDoesNotCountAsCarPlayStart() {
+         assertEquals(Iap2AvailabilityProgress.State.LINK_SILENT, Iap2AvailabilityProgress.classify(0L, false))
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+@@ -8,6 +8,90 @@
+ 
+ /** 两个链路引擎通过直接交换输出字节完成握手与数据往返（无线程、无 I/O）。 */
+ class Iap2LinkEngineTest {
++    @Test
++    fun observedControlNeedsItsOwnValidCumulativeAck() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        val seq = parseFrames(phone.takeOutput()).single().sequence
++        fun ack(value: Int) = ackFrame().apply {
++            this[6] = (value and 255).toByte()
++            this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++        }
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.state)
++        phone.feed(ack(seq - 1), tick())
++        phone.feed(ack(seq + 1), tick())
++        repeat(8) { phone.feed(Iap2LinkEngine.MARKER, tick()) }
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.state)
++        phone.advanceTime(100_000L)
++        assertTrue("Observation must not silently enable retransmission", phone.takeOutput().isEmpty())
++        phone.feed(ack(seq), tick())
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.PEER_ACKED, receipt.state)
++    }
++
++    @Test
++    fun observedControlDoesNotConfirmWhileStillQueued() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        val syncSeq = phone.javaClass.getDeclaredField("sentSequence").apply { isAccessible = true }.getInt(phone)
++        phone.feed(ackFrame().apply {
++            this[6] = syncSeq.toByte()
++            this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++        }, tick())
++        val window = phone.javaClass.getDeclaredField("declaredMaxOutgoing").apply { isAccessible = true }.getInt(phone)
++        repeat(window) { assertTrue(phone.sendControl(Iap2Csm.encode(0x5000), tick())) }
++        val sent = parseFrames(phone.takeOutput())
++        assertEquals(window, sent.size)
++        val last = sent.last().sequence
++        val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.QUEUED, receipt.state)
++        assertTrue(phone.takeOutput().isEmpty())
++        fun ack(value: Int) = ackFrame().apply {
++            this[6] = (value and 255).toByte()
++            this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++        }
++        phone.feed(ack(last), tick())
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.state)
++        val seq = parseFrames(phone.takeOutput()).single().sequence
++        phone.feed(ack(last), tick())
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.state)
++        phone.feed(ack(seq), tick())
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.PEER_ACKED, receipt.state)
++    }
++
++    @Test
++    fun observedControlRemainsCorrectAcrossSequenceWrapAndLinkEnd() {
++        val phone = normalHandshake().phone
++        phone.takeOutput()
++        repeat(300) {
++            val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++            val seq = parseFrames(phone.takeOutput()).single().sequence
++            val ack = ackFrame().apply {
++                this[6] = seq.toByte()
++                this[8] = (-take(8).sumOf { it.toInt() and 255 }).toByte()
++            }
++            phone.feed(ack, tick())
++            assertEquals(Iap2LinkEngine.ControlReceipt.State.PEER_ACKED, receipt.state)
++        }
++        val outstanding = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        phone.feedEof()
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.ENDED, outstanding.state)
++    }
++
++    @Test
++    fun malformedDetectPrefixDoesNotHideFollowingValidFrame() {
++        val (phone, accessory) = normalHandshake()
++        phone.takeOutput()
++        accessory.takeOutput()
++        assertTrue(accessory.sendControl(Iap2Csm.encode(0x5000), tick()))
++        val valid = accessory.takeOutput()
++        val before = phone.parserStats().detectMarkers
++        phone.feed(byteArrayOf(0xFF.toByte(), 0x55, 0xFF.toByte()), tick())
++        phone.feed(valid, tick())
++        assertEquals(1, pollControls(phone).size)
++        assertEquals(before, phone.parserStats().detectMarkers)
++    }
++
+     @Test
+     fun invalidAcknowledgementsNeverRemoveUnsentOrUnconfirmedPackets() {
+         val phone = normalHandshake().phone
+--- a/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
++++ b/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
+@@ -7,6 +7,29 @@
+ import org.junit.Test
+ 
+ class Iap2LinkChannelRestartTest {
++    @Test
++    fun passiveReceiptTracksRealPeerAckAcrossThreadedLoopback() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA, name = "receipt-phone")
++        val peer = Iap2LinkChannel(pair.sideB, name = "receipt-peer")
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            val submission = phone.submitObservedControl(byteArrayOf(9, 9, 9))!!
++            assertNotNull(peer.recvControl(2_000))
++            val deadline = System.nanoTime() + 2_000_000_000L
++            while (phone.snapshot(submission.second).receiptState != Iap2LinkEngine.ControlReceipt.State.PEER_ACKED &&
++                System.nanoTime() < deadline
++            ) Thread.sleep(5)
++            val after = phone.snapshot(submission.second)
++            assertTrue(after.receiptState == Iap2LinkEngine.ControlReceipt.State.PEER_ACKED)
++            assertTrue(after.peerFrames > submission.first.peerFrames)
++        } finally {
++            phone.close()
++            peer.close()
++        }
++    }
++
+     @Test
+     fun newSynClosesTheChannelAndSurfacesTheRestartReason() {
+         val pair = InMemoryStreamPair()
+--- a/build-r23-signed.ps1
++++ b/build-r23-signed.ps1
+@@ -1,4 +1,4 @@
+-# R23 local release build. Requires Android SDK, JDK, and keystore.properties.
++# R24 local release build. Requires Android SDK, JDK, and keystore.properties.
+ # Never sends a key or password to the network. Requires the R23 long-term signer.
+ param(
+     [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
+@@ -13,7 +13,7 @@
+ $signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
+ $aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
+ if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
+-& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.10-test.1 :app:assembleStandardRelease
++& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.11-test.1 :app:assembleStandardRelease
+ if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
+ $apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
+ if (!(Test-Path $apk)) { throw 'Release APK missing.' }
+@@ -23,9 +23,9 @@
+ $cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
+ if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
+ $meta = & $aapt dump badging $apk
+-if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1100000'")) { throw 'Unexpected package name or versionCode.' }
++if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1110000'")) { throw 'Unexpected package name or versionCode.' }
+ New-Item -ItemType Directory -Force dist | Out-Null
+-$out = 'dist\mcarplay-0.1.10.apk'
++$out = 'dist\mcarplay-0.1.11.apk'
+ Copy-Item $apk $out -Force
+ Get-FileHash $out -Algorithm SHA256
+ Write-Output 'Signed APK verified against expected certificate and package/version.'
+--- /dev/null
++++ b/docs/R24-E2LB-EVIDENCE-REVIEW.md
+@@ -0,0 +1,29 @@
++# R24 / 0.1.11 E2LB evidence review — 2026-11-25
++
++Status: experimental source candidate; not a confirmed E2LB connection fix. Based on the 0.1.10 round-2 source archive (which itself has not passed full Android CI), not on the installed 0.1.9 APK. Installed 0.1.9 SHA-256 matches the supplied Nov 25 report: 2c9843711a6cf9c08640e95401b5efd27231ee57de76e6aa8e13f31b60c344be.
++
++## Observations and causal limits
++
++The Nov 25 report contains five availability windows, one single-group and four dual-group, all with 8 DETECT, 0 checksum-valid normal link frames, and zero header/payload/length/noise parser errors within eight seconds. Last positive cumulative ACK before 0x4300 is 109; 0x4300 has sequence 110. This proves neither delivery to the receiver application nor acceptance. Periodic DETECT indicates probe traffic; it does not establish whether the receiver deliberately reset, rejected a request, returned to negotiation, or changed application state. Four attempts were user-stopped; one was ongoing when exported. No full 180-second expiry is demonstrated. R22's speculative gateway SETUP returned 500; R23 removed that fallback for E2LB, so the different symptom is not an improvement in real connectivity.
++
++The accessory certificate and challenge response are still unverified. The source sends a compatibility auth signal; this is not verified authentication or CarPlay authorization. Do not substitute synthetic identifiers, forged certificates, or success signals for real verification. No trusted MFi roots, verified challenge algorithm or successful native iPhone trace is available in these materials. The underlying E2LB launch refusal/absence of response is unresolved. Bluetooth identity is manually configured and not independently verified; its correctness remains unknown. Network-local mDNS registration does not establish peer visibility. No confirmed AirPlay endpoint or invite exists in the observed attempts. CarWith, capture, video, audio, and touch never began, so their behavior cannot explain these failures.
++
++## Changes delivered
++
++- Iap2LinkEngine: passive single-control receipt observes QUEUED, FRAME_GENERATED, PEER_ACKED, ENDED; only a valid cumulative ACK covering that actual sequence confirms the receipt. No changed 0x4300 body, additional retransmission or auth behavior. No-ACK transport retains prior behavior. Malformed FF55 prefixes no longer wait unnecessarily; matching partial marker preserved.
++- Iap2LinkChannel: atomic snapshot of received frame count, parser statistics, liveness and receipt; baseline taken under same lock as submission. Distinguish output generation from actual application acceptance. A write failure cannot produce a successful submission result.
++- Iap2AvailabilityProgress: DETECT_ONLY requires at least three complete markers, zero additional checksum-valid frames, zero new parser errors/noise and FRAME_GENERATED receipt. This threshold is a conservative project policy, NOT a protocol-defined reset condition. Queued control, terminated link, ordinary silence, link activity and explicit start remain separate.
++- Iap2SenderSession: E2LB-only policy stops the observed DETECT_ONLY / NOT_TRANSMITTED branch before delivering an unsupported endpoint, except if another legitimate invitation or accessory Wi-Fi configuration exists. Ended E2LB link is reported as such. Existing Bluetooth teardown/reconnect guard used; no added retry loop or injected SYN. Existing 8-second observation window retained. Potential regression: a valid late start arriving after the guard may be lost; native receiver validation required. Non-E2LB routing preserved, subject to Android CI.
++- Version 0.1.11, versionCode 1110000; local build helper updated to require the installed 0.1.9 certificate fingerprint (44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512). No private keys or passwords in archive. No signed APK produced in this run.
++
++## Validation and limits
++
++32 targeted Kotlin test methods passed using Kotlin 1.9/JDK 21 and minimal JUnit API shims, not the real Gradle JUnit runner. Production link engine, CSM, channel and progress policy compiled; test-only DuplexStream copy uses equivalent ArrayDeque.add instead of addLast due local compiler/JDK interop. New tests cover own ACK vs stale/future ACK, backlogged receipt, wraparound, link end, marker/noise parsing, five identical log-summary windows, alternate handoff and threaded in-memory receipt. These windows reproduce the *observed counters*, not the complete raw vehicle wire protocol. Actual sender integration and Android lifecycle not fully executed. Python 87/87 passed. Full Android build attempt failed because Gradle wrapper cannot resolve services.gradle.org; Android SDK also absent. 0.1.10 inherited changes need CI too. No physical car test. This is a safer failure/recovery policy and diagnostic improvement, not proof of interoperability.
++
++## Acceptance gate (before claiming repaired connection)
++
++1. Parked vehicle: verify supported native wireless CarPlay works on the same receiver/firmware; if it fails, diagnose receiver settings, firmware and official supported setup first. Use authorized diagnostics to establish state milestones, not raw keys or credentials. Establish actual phone Bluetooth identity through supported OS APIs or user-verified system settings.
++2. Verify the legitimate MFi/protocol authentication against the relevant trusted specification and certificate roots; distinguish accessory verification from receiver authorization. Do not mark unverified evidence successful. Compare normal supported session's transport and application stage ordering.
++3. Controlled receiver / bench tests: startup signal delivery and ACK attribution, split/merged/malformed frames, reset/late start, no-ACK negotiation, validated endpoint, stale observations, bounded retry and cancellation; preserve supported older receivers.
++4. Full Android standard and remote test suites, lint, release build, package/version/signature checks. Only use the existing long-term signing key for in-place upgrade. Publish update only after authorized release with digest.
++5. Real E2LB repeated cold/warm starts, 0x4301 or other legitimate receiver startup evidence, verified endpoint, SETUP and RECORD success, actual image/sound/touch and reconnect. Until then do not claim the car is fixed.

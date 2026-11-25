@@ -1,0 +1,724 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fcf97cc..a2b89d6 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.24-test.1] - 2026-11-25
++
++> R37 — local projection interaction candidate; hardware validation pending.
++
++### English
++- Add local page swipes, directional focus with GPU ring, and frame-confirmed selection.
++- Cancel ambiguous multi-contact gestures instead of synthesizing taps or map gestures.
++- Repair the R36 renderer formatting blocker without disabling lint.
++
++### 简体中文
++- 新增本地页面滑动切换、旋钮方向焦点及 GPU 描边，确认操作须等待对应画面发送。
++- 多指状态不明确时取消本地手势，不误触地图或音乐按钮。
++- 修复 R36 渲染器格式检查阻塞，保留严格检查。
++
+ ## [v0.1.23-test.1] - 2026-11-25
+ 
+ > R36 — projected glass material and interaction candidate; no Android/receiver validation.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 00bf79b..3c0f0c7 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.23"
++val appVersionName = "0.1.24"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index 2ab631a..d58fa7d 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -498,7 +498,23 @@ object SessionController {
+      * 这里只记日志，便于看到车机确实发来了导航类 HID。
+      */
+     private fun injectNavigationKey(keyCode: Int) {
+-        appendLog("HID: 导航键 ${HidNavigation.nameOf(keyCode)} 无处注入（CarWith 流不承载方向键）——忽略")
++        val sender = videoSender
++        val projected = sender?.routeDashboardKey(keyCode)
++        if (projected == null) {
++            appendLog("HID: 导航键 ${HidNavigation.nameOf(keyCode)} 无处注入（CarWith 流不承载方向键）——忽略")
++            return
++        }
++        projected.action?.let { action ->
++            val key = when (action) {
++                DashboardAction.PREVIOUS -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
++                DashboardAction.PLAY_PAUSE -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
++                DashboardAction.NEXT -> KeyEvent.KEYCODE_MEDIA_NEXT
++            }
++            if (action == DashboardAction.PLAY_PAUSE) autoPlaySuppressor.disarm()
++            if (sender?.dispatchProjectedMedia(key, projected.mediaIdentity) != true) {
++                appendLog("EVENT: R37 focused media action unavailable; no cross-player fallback")
++            }
++        }
+     }
+ 
+     /**
+@@ -4879,6 +4895,7 @@ object SessionController {
+                                                 val projected = videoSender?.routeDashboardTouch(
+                                                     contact.xPixels, contact.yPixels, contact.down,
+                                                     setup.displayWidth, setup.displayHeight, carLife.videoWidth, carLife.videoHeight,
++                                                    otherPointerDown = contacts.any { it.slot != contact.slot && it.down },
+                                                 )
+                                                 if (projected?.cancelSource == true) carLife.releaseActiveTouch()
+                                                 projected?.action?.let { action ->
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+index d36f616..6ecd5b1 100644
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -62,6 +62,13 @@ internal class CarWithTranscoder(
+         pressedBounds = bounds
+         glHandler.post { if (mayRefreshIdle()) scheduleRender() }
+     }
++    fun clearProjectedFocus() {
++        if (pages?.clearFocus() == true) glHandler.post { if (mayRefreshIdle()) scheduleRender() }
++    }
++    fun moveProjectedFocus(direction: ProjectionDirection) {
++        if (pages?.moveFocus(direction) == true) glHandler.post { if (mayRefreshIdle()) scheduleRender() }
++    }
++    fun confirmedProjectedFocus(): ProjectionFocusTarget? = pages?.confirmedFocus()
+     fun selectPage(page: ProjectionPage) {
+         if (pages?.select(page) == true) glHandler.post { if (mayRefreshIdle()) scheduleRender() }
+     }
+@@ -165,8 +172,9 @@ internal class CarWithTranscoder(
+         val renderer = dashboard ?: return false
+         if (inputSyncRetry) return true
+         val now = android.os.SystemClock.uptimeMillis()
++        val state = pages?.renderState() ?: return false
+         return renderer.needsRefresh(
+-            pages?.requested ?: return false, now, System.nanoTime() - lastSourceNs > 2_000_000_000L, pressedBounds,
++            state.layout, now, System.nanoTime() - lastSourceNs > 2_000_000_000L, pressedBounds, state.focus?.bounds,
+         )
+     }
+ 
+@@ -544,11 +552,12 @@ internal class CarWithTranscoder(
+                 GLES20.glClearColor(0f, 0f, 0f, 1f)
+                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+             }
+-            val currentLayout = pages?.requested
++            val state = pages?.renderState()
++            val currentLayout = state?.layout
+             dashboard?.let { renderer ->
+                 renderer.draw(
+                     currentLayout ?: error("missing dashboard layout"), System.nanoTime() - lastSourceNs > 2_000_000_000L,
+-                    pressedBounds,
++                    pressedBounds, state?.focus?.bounds,
+                 )
+             }
+             val viewport = currentLayout?.video
+@@ -597,7 +606,7 @@ internal class CarWithTranscoder(
+             check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "GL composition failed" }
+             lastPresentationNs = maxOf(lastPresentationNs + 1, System.nanoTime())
+             check(EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, lastPresentationNs)) { "eglPresentationTimeANDROID" }
+-            currentLayout?.let { pages?.submit(it, lastPresentationNs / 1_000L, dashboard?.displayedMedia) }
++            currentLayout?.let { pages?.submit(it, lastPresentationNs / 1_000L, dashboard?.displayedMedia, state?.focus) }
+             check(EGL14.eglSwapBuffers(eglDisplay, eglSurface)) { "eglSwapBuffers" }
+             framesRendered++
+             if (!source) dashboardOnlyFrames++
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+index bb1ed3a..6bf2f6d 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+@@ -14,7 +14,28 @@ internal enum class ProjectionPage { DASHBOARD, HOME, NAVIGATION, MUSIC, WIDGETS
+ internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
+     @Volatile var requested = initial
+         private set
+-    private data class Frame<T>(val layout: ProjectedDashboardLayout, val media: T?)
++    data class RenderState(val layout: ProjectedDashboardLayout, val focus: ProjectionFocusTarget?)
++    private data class Frame<T>(val layout: ProjectedDashboardLayout, val media: T?, val focus: ProjectionFocusTarget?)
++    private var focus: ProjectionFocusTarget? = null
++
++    @Synchronized fun renderState() = RenderState(requested, focus)
++    @Synchronized fun clearFocus(): Boolean {
++        if (focus == null) return false
++        focus = null
++        return true
++    }
++
++    @Synchronized fun moveFocus(direction: ProjectionDirection): Boolean {
++        if (requested.fullContent || !requested.shell || sent?.layout !== requested) return false
++        val next = ProjectionFocus.move(requested, focus, direction) ?: return false
++        if (next == focus) return false
++        focus = next
++        return true
++    }
++
++    @Synchronized fun confirmedFocus(): ProjectionFocusTarget? =
++        focus?.takeIf { sent?.layout === requested && sent?.focus == it }
++
+     private val frames = LinkedHashMap<Long, Frame<T>>()
+     private var sent: Frame<T>? = null
+     private var lastSentPts = Long.MIN_VALUE
+@@ -22,11 +43,12 @@ internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
+     @Synchronized fun select(page: ProjectionPage): Boolean {
+         if (requested.fullContent || requested.page == page || sent?.layout !== requested) return false
+         requested = requested.withPage(page)
++        focus = null
+         return true
+     }
+ 
+-    @Synchronized fun submit(layout: ProjectedDashboardLayout, ptsUs: Long, media: T?) {
+-        frames[ptsUs] = Frame(layout, media)
++    @Synchronized fun submit(layout: ProjectedDashboardLayout, ptsUs: Long, media: T?, renderedFocus: ProjectionFocusTarget? = null) {
++        frames[ptsUs] = Frame(layout, media, renderedFocus)
+         while (frames.size > 64) frames.remove(frames.keys.first())
+     }
+ 
+@@ -39,7 +61,11 @@ internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
+         return sent != null
+     }
+ 
+-    @Synchronized fun invalidate() { sent = null; frames.clear() }
++    @Synchronized fun invalidate() {
++        sent = null
++        frames.clear()
++        focus = null
++    }
+     @Synchronized fun touchLayout(): ProjectedDashboardLayout? = sent?.layout?.takeIf { it === requested }
+     @Synchronized fun sentMedia(): T? = sent?.takeIf { it.layout === requested }?.media
+ }
+@@ -172,6 +198,9 @@ internal class DashboardTouchRouter {
+     private var cancelled = false
+     private var page: ProjectionPage? = null
+     private var pressBounds: ProjectionRect? = null
++    private var capturedLayout: ProjectedDashboardLayout? = null
++    private var swipeStart: Pair<Int, Int>? = null
++    private var swipeOutside = false
+ 
+     @Synchronized fun pressedBounds(): ProjectionRect? = pressBounds.takeIf { active && !cancelled && !source }
+ 
+@@ -184,29 +213,45 @@ internal class DashboardTouchRouter {
+         page = null
+         cancelled = false
+         pressBounds = null
++        capturedLayout = null
++        swipeStart = null
++        swipeOutside = false
+         return cancelSource
+     }
+     @Synchronized
+     fun route(layout: ProjectedDashboardLayout, x: Int, y: Int, down: Boolean, targetWidth: Int, targetHeight: Int): Result {
++        if (active && capturedLayout !== layout) return Result(cancelSource = reset())
+         if (down && !active) {
+             active = true
++            capturedLayout = layout
+             page = layout.pageAt(x, y)
+             source = page == null && layout.showsVideo && layout.video.contains(x, y)
+             action = layout.actionAt(x, y)
+             pressBounds = (layout.dock + layout.tiles).firstOrNull { it.second.contains(x, y) }?.second
+                 ?: layout.controls.firstOrNull { it.second.contains(x, y) }?.second
+             cancelled = false
++            swipeOutside = false
++            swipeStart = if (layout.shell && !layout.fullContent && !layout.showsVideo &&
++                page == null && action == null && layout.workspace.contains(x, y)
++            ) x to y else null
+         }
+         if (!active) return Result()
++        swipeStart?.let { start ->
++            if (!layout.workspace.contains(x, y)) swipeOutside = true
++            if (down) return Result()
++            val dest = if (swipeOutside) null else ProjectionFocus.swipe(layout, start, x to y)
++            reset()
++            return Result(page = dest)
++        }
+         if (source) {
+             val point = layout.sourcePoint(x, y, targetWidth, targetHeight)
+-            if (!down) active = false
++            if (!down) reset()
+             return Result(point = point)
+         }
+         if (layout.actionAt(x, y) != action || layout.pageAt(x, y) != page || pressBounds?.contains(x, y) == false) cancelled = true
+         if (down) return Result()
+-        active = false
+-        pressBounds = null
+-        return Result(action = action.takeUnless { cancelled }, page = page.takeUnless { cancelled })
++        val result = Result(action = action.takeUnless { cancelled }, page = page.takeUnless { cancelled })
++        reset()
++        return result
+     }
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+index 37dedb6..dfd37ea 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -41,6 +41,9 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+     }
+     private var pressRectLoc = -1
+     private var pressureLoc = -1
++    private var focusLoc = -1
++    private var focusBounds: ProjectionRect? = null
++    private var focusUniform = ProjectionGlass.normalized(null, layout.height)
+     private var pressRect: ProjectionRect? = null
+     private var pressTarget: ProjectionRect? = null
+     private var pressStart = 0L
+@@ -128,6 +131,7 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+         darkLoc = GL.glGetUniformLocation(program, "dark")
+         pressRectLoc = GL.glGetUniformLocation(program, "pressed")
+         pressureLoc = GL.glGetUniformLocation(program, "pressure")
++        focusLoc = GL.glGetUniformLocation(program, "focused")
+         cardLocations = IntArray(3) { GL.glGetUniformLocation(program, "card$it") }
+         GL.glGenTextures(1, ids, 0)
+         wallpaper = ids[0]
+@@ -174,7 +178,7 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+             pressStart = now
+             pressMoving = true
+         }
+-        val f = ProjectionMotion.ease(now - pressStart, ProjectionMotion.PRESS_MS)
++        val f = ProjectionMotion.pressEase(now - pressStart)
+         pressAmount = pressFrom + ((if (pressTarget == null) 0f else 1f) - pressFrom) * f
+         if (f >= 1f) {
+             pressMoving = false
+@@ -182,8 +186,10 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+         }
+     }
+ 
+-    fun needsRefresh(next: ProjectedDashboardLayout, nowMs: Long, sourceStale: Boolean, pressed: ProjectionRect?): Boolean {
+-        if (next !== layout || sourceStale != stale || pressed != pressTarget || animating()) return true
++    fun needsRefresh(
++        next: ProjectedDashboardLayout, nowMs: Long, sourceStale: Boolean, pressed: ProjectionRect?, focused: ProjectionRect?,
++    ): Boolean {
++        if (next !== layout || sourceStale != stale || pressed != pressTarget || focused != focusBounds || animating()) return true
+         if (lastPoll < 0 || nowMs - lastPoll >= 250) {
+             lastPoll = nowMs
+             pendingSnapshot = snapshot()
+@@ -195,14 +201,14 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+             (layout.page == ProjectionPage.WIDGETS && dirty.panel)
+     }
+ 
+-    fun draw(next: ProjectedDashboardLayout, sourceStale: Boolean, pressed: ProjectionRect?) {
++    fun draw(next: ProjectedDashboardLayout, sourceStale: Boolean, pressed: ProjectionRect?, focused: ProjectionRect?) {
+         GL.glViewport(0, 0, layout.width, layout.height)
+         GL.glUseProgram(program)
+         GL.glActiveTexture(GL.GL_TEXTURE0)
+         GL.glBindTexture(GL.GL_TEXTURE_2D, texture)
+         val now = SystemClock.uptimeMillis()
+         val pageChanged = layout !== next
+-        needsRefresh(next, now, sourceStale, pressed)
++        needsRefresh(next, now, sourceStale, pressed, focused)
+         val nightNow = desiredNight
+         if (pageChanged || nightNow != night) {
+             layout = next
+@@ -246,7 +252,7 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+         } else {
+             val staleChanged = stale != sourceStale
+             stale = sourceStale
+-            needsRefresh(layout, now, sourceStale, pressed)
++            needsRefresh(layout, now, sourceStale, pressed, focused)
+             val current = pendingSnapshot ?: if (staleChanged) snapshot() else null
+             current?.let {
+                 val dirty = it.key.changesFrom(lastKey)
+@@ -292,6 +298,11 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+         }
+         GL.glUniform4fv(pressRectLoc, 1, pressUniform, 0)
+         GL.glUniform1f(pressureLoc, pressAmount)
++        if (focused != focusBounds) {
++            focusBounds = focused
++            focusUniform = ProjectionGlass.normalized(focused, layout.height)
++        }
++        GL.glUniform4fv(focusLoc, 1, focusUniform, 0)
+         GL.glEnableVertexAttribArray(p)
+         GL.glEnableVertexAttribArray(t)
+         positions.position(0)
+@@ -380,8 +391,12 @@ internal class ProjectedDashboardRenderer(private var layout: ProjectedDashboard
+         // Connection indicator is local composition status, not claimed GPS or phone signal.
+         paint.color = if (stale) 0xFFE9AE55.toInt() else 0xFF71E6B2.toInt()
+         canvas.drawCircle(rail.left + rail.width * .5f, rail.top + h * .13f, rail.width * .065f, paint)
+-        label(if (stale) { if (chinese) "未更新" else "IDLE" } else { if (chinese) "实时" else "LIVE" },
+-            railX, rail.top + h * .20f, rail.width * .19f, rail.width * .8f)
++        val status = if (stale) {
++            if (chinese) "未更新" else "IDLE"
++        } else {
++            if (chinese) "实时" else "LIVE"
++        }
++        label(status, railX, rail.top + h * .20f, rail.width * .19f, rail.width * .8f)
+         for ((page, bounds) in layout.dock) icon(page, bounds, page == layout.page)
+ 
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionFocus.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionFocus.kt
+new file mode 100644
+index 0000000..19b5198
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionFocus.kt
+@@ -0,0 +1,75 @@
++package com.mcarplay.app.video
++
++import kotlin.math.abs
++
++internal enum class ProjectionDirection { UP, DOWN, LEFT, RIGHT }
++
++/** Bounds and action are derived from the same immutable layout used to draw the frame. */
++internal data class ProjectionFocusTarget(
++    val bounds: ProjectionRect,
++    val page: ProjectionPage? = null,
++    val action: DashboardAction? = null,
++)
++
++internal object ProjectionFocus {
++    private val swipePages = listOf(ProjectionPage.HOME, ProjectionPage.MUSIC, ProjectionPage.WIDGETS)
++
++    fun targets(layout: ProjectedDashboardLayout): List<ProjectionFocusTarget> =
++        if (!layout.shell || layout.fullContent) emptyList()
++        else (layout.dock + layout.tiles).map { (page, bounds) -> ProjectionFocusTarget(bounds, page = page) } +
++            layout.controls.map { (action, bounds) -> ProjectionFocusTarget(bounds, action = action) }
++
++    fun move(layout: ProjectedDashboardLayout, current: ProjectionFocusTarget?, direction: ProjectionDirection): ProjectionFocusTarget? {
++        val candidates = targets(layout)
++        if (current !in candidates) return candidates.firstOrNull { it.page == layout.page } ?: candidates.firstOrNull()
++        val origin = requireNotNull(current).bounds
++        val ox = origin.left + origin.right
++        val oy = origin.top + origin.bottom
++        var best: ProjectionFocusTarget? = null
++        var bestScore = Long.MAX_VALUE
++        for (target in candidates) {
++            val r = target.bounds
++            val dx = r.left + r.right - ox
++            val dy = r.top + r.bottom - oy
++            val forward = when (direction) {
++                ProjectionDirection.UP -> -dy
++                ProjectionDirection.DOWN -> dy
++                ProjectionDirection.LEFT -> -dx
++                ProjectionDirection.RIGHT -> dx
++            }
++            if (forward <= 0) continue
++            val cross = if (direction == ProjectionDirection.UP || direction == ProjectionDirection.DOWN) abs(dx) else abs(dy)
++            val score = forward.toLong() * forward + 4L * cross * cross
++            if (score < bestScore) {
++                best = target
++                bestScore = score
++            }
++        }
++        return best ?: current
++    }
++
++    /** Swipes are local-only; never reinterpret live video or a captured button. No wraparound. */
++    fun swipe(layout: ProjectedDashboardLayout, from: Pair<Int, Int>, to: Pair<Int, Int>): ProjectionPage? {
++        if (!layout.shell || layout.fullContent || layout.showsVideo) return null
++        if (!layout.workspace.contains(from.first, from.second) || !layout.workspace.contains(to.first, to.second)) return null
++        val dx = to.first - from.first
++        val dy = to.second - from.second
++        val threshold = maxOf(48, layout.height / 7)
++        if (abs(dx) < threshold || abs(dx) < 2 * abs(dy)) return null
++        val index = swipePages.indexOf(layout.page)
++        if (index < 0) return null
++        return swipePages.getOrNull(index + if (dx < 0) 1 else -1)
++    }
++}
++
++/** Unsupported secondary contacts cancel the entire gesture until every contact is released. */
++internal class ProjectionContactGate {
++    private var blocked = false
++
++    fun accepts(primaryDown: Boolean, secondaryDown: Boolean): Boolean {
++        if (secondaryDown) blocked = true
++        if (!blocked) return true
++        if (!primaryDown && !secondaryDown) blocked = false
++        return false
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt
+index b1b1819..085fc02 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionGlass.kt
+@@ -3,7 +3,14 @@ package com.mcarplay.app.video
+ /** A bounded, wall-clock animation; never extrapolate or move the input geometry. */
+ internal object ProjectionMotion {
+     const val PAGE_MS = 220L
+-    const val PRESS_MS = 100L
++    const val PRESS_MS = 140L
++
++    /** Critically damped response, normalized at the deadline; no overshoot of hit geometry. */
++    fun pressEase(elapsedMs: Long): Float {
++        val t = (elapsedMs.toDouble() / PRESS_MS).coerceIn(0.0, 1.0)
++        fun response(x: Double): Double = 1.0 - (1.0 + 6.0 * x) * kotlin.math.exp(-6.0 * x)
++        return (response(t) / response(1.0)).coerceIn(0.0, 1.0).toFloat()
++    }
+ 
+     fun ease(elapsedMs: Long, durationMs: Long): Float {
+         val t = (elapsedMs.toDouble() / durationMs.coerceAtLeast(1L)).coerceIn(0.0, 1.0)
+@@ -46,6 +53,7 @@ internal object ProjectionGlass {
+         uniform vec4 card2;
+         uniform vec4 pressed;
+         uniform float pressure;
++        uniform vec4 focused;
+         float rounded(vec2 q, vec4 r, float radius) {
+             vec2 halfSize = (r.zw-r.xy)*0.5;
+             float rad = min(radius, min(halfSize.x, halfSize.y));
+@@ -87,6 +95,11 @@ internal object ProjectionGlass {
+                 float mask = 1.0-smoothstep(-pixel,pixel,rounded(q,pressed,0.024));
+                 color = mix(color, mix(vec3(0.08,0.18,0.28),vec3(1.0),dark),mask*pressure*0.18);
+             }
++            if (focused.x >= 0.0) {
++                float fd = rounded(q,focused+vec4(pixel*3.0,pixel*3.0,-pixel*3.0,-pixel*3.0),0.022);
++                float ring = 1.0-smoothstep(pixel*0.6,pixel*2.4,abs(fd));
++                color = mix(color,mix(vec3(0.04,0.35,0.85),vec3(0.43,0.78,1.0),dark),ring*0.94);
++            }
+             gl_FragColor = vec4(clamp(color,0.0,1.0),1.0);
+         }
+     """
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+index 8b6253e..8703db0 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -130,6 +130,7 @@ class VideoSender(
+     private var transcoder: CarWithTranscoder? = null
+ 
+     private val dashboardTouch = DashboardTouchRouter()
++    private val dashboardContacts = ProjectionContactGate()
+     private var suppressDashboardGesture = false
+     private var dashboardPointerDown = false
+     private var capturedMediaIdentity: Any? = null
+@@ -138,10 +139,25 @@ class VideoSender(
+     @Volatile private var dashboardFallback = projectedDashboard && !ProjectedDashboardLayout.supports(streamWidth, streamHeight)
+ 
+     /** Null means the compatibility stream owns input; empty result consumes input during startup. */
+-    internal fun routeDashboardTouch(x: Int, y: Int, down: Boolean, displayWidth: Int, displayHeight: Int, targetWidth: Int, targetHeight: Int): DashboardTouchRouter.Result? {
++    internal fun routeDashboardTouch(
++        x: Int, y: Int, down: Boolean, displayWidth: Int, displayHeight: Int, targetWidth: Int, targetHeight: Int,
++        otherPointerDown: Boolean = false,
++    ): DashboardTouchRouter.Result? {
+         if (!projectedDashboard || dashboardFallback) return null
+         val pipeline = transcoder ?: return DashboardTouchRouter.Result()
+-        if (down && !dashboardPointerDown) capturedMediaIdentity = pipeline.mediaIdentity()
++        if (!dashboardContacts.accepts(down, otherPointerDown)) {
++            val cancelled = dashboardTouch.reset()
++            pipeline.clearProjectedFocus()
++            pipeline.updateProjectedPress(null)
++            capturedMediaIdentity = null
++            dashboardPointerDown = down || otherPointerDown
++            suppressDashboardGesture = dashboardPointerDown
++            return DashboardTouchRouter.Result(cancelSource = dashboardCancelPending.getAndSet(false) || cancelled)
++        }
++        if (down && !dashboardPointerDown) {
++            pipeline.clearProjectedFocus()
++            capturedMediaIdentity = pipeline.mediaIdentity()
++        }
+         dashboardPointerDown = down
+         if (dashboardCancelPending.getAndSet(false)) {
+             dashboardTouch.reset()
+@@ -168,7 +184,35 @@ class VideoSender(
+         result.page?.let { pipeline.selectPage(it) }
+         val identity = capturedMediaIdentity
+         if (!down) capturedMediaIdentity = null
+-        return result.copy(cancelSource = dashboardCancelPending.getAndSet(false), mediaIdentity = identity)
++        return result.copy(cancelSource = dashboardCancelPending.getAndSet(false) || result.cancelSource, mediaIdentity = identity)
++    }
++
++    /** Consume only shell navigation; never synthesize directional input into the live source. */
++    internal fun routeDashboardKey(keyCode: Int): DashboardTouchRouter.Result? {
++        if (!projectedDashboard || dashboardFallback || fullContentProjection) return null
++        val pipeline = transcoder ?: return DashboardTouchRouter.Result()
++        val layout = pipeline.touchLayout() ?: return DashboardTouchRouter.Result()
++        if (dashboardPointerDown || dashboardCancelPending.get() || !dashboardFrameSent || dashboardSourceSize != sourceSize ||
++            !runCatching { phoneOwnsScreen() }.getOrDefault(false)
++        ) return DashboardTouchRouter.Result()
++        val direction = when (keyCode) {
++            android.view.KeyEvent.KEYCODE_DPAD_UP -> ProjectionDirection.UP
++            android.view.KeyEvent.KEYCODE_DPAD_DOWN -> ProjectionDirection.DOWN
++            android.view.KeyEvent.KEYCODE_DPAD_LEFT -> ProjectionDirection.LEFT
++            android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> ProjectionDirection.RIGHT
++            else -> null
++        }
++        if (direction != null) {
++            pipeline.moveProjectedFocus(direction)
++        } else if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
++            if (layout.page != ProjectionPage.DASHBOARD) pipeline.selectPage(ProjectionPage.DASHBOARD)
++            else pipeline.clearProjectedFocus()
++        } else if (keyCode == android.view.KeyEvent.KEYCODE_DPAD_CENTER) {
++            val focus = pipeline.confirmedProjectedFocus() ?: return DashboardTouchRouter.Result()
++            focus.page?.let { pipeline.selectPage(it) }
++            return DashboardTouchRouter.Result(action = focus.action, mediaIdentity = pipeline.mediaIdentity())
++        }
++        return DashboardTouchRouter.Result()
+     }
+ 
+     internal fun dispatchProjectedMedia(keyCode: Int, expected: Any?): Boolean =
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt
+new file mode 100644
+index 0000000..c5ea057
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt
+@@ -0,0 +1,173 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionFocusTest {
++    private fun base() = ProjectedDashboardLayout(2400, 800, 1920, 1080, true, shell = true)
++
++    @Test
++    fun multiContactBlocksUntilAllPointersLift() {
++        val gate = ProjectionContactGate()
++        assertTrue(gate.accepts(true, false))
++        assertFalse(gate.accepts(true, true))
++        assertFalse(gate.accepts(false, true))
++        assertFalse(gate.accepts(true, false))
++        assertFalse(gate.accepts(false, false))
++        assertTrue(gate.accepts(true, false))
++        assertTrue(gate.accepts(false, false))
++        val random = Random(370)
++        var blocked = false
++        repeat(10000) {
++            val primary = random.nextBoolean()
++            val secondary = random.nextBoolean()
++            if (secondary) blocked = true
++            assertEquals(!blocked, gate.accepts(primary, secondary))
++            if (!primary && !secondary) blocked = false
++        }
++    }
++
++    @Test
++    fun dampedPressIsBoundedAndCompletesExactly() {
++        var previous = 0f
++        for (ms in -10L..200L) {
++            val next = ProjectionMotion.pressEase(ms)
++            assertTrue(next in previous..1f)
++            previous = next
++        }
++        assertEquals(0f, ProjectionMotion.pressEase(0L))
++        assertEquals(1f, ProjectionMotion.pressEase(ProjectionMotion.PRESS_MS))
++    }
++
++    @Test
++    fun focusRequiresMatchingWrittenFrameAndClearsOnPageChange() {
++        val l = base()
++        val state = ProjectionPageState<String>(l)
++        assertFalse(state.moveFocus(ProjectionDirection.DOWN))
++        state.submit(l, 1, "A")
++        state.markSent(1)
++        assertTrue(state.moveFocus(ProjectionDirection.DOWN))
++        val first = state.renderState().focus
++        assertNull(state.confirmedFocus())
++        state.submit(l, 2, "A", first)
++        assertTrue(state.moveFocus(ProjectionDirection.DOWN))
++        val second = state.renderState().focus
++        assertTrue(first != second)
++        state.markSent(2)
++        assertNull(state.confirmedFocus())
++        state.submit(l, 3, "B", second)
++        state.markSent(3)
++        assertEquals(second, state.confirmedFocus())
++        assertEquals("B", state.sentMedia())
++        assertTrue(state.select(ProjectionPage.HOME))
++        assertNull(state.confirmedFocus())
++        assertNull(state.renderState().focus)
++        assertFalse(state.moveFocus(ProjectionDirection.RIGHT))
++        val home = state.requested
++        state.submit(home, 4, null)
++        state.markSent(4)
++        assertTrue(state.moveFocus(ProjectionDirection.RIGHT))
++        state.invalidate()
++        assertNull(state.confirmedFocus())
++        assertNull(state.renderState().focus)
++    }
++
++    @Test
++    fun focusClearCannotBeRearmedByAnInFlightFrame() {
++        val l = base()
++        val state = ProjectionPageState<String>(l)
++        state.submit(l, 1, null)
++        state.markSent(1)
++        state.moveFocus(ProjectionDirection.DOWN)
++        state.submit(l, 2, null, state.renderState().focus)
++        assertTrue(state.clearFocus())
++        state.markSent(2)
++        assertNull(state.confirmedFocus())
++        assertNull(state.renderState().focus)
++    }
++
++    @Test
++    fun localSwipeDoesNotClickTilesOrStealMapGesture() {
++        val home = base().withPage(ProjectionPage.HOME)
++        val x = home.workspace.left + home.workspace.width / 2
++        val y = home.workspace.top + 5
++        val router = DashboardTouchRouter()
++        router.route(home, x, y, true, 1920, 1080)
++        router.route(home, x - 200, y, true, 1920, 1080)
++        val swipe = router.route(home, x - 300, y, false, 1920, 1080)
++        assertEquals(ProjectionPage.MUSIC, swipe.page)
++        assertNull(swipe.action)
++        assertNull(swipe.point)
++        router.route(home, x, y, true, 1920, 1080)
++        router.route(home, -1, y, true, 1920, 1080)
++        assertNull(router.route(home, x - 300, y, false, 1920, 1080).page)
++        router.route(home, x, y, true, 1920, 1080)
++        assertNull(router.route(home, x - 200, y + 150, false, 1920, 1080).page)
++        val tile = home.tiles.first().second
++        router.route(home, tile.left, tile.top, true, 1920, 1080)
++        assertNull(router.route(home, tile.right + 5, tile.top, false, 1920, 1080).page)
++        val nav = base().withPage(ProjectionPage.NAVIGATION)
++        val start = nav.video.left + nav.video.width / 2
++        val middle = nav.video.top + nav.video.height / 2
++        assertTrue(router.route(nav, start, middle, true, 1920, 1080).point != null)
++        val end = router.route(nav, start - 300, middle, false, 1920, 1080)
++        assertTrue(end.point != null)
++        assertNull(end.page)
++    }
++
++    @Test
++    fun geometryChangeCancelsCapturedSourceAndLocalTap() {
++        val l = base()
++        val router = DashboardTouchRouter()
++        router.route(l, l.video.left, l.video.top, true, 1920, 1080)
++        val home = l.withPage(ProjectionPage.HOME)
++        val cancel = router.route(home, home.workspace.left, home.workspace.top, false, 1920, 1080)
++        assertTrue(cancel.cancelSource)
++        assertNull(cancel.page)
++        val r = l.dock.first().second
++        router.route(l, r.left, r.top, true, 1920, 1080)
++        val local = router.route(home, r.left, r.top, false, 1920, 1080)
++        assertFalse(local.cancelSource)
++        assertNull(local.page)
++    }
++
++    @Test
++    fun randomFocusTargetsStayInCorrectDirectionAndNeverEnterVideo() {
++        val random = Random(37)
++        var checked = 0
++        repeat(3000) {
++            val w = random.nextInt(640, 2561)
++            val h = random.nextInt(360, 1081)
++            if (!ProjectedDashboardLayout.supports(w, h)) return@repeat
++            val l = ProjectedDashboardLayout(w, h, 1920, 1080, true, shell = true)
++                .withPage(ProjectionPage.entries.random(random))
++            val targets = ProjectionFocus.targets(l)
++            for (origin in targets) {
++                for (direction in ProjectionDirection.entries) {
++                    val next = requireNotNull(ProjectionFocus.move(l, origin, direction))
++                    assertTrue(next in targets)
++                    if (next != origin) {
++                        val a = origin.bounds
++                        val b = next.bounds
++                        val dx = b.left + b.right - a.left - a.right
++                        val dy = b.top + b.bottom - a.top - a.bottom
++                        assertTrue(when (direction) {
++                            ProjectionDirection.UP -> dy < 0
++                            ProjectionDirection.DOWN -> dy > 0
++                            ProjectionDirection.LEFT -> dx < 0
++                            ProjectionDirection.RIGHT -> dx > 0
++                        })
++                    }
++                    checked++
++                }
++            }
++        }
++        assertTrue(checked > 30000)
++        assertTrue(ProjectionFocus.targets(ProjectedDashboardLayout(1280, 720, 1920, 1080)).isEmpty())
++        println("Random directional focus checks: $checked")
++    }
++}

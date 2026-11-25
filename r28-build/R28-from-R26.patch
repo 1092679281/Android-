@@ -1,0 +1,2265 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,34 @@
+ 
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
++
++## [v0.1.15-test.1] - 2026-11-25
++
++> R28 — UI review candidate; full Android compilation and device verification pending.
++
++### English
++- Harden dock geometry, animation interruption, window lifecycle, snackbar replacement and landscape overflow handling.
++- Improve accessible tab labels, equal tab sizes and tint state restoration; keep retry actions usable.
++- Include an independent CI build gate and an original-signer verification script. No protocol or media changes.
++
++### 简体中文
++- 加固导航重排、动画中断、弹窗生命周期、提示消息替换与横屏溢出处理。
++- 改善标签无障碍语义、等高布局和着色恢复；保留弹窗重试能力。
++- 新增独立 CI 构建验证及原签名脚本；未修改连接协议及媒体模块，待 Android 编译与真机验证。
++
++## [v0.1.14-test.1] - 2026-11-25
++
++> R27 — iOS 27-inspired Android UI refresh; not an Apple implementation. Source-only, pending Android build/device verification.
++
++### English
++- Introduce a floating glass-style dock with animated selection and adjustable tint; preserve navigation destinations.
++- Refresh shared palettes, rounded surfaces, typography, switches, dialog transitions, and press/expand feedback.
++- Keep R26 connection, media and protocol code unchanged.
++
++### 简体中文
++- 新增悬浮玻璃风格导航、选中胶囊滑动动画及着色调节，原有三个页面入口保留。
++- 更新浅深色令牌、圆角、字体层级、开关、弹窗及按压/展开动效。
++- 保持 R26 连接、媒体和协议源码不变；本次仅源码静态验证，待编译及真机验证。
+ 
+ ## [v0.1.13-test.1] - 2026-11-25
+ 
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.13"
++val appVersionName = "0.1.15"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+--- a/app/src/main/java/com/mcarplay/app/MainActivity.kt
++++ b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+@@ -68,7 +68,10 @@
+ import com.mcarplay.app.ui.ScreenDimmer
+ import com.mcarplay.app.ui.TargetPickerController
+ import com.mcarplay.app.ui.WhatsNewDialog
++import com.mcarplay.app.ui.kit.GlassDock
+ import com.mcarplay.app.ui.kit.StepperView
++import com.mcarplay.app.ui.kit.UiLayoutPolicy
++import com.mcarplay.app.ui.kit.UiMotion
+ import com.mcarplay.app.update.WhatsNew
+ import com.mcarplay.app.util.Bg
+ import com.mcarplay.app.util.DeviceIdentity
+@@ -908,9 +911,35 @@
+         EdgeToEdge.enable(this)
+         val pageColumn = findViewById<View>(R.id.pageColumn)
+         val tabBar = findViewById<View>(R.id.tabBar)
++        val toast = findViewById<View>(R.id.snackbar)
++        fun positionToast(dockHeight: Int) {
++            val params = toast.layoutParams as FrameLayout.LayoutParams
++            val margin = dockHeight + (8 * resources.displayMetrics.density).toInt()
++            if (params.bottomMargin != margin) {
++                params.bottomMargin = margin
++                toast.layoutParams = params
++            }
++        }
++        tabBar.addOnLayoutChangeListener { _, _, top, _, bottom, _, _, _, _ ->
++            positionToast(bottom - top)
++        }
+         EdgeToEdge.onInsets(findViewById(android.R.id.content)) {
++            val sideInsetsChanged = pageColumn.paddingLeft != it.left || pageColumn.paddingRight != it.right
+             pageColumn.setPadding(it.left, it.top, it.right, 0)
++            if (sideInsetsChanged && findViewById<View>(R.id.heroCard).parent === findViewById<View>(R.id.contentArea)) {
++                applyContentLayout(true)
++            }
+             tabBar.setPadding(0, 0, 0, it.bottom)
++            val params = toast.layoutParams as FrameLayout.LayoutParams
++            val side = (18 * resources.displayMetrics.density).toInt()
++            val left = it.left + side
++            val right = it.right + side
++            if (params.leftMargin != left || params.rightMargin != right) {
++                // Resolve absolute safe areas instead of carrying relative XML margins into RTL.
++                params.marginStart = if (toast.layoutDirection == View.LAYOUT_DIRECTION_RTL) right else left
++                params.marginEnd = if (toast.layoutDirection == View.LAYOUT_DIRECTION_RTL) left else right
++                toast.layoutParams = params
++            }
+         }
+         // 旋转/重建：沿用原倒计时截止时刻（onResume 据此续弹）
+         disclaimerDeadlineAt = savedInstanceState?.getLong(KEY_DISCLAIMER_DEADLINE, 0L) ?: 0L
+@@ -937,6 +966,8 @@
+         ctaLabel = findViewById(R.id.ctaLabel)
+         audioTag = findViewById(R.id.audioTag)
+         readyCount = findViewById(R.id.readyCount)
++        currentTab = savedInstanceState?.getInt("glass.currentTab", 0)?.coerceIn(0, 2) ?: 0
++        setupGlassAppearance()
+         setupTabs()
+         readyBody = findViewById(R.id.readyBody)
+         readyChevron = findViewById(R.id.readyChevron)
+@@ -1084,10 +1115,21 @@
+         val startLandscape =
+             resources.configuration.orientation ==
+                 android.content.res.Configuration.ORIENTATION_LANDSCAPE
++        val contentArea = findViewById<FrameLayout>(R.id.contentArea)
++        val hero = findViewById<View>(R.id.heroCard)
++        fun checkHeroFits() {
++            contentArea.post {
++                if (!isFinishing && !isDestroyed && hero.parent === contentArea && hero.isShown &&
++                    contentArea.height > 0 && hero.height >= contentArea.height
++                ) {
++                    // Short landscape / large text: keep the primary action reachable by scrolling.
++                    applyContentLayout(false)
++                }
++            }
++        }
++        contentArea.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> checkHeroFits() }
++        hero.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> checkHeroFits() }
+         applyContentLayout(startLandscape)
+-        findViewById<android.widget.FrameLayout>(R.id.contentArea).post {
+-            if (!isFinishing && !isDestroyed) applyContentLayout(startLandscape)
+-        }
+ 
+         // 免责声明：未接受当前版本时强制弹（不可取消、需倒计时 + 滑到底）。
+         // savedState 非空（旋转/重建）时复用原截止时刻，不重新计时。
+@@ -1490,12 +1532,7 @@
+     ) {
+         findViewById<View>(headerId).setOnClickListener {
+             val opening = body.visibility != View.VISIBLE
+-            body.visibility = if (opening) View.VISIBLE else View.GONE
+-            chevron
+-                .animate()
+-                .rotation(if (opening) 180f else 0f)
+-                .setDuration(250L)
+-                .start()
++            UiMotion.expand(body, chevron, opening)
+         }
+     }
+ 
+@@ -1522,6 +1559,7 @@
+             if (s == HeroState.CONNECTED) connectedAt = SystemClock.elapsedRealtime()
+             heroState = s
+             applyHeroState(s)
++            UiMotion.reveal(heroStateText, 4)
+         }
+         // 连接中：副标题跟随阶段提示（英雄卡内即可见，不必划到底部看日志）
+         if (s == HeroState.CONNECTING) {
+@@ -1944,13 +1982,50 @@
+     private fun setupTabs() {
+         val tabs = intArrayOf(R.id.tabConnect, R.id.tabSettings, R.id.tabDiagnostics)
+         tabs.forEachIndexed { index, id -> findViewById<View>(id).setOnClickListener { setTab(index) } }
+-        setTab(currentTab)
+-    }
+-
+-    private fun setTab(index: Int) {
++        setTab(currentTab, animate = false)
++    }
++
++    private fun setupGlassAppearance() {
++        val prefs = getSharedPreferences("ui_appearance", MODE_PRIVATE)
++        val dock = findViewById<GlassDock>(R.id.glassDock)
++        val label = findViewById<TextView>(R.id.glassTintLabel)
++        val slider = findViewById<android.widget.SeekBar>(R.id.glassTintSlider)
++        fun render(value: Int) {
++            dock.setGlassTint(value)
++            label.text = getString(R.string.ui_glass_tint, value)
++        }
++        slider.progress = prefs.getInt("dock_tint", 65).coerceIn(0, 100)
++        render(slider.progress)
++        slider.setOnSeekBarChangeListener(
++            object : android.widget.SeekBar.OnSeekBarChangeListener {
++                override fun onProgressChanged(bar: android.widget.SeekBar, progress: Int, fromUser: Boolean) {
++                    render(progress)
++                    if (fromUser) prefs.edit().putInt("dock_tint", progress).apply()
++                }
++
++                override fun onStartTrackingTouch(bar: android.widget.SeekBar) = Unit
++
++                override fun onStopTrackingTouch(bar: android.widget.SeekBar) = Unit
++            },
++        )
++    }
++
++    private fun setTab(
++        index: Int,
++        animate: Boolean = true,
++    ) {
++        val pages = intArrayOf(R.id.mainScroll, R.id.settingsScroll, R.id.diagnosticsScroll)
++        if (index !in pages.indices) return
++        val changed = currentTab != index
+         currentTab = index
+-        val pages = intArrayOf(R.id.mainScroll, R.id.settingsScroll, R.id.diagnosticsScroll)
+-        pages.forEachIndexed { i, id -> findViewById<View>(id).visibility = if (i == index) View.VISIBLE else View.GONE }
++        pages.forEachIndexed { i, id ->
++            val page = findViewById<View>(id)
++            page.animate().cancel()
++            page.alpha = 1f
++            page.translationY = 0f
++            page.visibility = if (i == index) View.VISIBLE else View.GONE
++        }
++        findViewById<GlassDock>(R.id.glassDock).select(index, animate && changed)
+         listOf(R.id.tabConnect, R.id.tabSettings, R.id.tabDiagnostics).forEachIndexed { i, id ->
+             findViewById<View>(id).isSelected = i == index
+         }
+@@ -1958,15 +2033,15 @@
+         findViewById<View>(R.id.heroCard).visibility = if (index == 0) View.VISIBLE else View.GONE
+         // 用户可能刚从系统设置返回：进入诊断页时刷新授权状态。
+         if (index == 2) updateNotificationAccessRow()
++        if (animate && changed) {
++            findViewById<View>(listOf(R.id.tabConnect, R.id.tabSettings, R.id.tabDiagnostics)[index])
++                .performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
++            UiMotion.reveal(findViewById<View>(pages[index]))
++        }
+     }
+ 
+     private fun setReadyExpanded(expanded: Boolean) {
+-        readyBody.visibility = if (expanded) View.VISIBLE else View.GONE
+-        readyChevron
+-            .animate()
+-            .rotation(if (expanded) 180f else 0f)
+-            .setDuration(250L)
+-            .start()
++        UiMotion.expand(readyBody, readyChevron, expanded)
+     }
+ 
+     /** 「本机蓝牙地址」行：只读缓存/本地记录；Shizuku 就绪但尚未读取时在后台读一次再刷新。 */
+@@ -2074,29 +2149,41 @@
+         )
+ 
+     private var snackRunnable: Runnable? = null
++    private var snackGeneration = 0L
+ 
+     /** 自绘 M3 Snackbar（底部反色胶囊，替代 Toast）。 */
+     private fun snack(
+         message: String,
+         durationMs: Long = 2_400L,
+     ) {
++        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
++            mainHandler.post { snack(message, durationMs) }
++            return
++        }
++        if (isFinishing || isDestroyed || !::snackbar.isInitialized) return
++        val generation = ++snackGeneration
++        snackRunnable?.let { mainHandler.removeCallbacks(it) }
++        snackbar.animate().cancel()
+         snackbar.text = message
+         snackbar.visibility = View.VISIBLE
+-        snackbar.translationY = snackbar.height + 60f
+-        snackbar
+-            .animate()
+-            .translationY(0f)
+-            .setDuration(260L)
+-            .start()
+-        snackRunnable?.let { mainHandler.removeCallbacks(it) }
++        UiMotion.reveal(snackbar, 16)
+         snackRunnable =
+             Runnable {
+-                snackbar
+-                    .animate()
+-                    .translationY(snackbar.height + 60f)
+-                    .setDuration(260L)
+-                    .withEndAction { snackbar.visibility = View.GONE }
+-                    .start()
++                if (generation != snackGeneration || isFinishing || isDestroyed) return@Runnable
++                snackRunnable = null
++                if (android.animation.ValueAnimator.areAnimatorsEnabled()) {
++                    snackbar
++                        .animate()
++                        .alpha(0f)
++                        .translationY(16 * resources.displayMetrics.density)
++                        .setDuration(180L)
++                        .withEndAction {
++                            if (generation == snackGeneration) snackbar.visibility = View.GONE
++                        }
++                        .start()
++                } else {
++                    snackbar.visibility = View.GONE
++                }
+             }.also { mainHandler.postDelayed(it, durationMs) }
+     }
+ 
+@@ -2368,6 +2455,7 @@
+     override fun onSaveInstanceState(outState: Bundle) {
+         super.onSaveInstanceState(outState)
+         outState.putLong(KEY_DISCLAIMER_DEADLINE, disclaimerDeadlineAt)
++        outState.putInt("glass.currentTab", currentTab)
+     }
+ 
+     /**
+@@ -2408,11 +2496,13 @@
+         val detail = findViewById<android.widget.LinearLayout>(R.id.detailColumn)
+         val density = resources.displayMetrics.density
+         val gap = (12 * density).toInt()
+-        val padTop = ((if (landscape) 12 else 20) * density).toInt()
+-        val padBottom = ((if (landscape) 12 else 16) * density).toInt()
+-        hero.setPadding(hero.paddingStart, padTop, hero.paddingEnd, padBottom)
++        val config = resources.configuration
++        val fixedHero = UiLayoutPolicy.useFixedHero(landscape, config.screenHeightDp, config.fontScale)
++        val padTop = ((if (fixedHero) 12 else 20) * density).toInt()
++        val padBottom = ((if (fixedHero) 12 else 16) * density).toInt()
++        hero.setPaddingRelative(hero.paddingStart, padTop, hero.paddingEnd, padBottom)
+         row.orientation = android.widget.LinearLayout.VERTICAL
+-        if (landscape) {
++        if (fixedHero) {
+             if (hero.parent === row) {
+                 row.removeView(hero)
+                 contentArea.addView(hero)
+@@ -2422,8 +2512,9 @@
+             // 副标题被挤成三行，真机截图暴露）。
+             val pagePadding =
+                 (16 * resources.displayMetrics.density * 2).toInt()
++            val page = findViewById<View>(R.id.pageColumn)
+             val available =
+-                (resources.displayMetrics.widthPixels - pagePadding).coerceAtLeast(1)
++                (resources.displayMetrics.widthPixels - pagePadding - page.paddingLeft - page.paddingRight).coerceAtLeast(1)
+             val heroWidth = (available * 0.46f).toInt().coerceAtLeast(1)
+             // 高度必须 WRAP_CONTENT：FrameLayout 会把 MATCH_PARENT/WRAP 视作铺满，
+             // 铺满会把按钮顶到卡片底缘、副标题挤成三行（真机截图暴露）
+@@ -2434,7 +2525,7 @@
+                         android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+                     ).apply { gravity = android.view.Gravity.START or android.view.Gravity.TOP }
+             // 右侧内容让出英雄卡宽度（含间距）：滚动条仍在屏幕右缘
+-            scroll.setPadding(heroWidth + gap, scroll.paddingTop, scroll.paddingEnd, scroll.paddingBottom)
++            scroll.setPaddingRelative(heroWidth + gap, scroll.paddingTop, 0, scroll.paddingBottom)
+             (detail.layoutParams as android.widget.LinearLayout.LayoutParams).apply {
+                 width = android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                 weight = 0f
+@@ -2457,7 +2548,7 @@
+                 topMargin = gap
+                 marginEnd = 0
+             }
+-            scroll.setPadding(0, scroll.paddingTop, scroll.paddingEnd, scroll.paddingBottom)
++            scroll.setPaddingRelative(0, scroll.paddingTop, 0, scroll.paddingBottom)
+             (detail.layoutParams as android.widget.LinearLayout.LayoutParams).apply {
+                 width = android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                 weight = 0f
+@@ -2477,6 +2568,10 @@
+     }
+ 
+     override fun onDestroy() {
++        ++snackGeneration
++        snackRunnable?.let { mainHandler.removeCallbacks(it) }
++        snackRunnable = null
++        if (::snackbar.isInitialized) snackbar.animate().cancel()
+         super.onDestroy()
+         receiverDetectionDialog?.dismiss()
+         // 强制声明不得随 Activity 销毁残留窗口（旋转时 Activity 重建，onResume 会续弹）
+--- a/app/src/main/java/com/mcarplay/app/legal/DisclaimerDialog.kt
++++ b/app/src/main/java/com/mcarplay/app/legal/DisclaimerDialog.kt
+@@ -165,6 +165,7 @@
+             // 宽度 92%、高度 78% 屏高；登记后旋转时由 Activity 调 resizeShowing 重算
+             PanelWindow.apply(dialog, activity, WINDOW_HEIGHT_FRACTION)
+         }
++        dialog.window?.setWindowAnimations(R.style.Animation_Ui_Dialog)
+         dialog.show()
+         return dialog
+     }
+--- a/app/src/main/java/com/mcarplay/app/ui/BtIdentityDialog.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/BtIdentityDialog.kt
+@@ -145,6 +145,7 @@
+             onChanged()
+         }
+         dialog.setOnShowListener { PanelWindow.apply(dialog, activity) }
++        dialog.window?.setWindowAnimations(R.style.Animation_Ui_Dialog)
+         dialog.show()
+         return dialog
+     }
+--- a/app/src/main/java/com/mcarplay/app/ui/DarkMessageDialog.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/DarkMessageDialog.kt
+@@ -112,6 +112,7 @@
+             PanelWindow.apply(dialog, activity, onResize = clampBody)
+             clampBody(activity)
+         }
++        dialog.window?.setWindowAnimations(R.style.Animation_Ui_Dialog)
+         dialog.show()
+         return dialog
+     }
+@@ -126,7 +127,9 @@
+     ): TextView =
+         TextView(activity).apply {
+             text = action.label
+-            textSize = 13f
++            textSize = 15f
++            minimumHeight = (48 * density).toInt()
++            stateListAnimator = android.animation.AnimatorInflater.loadStateListAnimator(activity, R.animator.ui_press_scale_small)
+             setTypeface(typeface, android.graphics.Typeface.BOLD)
+             gravity = Gravity.CENTER
+             val padH = (16 * density).toInt()
+@@ -175,8 +178,9 @@
+                 } else {
+                     LinearLayout
+                         .LayoutParams(
++                            0,
+                             ViewGroup.LayoutParams.WRAP_CONTENT,
+-                            ViewGroup.LayoutParams.WRAP_CONTENT,
++                            1f,
+                         ).apply {
+                             // 横排：首项贴右缘，后续各项之间留 6dp
+                             if (!isFirst) marginStart = (6 * density).toInt()
+@@ -184,7 +188,7 @@
+                 }
+             setOnClickListener {
+                 // 防连点：回调里通常要跳转/重开流程/写系统设置
+-                isEnabled = false
++                if (action.dismissOnClick) isEnabled = false
+                 onClick()
+             }
+         }
+--- a/app/src/main/java/com/mcarplay/app/ui/PanelWindow.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/PanelWindow.kt
+@@ -2,6 +2,7 @@
+ 
+ import android.app.Activity
+ import android.app.Dialog
++import android.view.View
+ import android.view.ViewGroup
+ import androidx.appcompat.app.AlertDialog
+ import java.lang.ref.WeakReference
+@@ -19,6 +20,7 @@
+ 
+     private data class Entry(
+         val dialog: WeakReference<AlertDialog>,
++        val owner: WeakReference<Activity>,
+         /** null = WRAP_CONTENT（短弹窗贴合内容）。 */
+         val heightFraction: Float?,
+         /** 旋转后额外重算（例如正文滚动区按新屏高重新夹紧）。 */
+@@ -41,7 +43,7 @@
+     ) {
+         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
+         sizeTo(dialog, activity, heightFraction)
+-        register(dialog, heightFraction, onResize)
++        register(dialog, activity, heightFraction, onResize)
+     }
+ 
+     /** 屏幕方向/尺寸变化后重算所有仍在显示的弹窗。 */
+@@ -49,6 +51,7 @@
+         showing.removeAll { it.dialog.get()?.isShowing != true }
+         showing.forEach { entry ->
+             val dialog = entry.dialog.get() ?: return@forEach
++            if (entry.owner.get() !== activity) return@forEach
+             sizeTo(dialog, activity, entry.heightFraction)
+             entry.onResize?.invoke(activity)
+         }
+@@ -56,11 +59,24 @@
+ 
+     private fun register(
+         dialog: AlertDialog,
++        activity: Activity,
+         heightFraction: Float?,
+         onResize: ((Activity) -> Unit)?,
+     ) {
+         showing.removeAll { it.dialog.get() == null || it.dialog.get() == dialog }
+-        showing.add(Entry(WeakReference(dialog), heightFraction, onResize))
++        if (!dialog.isShowing) return
++        val entry = Entry(WeakReference(dialog), WeakReference(activity), heightFraction, onResize)
++        showing.add(entry)
++        dialog.window?.decorView?.addOnAttachStateChangeListener(
++            object : View.OnAttachStateChangeListener {
++                override fun onViewAttachedToWindow(v: View) = Unit
++
++                override fun onViewDetachedFromWindow(v: View) {
++                    showing.remove(entry)
++                    v.removeOnAttachStateChangeListener(this)
++                }
++            },
++        )
+     }
+ 
+     private fun sizeTo(
+--- a/app/src/main/java/com/mcarplay/app/ui/ReceiverDetectionDialog.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/ReceiverDetectionDialog.kt
+@@ -271,6 +271,7 @@
+         }
+         dialog.setOnDismissListener { handler.removeCallbacks(tick) }
+         dialog.setOnShowListener { handler.post(tick) }
++        dialog.window?.setWindowAnimations(R.style.Animation_Ui_Dialog)
+         dialog.show()
+         PanelWindow.apply(dialog, activity, heightFraction = 0.9f)
+         return dialog
+--- a/app/src/main/java/com/mcarplay/app/ui/TargetPickerController.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/TargetPickerController.kt
+@@ -134,6 +134,7 @@
+             val width = (activity.resources.displayMetrics.widthPixels * PanelWindow.WIDTH_FRACTION).toInt()
+             dialog.window?.setLayout(width, android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+         }
++        dialog.window?.setWindowAnimations(R.style.Animation_Ui_Dialog)
+         dialog.show()
+         startTargetScan(dialog)
+     }
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/ui/kit/GlassDock.kt
+@@ -0,0 +1,141 @@
++package com.mcarplay.app.ui.kit
++
++import android.animation.ValueAnimator
++import android.content.Context
++import android.graphics.Canvas
++import android.graphics.Paint
++import android.graphics.RectF
++import android.graphics.drawable.GradientDrawable
++import android.util.AttributeSet
++import android.view.View
++import android.view.animation.PathInterpolator
++import android.widget.LinearLayout
++import androidx.core.graphics.ColorUtils
++import com.mcarplay.app.R
++
++/** Floating navigation. The lens slides between actual child bounds, including RTL and rotation. */
++class GlassDock
++    @JvmOverloads
++    constructor(
++        context: Context,
++        attrs: AttributeSet? = null,
++    ) : LinearLayout(context, attrs) {
++        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
++        private val lens = RectF()
++        private var selectedIndex = 0
++        private var motion: ValueAnimator? = null
++        private var tint = -1
++        private val targetBounds = RectF()
++
++        init {
++            setWillNotDraw(false)
++            clipToPadding = false
++            setGlassTint(65)
++        }
++
++        fun setGlassTint(value: Int) {
++            val next = value.coerceIn(0, 100)
++            if (tint == next) return
++            tint = next
++            val solid = context.getColor(R.color.ui_card)
++            val surface = context.getColor(R.color.ui_glass_surface)
++            val light = ColorUtils.blendARGB(surface, solid, tint / 100f)
++            val shade = ColorUtils.blendARGB(context.getColor(R.color.ui_glass_shade), solid, tint / 100f)
++            background =
++                GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(light, shade)).apply {
++                    cornerRadius = context.dp(32).toFloat()
++                    setStroke(context.dp(1).coerceAtLeast(1), context.getColor(R.color.ui_glass_edge))
++                }
++            invalidate()
++        }
++
++        fun select(
++            index: Int,
++            animate: Boolean,
++        ) {
++            if (index !in 0 until childCount) return
++            selectedIndex = index
++            stopMotion()
++            val child = getChildAt(index)
++            if (!isLaidOut || child.width == 0) return
++            val target = bounds(child)
++            targetBounds.set(target)
++            if (!animate || !isShown || !isAttachedToWindow || !ValueAnimator.areAnimatorsEnabled() || lens.isEmpty) {
++                lens.set(target)
++                invalidate()
++                return
++            }
++            val start = RectF(lens)
++            motion =
++                ValueAnimator.ofFloat(0f, 1f).apply {
++                    duration = 320L
++                    interpolator = PathInterpolator(0.22f, 0.9f, 0.25f, 1f)
++                    addUpdateListener {
++                        val f = it.animatedFraction
++                        lens.set(
++                            start.left + (target.left - start.left) * f,
++                            start.top + (target.top - start.top) * f,
++                            start.right + (target.right - start.right) * f,
++                            start.bottom + (target.bottom - start.bottom) * f,
++                        )
++                        invalidate()
++                    }
++                    start()
++                }
++        }
++
++        private fun stopMotion() {
++            motion?.cancel()
++            motion = null
++        }
++
++        private fun bounds(child: View): RectF {
++            val inset = context.dp(3).toFloat()
++            return RectF(child.left + inset, child.top + inset, child.right - inset, child.bottom - inset)
++        }
++
++        override fun onLayout(
++            changed: Boolean,
++            l: Int,
++            t: Int,
++            r: Int,
++            b: Int,
++        ) {
++            super.onLayout(changed, l, t, r, b)
++            if (selectedIndex !in 0 until childCount) return
++            val target = bounds(getChildAt(selectedIndex))
++            // Child bounds can change even when the dock's outer bounds do not.
++            if (target != targetBounds || lens.isEmpty || motion?.isRunning != true) {
++                stopMotion()
++                targetBounds.set(target)
++                lens.set(target)
++                invalidate()
++            }
++        }
++
++        override fun onDraw(canvas: Canvas) {
++            super.onDraw(canvas)
++            if (lens.isEmpty) return
++            val radius = lens.height() / 2f
++            paint.style = Paint.Style.FILL
++            paint.color = context.getColor(R.color.ui_glass_selection)
++            canvas.drawRoundRect(lens, radius, radius, paint)
++            paint.style = Paint.Style.STROKE
++            paint.strokeWidth = context.dp(1).toFloat().coerceAtLeast(1f)
++            paint.color = context.getColor(R.color.ui_glass_edge)
++            canvas.drawRoundRect(lens, radius, radius, paint)
++            paint.style = Paint.Style.FILL
++        }
++
++        override fun onAttachedToWindow() {
++            super.onAttachedToWindow()
++            select(selectedIndex, animate = false)
++        }
++
++        override fun onDetachedFromWindow() {
++            stopMotion()
++            lens.setEmpty()
++            targetBounds.setEmpty()
++            super.onDetachedFromWindow()
++        }
++    }
+--- a/app/src/main/java/com/mcarplay/app/ui/kit/SettingRow.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/kit/SettingRow.kt
+@@ -38,6 +38,7 @@
+             setPaddingRelative(pad, context.dp(8), pad, context.dp(8))
+             isClickable = true
+             isFocusable = true
++            stateListAnimator = android.animation.AnimatorInflater.loadStateListAnimator(context, R.animator.ui_press_scale)
+             foreground =
+                 RippleDrawable(
+                     ColorStateList.valueOf(context.getColor(R.color.ui_ripple)),
+--- a/app/src/main/java/com/mcarplay/app/ui/kit/StepperView.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/kit/StepperView.kt
+@@ -1,12 +1,15 @@
+ package com.mcarplay.app.ui.kit
+ 
++import android.animation.ValueAnimator
+ import android.content.Context
+ import android.graphics.Canvas
+ import android.graphics.Paint
+ import android.graphics.RectF
+ import android.util.AttributeSet
+ import android.view.View
++import android.view.animation.PathInterpolator
+ import androidx.annotation.ColorRes
++import androidx.core.graphics.ColorUtils
+ import com.mcarplay.app.R
+ import com.mcarplay.app.diagnostics.ConnectionProgress
+ 
+@@ -25,14 +28,36 @@
+         private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+         private val rect = RectF()
+         private var steps: List<ConnectionProgress.StepState> = emptyList()
+-        private val gap = context.dp(3)
+-        private val barHeight = context.dp(5)
++        private val gap = context.dp(4)
++        private val barHeight = context.dp(6)
++        private var transition: ValueAnimator? = null
++        private var previousColors = intArrayOf()
++        private var fraction = 1f
+ 
+         /** 传 null 或空表示没有进度（整条按未到达画一个占位）。 */
+         fun setSteps(value: List<ConnectionProgress.Step>?) {
+             val next = value?.map { it.state }.orEmpty()
+             if (next == steps) return
++            val before = displayStates()
++            val colors = IntArray(before.size) { index -> displayedColor(index, before[index]) }
++            transition?.cancel()
+             steps = next
++            val after = displayStates()
++            previousColors = colors
++            fraction = 1f
++            if (isShown && isAttachedToWindow && before.size == after.size && ValueAnimator.areAnimatorsEnabled()) {
++                fraction = 0f
++                transition =
++                    ValueAnimator.ofFloat(0f, 1f).apply {
++                        duration = 240L
++                        interpolator = PathInterpolator(0.22f, 0.85f, 0.25f, 1f)
++                        addUpdateListener {
++                            fraction = it.animatedValue as Float
++                            invalidate()
++                        }
++                        start()
++                    }
++            }
+             invalidate()
+         }
+ 
+@@ -43,14 +68,33 @@
+             setMeasuredDimension(getDefaultSize(suggestedMinimumWidth, widthMeasureSpec), barHeight)
+         }
+ 
++        private fun displayStates(): List<ConnectionProgress.StepState> =
++            steps.ifEmpty { ConnectionProgress.LAYERS.map { ConnectionProgress.StepState.PENDING } }
++
++        private fun displayedColor(index: Int, state: ConnectionProgress.StepState): Int {
++            val target = context.getColor(colorFor(state))
++            return if (fraction < 1f && index < previousColors.size) {
++                ColorUtils.blendARGB(previousColors[index], target, fraction)
++            } else {
++                target
++            }
++        }
++
++        override fun onDetachedFromWindow() {
++            transition?.cancel()
++            transition = null
++            fraction = 1f
++            super.onDetachedFromWindow()
++        }
++
+         override fun onDraw(canvas: Canvas) {
+-            val states = steps.ifEmpty { ConnectionProgress.LAYERS.map { ConnectionProgress.StepState.PENDING } }
++            val states = displayStates()
+             val count = states.size
+             val segment = (width - paddingLeft - paddingRight - gap * (count - 1)).toFloat() / count
+             if (segment <= 0f) return
+             val radius = barHeight / 2f
+             states.forEachIndexed { index, state ->
+-                paint.color = context.getColor(colorFor(state))
++                paint.color = displayedColor(index, state)
+                 val left = paddingLeft + index * (segment + gap)
+                 rect.set(left, 0f, left + segment, barHeight.toFloat())
+                 canvas.drawRoundRect(rect, radius, radius, paint)
+--- a/app/src/main/java/com/mcarplay/app/ui/kit/UiDialog.kt
++++ b/app/src/main/java/com/mcarplay/app/ui/kit/UiDialog.kt
+@@ -46,7 +46,7 @@
+         val root =
+             LinearLayout(activity).apply {
+                 orientation = LinearLayout.VERTICAL
+-                setBackgroundResource(R.drawable.ui_bg_card)
++                setBackgroundResource(R.drawable.bg_dialog_panel)
+                 val pad = resources.getDimensionPixelSize(R.dimen.ui_space_6)
+                 setPadding(pad, pad, pad, pad)
+                 addView(titleView, LinearLayout.LayoutParams(match, wrap))
+@@ -61,7 +61,7 @@
+                 UiButtons.create(activity, action.kind, action.label).apply {
+                     setOnClickListener {
+                         // 防连点：回调里通常要跳转或写系统设置
+-                        isEnabled = false
++                        if (action.dismissOnClick) isEnabled = false
+                         action.onClick()
+                         if (action.dismissOnClick) dialog.dismiss()
+                     }
+@@ -92,6 +92,7 @@
+             PanelWindow.apply(dialog, activity, onResize = clampBody)
+             clampBody(activity)
+         }
++        dialog.window?.setWindowAnimations(R.style.Animation_Ui_Dialog)
+         dialog.show()
+         return dialog
+     }
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/ui/kit/UiLayoutPolicy.kt
+@@ -0,0 +1,10 @@
++package com.mcarplay.app.ui.kit
++
++/** Pure policy for the fixed landscape hero; the measured overflow guard is in MainActivity. */
++internal object UiLayoutPolicy {
++    fun useFixedHero(
++        landscape: Boolean,
++        heightDp: Int,
++        fontScale: Float,
++    ): Boolean = landscape && heightDp >= 360 && fontScale <= 1.3f
++}
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/ui/kit/UiMotion.kt
+@@ -0,0 +1,63 @@
++package com.mcarplay.app.ui.kit
++
++import android.animation.ValueAnimator
++import android.transition.AutoTransition
++import android.transition.TransitionManager
++import android.view.View
++import android.view.ViewGroup
++import android.view.animation.PathInterpolator
++
++/** UI-only transitions; never defer a session action until an animation completes. */
++object UiMotion {
++    private fun ease() = PathInterpolator(0.22f, 0.85f, 0.25f, 1f)
++
++    fun reveal(
++        view: View,
++        distanceDp: Int = 8,
++    ) {
++        view.animate().cancel()
++        view.alpha = 1f
++        view.translationY = 0f
++        if (!ValueAnimator.areAnimatorsEnabled() || !view.isShown) return
++        view.alpha = 0.65f
++        view.translationY = view.context.dp(distanceDp).toFloat()
++        view.animate().alpha(1f).translationY(0f).setInterpolator(ease()).setDuration(240L).start()
++    }
++
++    fun rotate(
++        view: View,
++        expanded: Boolean,
++    ) {
++        view.animate().cancel()
++        val target = if (expanded) 180f else 0f
++        if (!ValueAnimator.areAnimatorsEnabled()) {
++            view.rotation = target
++            return
++        }
++        view.animate().rotation(target).setInterpolator(ease()).setDuration(260L).start()
++    }
++
++    fun expand(
++        body: View,
++        chevron: View,
++        expanded: Boolean,
++    ) {
++        val visibility = if (expanded) View.VISIBLE else View.GONE
++        val parent = body.parent as? ViewGroup
++        if (parent != null) {
++            // A scoped transition, not a persistent LayoutTransition reacting to every status refresh.
++            TransitionManager.endTransitions(parent)
++            if (body.visibility != visibility && parent.isShown && parent.isLaidOut && ValueAnimator.areAnimatorsEnabled()) {
++                TransitionManager.beginDelayedTransition(
++                    parent,
++                    AutoTransition().apply {
++                        setDuration(180L)
++                        setInterpolator(ease())
++                    },
++                )
++            }
++        }
++        body.visibility = visibility
++        rotate(chevron, expanded)
++    }
++}
+--- /dev/null
++++ b/app/src/main/res/anim/ui_dialog_in.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<set xmlns:android="http://schemas.android.com/apk/res/android" android:interpolator="@interpolator/ui_ease">
++    <alpha android:fromAlpha="0" android:toAlpha="1" android:duration="220" />
++    <scale android:fromXScale="0.94" android:toXScale="1" android:fromYScale="0.94" android:toYScale="1"
++        android:pivotX="50%" android:pivotY="50%" android:duration="260" />
++</set>
+--- /dev/null
++++ b/app/src/main/res/anim/ui_dialog_out.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<set xmlns:android="http://schemas.android.com/apk/res/android" android:interpolator="@interpolator/ui_ease">
++    <alpha android:fromAlpha="1" android:toAlpha="0" android:duration="160" />
++    <scale android:fromXScale="1" android:toXScale="0.97" android:fromYScale="1" android:toYScale="0.97"
++        android:pivotX="50%" android:pivotY="50%" android:duration="160" />
++</set>
+--- a/app/src/main/res/animator/ui_press_scale.xml
++++ b/app/src/main/res/animator/ui_press_scale.xml
+@@ -4,13 +4,13 @@
+     <item android:state_pressed="true">
+         <set>
+             <objectAnimator
+-                android:duration="120"
++                android:duration="100"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleX"
+                 android:valueTo="0.98"
+                 android:valueType="floatType" />
+             <objectAnimator
+-                android:duration="120"
++                android:duration="100"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleY"
+                 android:valueTo="0.98"
+@@ -20,13 +20,13 @@
+     <item>
+         <set>
+             <objectAnimator
+-                android:duration="200"
++                android:duration="240"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleX"
+                 android:valueTo="1"
+                 android:valueType="floatType" />
+             <objectAnimator
+-                android:duration="200"
++                android:duration="240"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleY"
+                 android:valueTo="1"
+--- a/app/src/main/res/animator/ui_press_scale_small.xml
++++ b/app/src/main/res/animator/ui_press_scale_small.xml
+@@ -1,32 +1,32 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<!-- 按下缩放 0.96（按钮、小控件用 ui_press_scale_small）；ObjectAnimator 自动遵从系统动画时长缩放 -->
++<!-- 按下缩放 0.97（按钮、小控件用 ui_press_scale_small）；ObjectAnimator 自动遵从系统动画时长缩放 -->
+ <selector xmlns:android="http://schemas.android.com/apk/res/android">
+     <item android:state_pressed="true">
+         <set>
+             <objectAnimator
+-                android:duration="120"
++                android:duration="100"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleX"
+-                android:valueTo="0.96"
++                android:valueTo="0.97"
+                 android:valueType="floatType" />
+             <objectAnimator
+-                android:duration="120"
++                android:duration="100"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleY"
+-                android:valueTo="0.96"
++                android:valueTo="0.97"
+                 android:valueType="floatType" />
+         </set>
+     </item>
+     <item>
+         <set>
+             <objectAnimator
+-                android:duration="200"
++                android:duration="240"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleX"
+                 android:valueTo="1"
+                 android:valueType="floatType" />
+             <objectAnimator
+-                android:duration="200"
++                android:duration="240"
+                 android:interpolator="@interpolator/ui_ease"
+                 android:propertyName="scaleY"
+                 android:valueTo="1"
+--- a/app/src/main/res/color/ui_tab_tint.xml
++++ b/app/src/main/res/color/ui_tab_tint.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <selector xmlns:android="http://schemas.android.com/apk/res/android">
+-    <item android:state_selected="true" android:color="@color/ui_accent_text" />
+-    <item android:color="@color/ui_text_secondary" />
++    <item android:state_selected="true" android:color="@color/ui_dock_selected_text" />
++    <item android:color="@color/ui_dock_text" />
+ </selector>
+--- a/app/src/main/res/drawable/bg_btn_tonal.xml
++++ b/app/src/main/res/drawable/bg_btn_tonal.xml
+@@ -4,6 +4,7 @@
+     <item>
+         <shape android:shape="rectangle">
+             <solid android:color="@color/ui_accent_tint" />
++                    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+             <corners android:radius="999dp" />
+         </shape>
+     </item>
+--- a/app/src/main/res/drawable/bg_chip.xml
++++ b/app/src/main/res/drawable/bg_chip.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+-    <solid android:color="@android:color/transparent" />
++    <gradient android:angle="270" android:startColor="@color/ui_glass_surface" android:endColor="@color/ui_glass_shade" />
+     <corners android:radius="999dp" />
+-    <stroke android:width="1dp" android:color="@color/ui_track" />
++    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+ </shape>
+--- a/app/src/main/res/drawable/bg_cta_fill.xml
++++ b/app/src/main/res/drawable/bg_cta_fill.xml
+@@ -11,6 +11,7 @@
+             <item>
+                 <shape android:shape="rectangle">
+                     <solid android:color="@color/ui_accent_fill" />
++                    <stroke android:width="1dp" android:color="#35FFFFFF" />
+                     <corners android:radius="999dp" />
+                 </shape>
+             </item>
+--- a/app/src/main/res/drawable/bg_cta_outline_err.xml
++++ b/app/src/main/res/drawable/bg_cta_outline_err.xml
+@@ -4,6 +4,7 @@
+     <item>
+         <shape android:shape="rectangle">
+             <solid android:color="@color/ui_error_tint" />
++                    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+             <corners android:radius="999dp" />
+         </shape>
+     </item>
+--- a/app/src/main/res/drawable/bg_dialog_panel.xml
++++ b/app/src/main/res/drawable/bg_dialog_panel.xml
+@@ -1,5 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+     <solid android:color="@color/ui_card" />
+-    <corners android:radius="@dimen/ui_radius_card" />
++    <corners android:radius="30dp" />
++    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+ </shape>
+--- a/app/src/main/res/drawable/bg_hero.xml
++++ b/app/src/main/res/drawable/bg_hero.xml
+@@ -1,5 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+-    <solid android:color="@color/ui_card" />
++    <gradient android:angle="270" android:startColor="@color/ui_card" android:endColor="@color/ui_hero_end" />
+     <corners android:radius="@dimen/ui_radius_card" />
++    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+ </shape>
+--- a/app/src/main/res/drawable/bg_icon_tile.xml
++++ b/app/src/main/res/drawable/bg_icon_tile.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+-    <solid android:color="@color/ui_field" />
+-    <corners android:radius="12dp" />
++    <gradient android:angle="270" android:startColor="@color/ui_glass_icon" android:endColor="@color/ui_field" />
++    <corners android:radius="13dp" />
+ </shape>
+--- /dev/null
++++ b/app/src/main/res/drawable/bg_ios_canvas.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
++    <gradient android:angle="270" android:startColor="@color/ui_bg" android:endColor="@color/ui_canvas_end" />
++</shape>
+--- a/app/src/main/res/drawable/bg_segment.xml
++++ b/app/src/main/res/drawable/bg_segment.xml
+@@ -3,5 +3,5 @@
+ <shape xmlns:android="http://schemas.android.com/apk/res/android"
+     android:shape="rectangle">
+     <solid android:color="@color/ui_track" />
+-    <corners android:radius="8dp" />
++    <corners android:radius="999dp" />
+ </shape>
+--- a/app/src/main/res/drawable/bg_segment_sel.xml
++++ b/app/src/main/res/drawable/bg_segment_sel.xml
+@@ -3,5 +3,5 @@
+ <shape xmlns:android="http://schemas.android.com/apk/res/android"
+     android:shape="rectangle">
+     <solid android:color="@color/ui_accent_fill" />
+-    <corners android:radius="8dp" />
++    <corners android:radius="999dp" />
+ </shape>
+--- a/app/src/main/res/drawable/ui_btn_danger.xml
++++ b/app/src/main/res/drawable/ui_btn_danger.xml
+@@ -11,6 +11,7 @@
+             <item>
+                 <shape android:shape="rectangle">
+                     <solid android:color="@color/ui_error_tint" />
++                    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+                     <corners android:radius="999dp" />
+                 </shape>
+             </item>
+--- a/app/src/main/res/drawable/ui_btn_primary.xml
++++ b/app/src/main/res/drawable/ui_btn_primary.xml
+@@ -11,6 +11,7 @@
+             <item>
+                 <shape android:shape="rectangle">
+                     <solid android:color="@color/ui_accent_fill" />
++                    <stroke android:width="1dp" android:color="#35FFFFFF" />
+                     <corners android:radius="999dp" />
+                 </shape>
+             </item>
+--- a/app/src/main/res/drawable/ui_btn_secondary.xml
++++ b/app/src/main/res/drawable/ui_btn_secondary.xml
+@@ -11,6 +11,7 @@
+             <item>
+                 <shape android:shape="rectangle">
+                     <solid android:color="@color/ui_accent_tint" />
++                    <stroke android:width="1dp" android:color="@color/ui_glass_edge" />
+                     <corners android:radius="999dp" />
+                 </shape>
+             </item>
+--- a/app/src/main/res/drawable/ui_sw_thumb.xml
++++ b/app/src/main/res/drawable/ui_sw_thumb.xml
+@@ -2,7 +2,7 @@
+ <!-- 开关滑块：27dp 白色圆，外留 2dp 与轨道边缘的间距，细描边让它在白卡片上仍可辨 -->
+ <inset xmlns:android="http://schemas.android.com/apk/res/android" android:inset="2dp">
+     <shape android:shape="oval">
+-        <solid android:color="#FFFFFF" />
++        <gradient android:angle="270" android:startColor="#FFFFFF" android:endColor="#F1F2F6" />
+         <stroke android:width="0.5dp" android:color="#29000000" />
+         <size android:width="27dp" android:height="27dp" />
+     </shape>
+--- a/app/src/main/res/interpolator/ui_ease.xml
++++ b/app/src/main/res/interpolator/ui_ease.xml
+@@ -1,7 +1,7 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<!-- cubic-bezier(0.25, 0.1, 0.25, 1)：Apple 风格的缓动，不做回弹 -->
++<!-- cubic-bezier(0.22, 0.85, 0.25, 1)：Apple 风格的缓动，不做回弹 -->
+ <pathInterpolator xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:controlX1="0.25"
+-    android:controlY1="0.1"
++    android:controlX1="0.22"
++    android:controlY1="0.85"
+     android:controlX2="0.25"
+     android:controlY2="1" />
+--- a/app/src/main/res/layout/activity_btsnoop.xml
++++ b/app/src/main/res/layout/activity_btsnoop.xml
+@@ -4,7 +4,7 @@
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+-    android:background="@color/m3_surface"
++    android:background="@drawable/bg_ios_canvas"
+     android:fillViewport="true">
+ 
+     <LinearLayout
+@@ -25,8 +25,8 @@
+ 
+             <ImageView
+                 android:id="@+id/btsnoopBack"
+-                android:layout_width="40dp"
+-                android:layout_height="40dp"
++                android:layout_width="48dp"
++                android:layout_height="48dp"
+                 android:background="@drawable/bg_ripple_circle"
+                 android:contentDescription="@string/update_back"
+                 android:padding="8dp"
+@@ -39,7 +39,7 @@
+                 android:layout_marginStart="8dp"
+                 android:text="@string/btsnoop_title"
+                 android:textColor="@color/m3_on_surface"
+-                android:textSize="22sp"
++                android:textSize="26sp"
+                 android:textStyle="bold" />
+         </LinearLayout>
+ 
+--- a/app/src/main/res/layout/activity_main.xml
++++ b/app/src/main/res/layout/activity_main.xml
+@@ -7,13 +7,14 @@
+     xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+-    android:background="@color/ui_bg">
++    android:background="@drawable/bg_ios_canvas">
+ 
+     <!-- 页面竖向容器：顶部栏固定，内容区（contentArea）占满剩余高度。
+          横屏时英雄卡会被移入 contentArea 左缘固定显示，滚动只作用于右栏
+          （见 MainActivity.applyContentLayout）——英雄卡不随右侧列表滚走。 -->
+     <LinearLayout
+         android:id="@+id/pageColumn"
++        android:clipChildren="false"
+         android:layout_width="match_parent"
+         android:layout_height="match_parent"
+         android:orientation="vertical">
+@@ -39,7 +40,8 @@
+                         android:layout_height="wrap_content"
+                         android:text="@string/app_name"
+                         android:textColor="@color/ui_text"
+-                        android:textSize="26sp"
++                        android:textSize="32sp"
++                        android:letterSpacing="-0.025"
+                         android:textStyle="bold" />
+ 
+                     <TextView
+@@ -58,8 +60,8 @@
+                 <TextView
+                     android:id="@+id/shizukuChip"
+                     android:layout_width="wrap_content"
+-                    android:layout_height="40dp"
+-                    android:minHeight="40dp"
++                    android:layout_height="wrap_content"
++                    android:minHeight="44dp"
+                     android:background="@drawable/bg_chip"
+                     android:drawableStart="@drawable/ic_dot_small"
+                     android:drawablePadding="6dp"
+@@ -67,7 +69,7 @@
+                     android:paddingStart="12dp"
+                     android:paddingEnd="12dp"
+                     android:text="@string/main_shizuku_chip_online"
+-                    android:textColor="@color/m3_on_var"
++                    android:textColor="@color/ui_dock_text"
+                     android:textSize="11.5sp"
+                     android:textStyle="bold" />
+             </LinearLayout>
+@@ -113,6 +115,7 @@
+                     android:layout_height="wrap_content"
+                     android:layout_marginTop="12dp"
+                     android:background="@drawable/bg_hero"
++                    android:elevation="1dp"
+                     android:gravity="center_horizontal"
+                 android:orientation="vertical"
+                 android:paddingStart="20dp"
+@@ -174,7 +177,7 @@
+                 <ProgressBar
+                     android:id="@+id/heroProgress"
+                     style="@android:style/Widget.Material.ProgressBar.Horizontal"
+-                    android:layout_width="250dp"
++                    android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:layout_marginTop="14dp"
+                     android:indeterminate="true"
+@@ -196,7 +199,11 @@
+                 <LinearLayout
+                     android:id="@+id/ctaButton"
+                     android:layout_width="match_parent"
+-                    android:layout_height="52dp"
++                    android:layout_height="wrap_content"
++                    android:minHeight="54dp"
++                    android:paddingTop="10dp"
++                    android:paddingBottom="10dp"
++                    android:stateListAnimator="@animator/ui_press_scale"
+                     android:layout_marginTop="18dp"
+                     android:background="@drawable/bg_cta_fill"
+                     android:clickable="true"
+@@ -276,6 +283,7 @@
+                     android:layout_marginTop="8dp"
+                     android:background="@drawable/bg_icon_tile"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center"
+                     android:minHeight="44dp"
+@@ -309,6 +317,7 @@
+                     android:layout_height="wrap_content"
+                     android:background="@drawable/bg_tbtn"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="48dp"
+@@ -363,6 +372,7 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -436,6 +446,7 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -604,6 +615,7 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -671,6 +683,7 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -922,8 +935,44 @@
+                 android:layout_marginTop="16dp"
+                 android:text="@string/main_tab_settings"
+                 android:textColor="@color/ui_text"
+-                android:textSize="@dimen/ui_text_title"
++                android:textSize="@dimen/ui_text_display"
+                 android:textStyle="bold" />
++
++            <LinearLayout
++                android:layout_width="match_parent"
++                android:layout_height="wrap_content"
++                android:layout_marginTop="12dp"
++                android:background="@drawable/bg_card"
++                android:orientation="vertical"
++                android:padding="16dp">
++
++                <TextView
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:text="@string/ui_glass_title"
++                    android:textColor="@color/ui_text"
++                    android:textSize="16sp"
++                    android:textStyle="bold" />
++
++                <TextView
++                    android:id="@+id/glassTintLabel"
++                    android:labelFor="@+id/glassTintSlider"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:layout_marginTop="6dp"
++                    android:textColor="@color/ui_text_secondary"
++                    android:textSize="13sp" />
++
++                <SeekBar
++                    android:id="@+id/glassTintSlider"
++                    android:layout_width="match_parent"
++                    android:layout_height="wrap_content"
++                    android:minHeight="48dp"
++                    android:max="100"
++                    android:saveEnabled="false"
++                    android:progressTint="@color/ui_accent"
++                    android:thumbTint="@color/ui_accent" />
++            </LinearLayout>
+ 
+             <!-- ==================== 车机显示 ==================== -->
+             <LinearLayout
+@@ -1015,6 +1064,7 @@
+                     android:layout_height="wrap_content"
+                     android:background="@drawable/bg_tbtn"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -1142,6 +1192,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1205,6 +1256,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1269,6 +1321,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1332,6 +1385,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1395,6 +1449,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1494,7 +1549,7 @@
+                 android:layout_marginTop="16dp"
+                 android:text="@string/main_tab_diagnostics"
+                 android:textColor="@color/ui_text"
+-                android:textSize="@dimen/ui_text_title"
++                android:textSize="@dimen/ui_text_display"
+                 android:textStyle="bold" />
+ 
+             <LinearLayout
+@@ -1523,6 +1578,7 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -1613,6 +1669,7 @@
+                     android:layout_width="match_parent"
+                     android:layout_height="wrap_content"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -1684,6 +1741,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1756,6 +1814,7 @@
+                 android:layout_marginTop="12dp"
+                 android:background="@drawable/bg_card"
+                 android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                 android:focusable="true"
+                 android:gravity="center_vertical"
+                 android:minHeight="60dp"
+@@ -1817,7 +1876,6 @@
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+                 android:layout_marginTop="12dp"
+-                android:animateLayoutChanges="true"
+                 android:background="@drawable/bg_card"
+                 android:orientation="vertical"
+                 android:paddingStart="16dp"
+@@ -1829,6 +1887,7 @@
+                     android:layout_height="wrap_content"
+                     android:background="@drawable/bg_tbtn"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -1998,7 +2057,6 @@
+                 android:layout_width="match_parent"
+                 android:layout_height="wrap_content"
+                 android:layout_marginTop="12dp"
+-                android:animateLayoutChanges="true"
+                 android:background="@drawable/bg_card"
+                 android:orientation="vertical"
+                 android:paddingStart="16dp"
+@@ -2010,6 +2068,7 @@
+                     android:layout_height="wrap_content"
+                     android:background="@drawable/bg_tbtn"
+                     android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                     android:focusable="true"
+                     android:gravity="center_vertical"
+                     android:minHeight="60dp"
+@@ -2101,6 +2160,7 @@
+                             android:layout_weight="1"
+                             android:background="@drawable/bg_btn_tonal"
+                             android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                             android:focusable="true"
+                             android:gravity="center"
+                             android:orientation="horizontal">
+@@ -2131,6 +2191,7 @@
+                             android:layout_weight="1"
+                             android:background="@drawable/bg_btn_tonal_warn"
+                             android:clickable="true"
++                    android:stateListAnimator="@animator/ui_press_scale_small"
+                             android:focusable="true"
+                             android:gravity="center"
+                             android:orientation="horizontal">
+@@ -2160,27 +2221,40 @@
+         </ScrollView>
+             </FrameLayout>
+ 
+-        <!-- 底部标签：连接 / 设置 / 诊断（见 MainActivity.setTab），通栏 -->
+-        <View
+-            android:layout_width="match_parent"
+-            android:layout_height="1dp"
+-            android:background="@color/ui_track" />
+-
+-        <LinearLayout
++        <!-- 独立的悬浮功能层：外部容器吸收系统手势区 inset。 -->
++        <FrameLayout
+             android:id="@+id/tabBar"
+             android:layout_width="match_parent"
+             android:layout_height="wrap_content"
+-            android:background="@color/ui_card"
++            android:clipChildren="false"
++            android:clipToPadding="false">
++
++        <com.mcarplay.app.ui.kit.GlassDock
++            android:id="@+id/glassDock"
++            android:layout_width="match_parent"
++            android:layout_height="wrap_content"
++            android:layout_gravity="center_horizontal"
++            android:layout_marginStart="18dp"
++            android:layout_marginEnd="18dp"
++            android:layout_marginTop="3dp"
++            android:layout_marginBottom="8dp"
++            android:elevation="5dp"
++            android:padding="4dp"
+             android:orientation="horizontal">
+ 
+         <LinearLayout
+             android:id="@+id/tabConnect"
+             android:layout_width="0dp"
+-            android:layout_height="56dp"
++            android:layout_height="match_parent"
++            android:minHeight="52dp"
++            android:paddingTop="4dp"
++            android:paddingBottom="4dp"
++            android:stateListAnimator="@animator/ui_press_scale_small"
+             android:layout_weight="1"
+             android:background="@drawable/bg_tbtn"
+             android:clickable="true"
+             android:focusable="true"
++            android:contentDescription="@string/main_tab_connect"
+             android:gravity="center"
+             android:orientation="vertical">
+ 
+@@ -2197,20 +2271,26 @@
+                 android:layout_height="wrap_content"
+                 android:layout_marginTop="2dp"
+                 android:duplicateParentState="true"
++                android:importantForAccessibility="no"
+                 android:text="@string/main_tab_connect"
+                 android:textColor="@color/ui_tab_tint"
+-                android:textSize="11sp"
++                android:textSize="12sp"
+                 android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <LinearLayout
+             android:id="@+id/tabSettings"
+             android:layout_width="0dp"
+-            android:layout_height="56dp"
++            android:layout_height="match_parent"
++            android:minHeight="52dp"
++            android:paddingTop="4dp"
++            android:paddingBottom="4dp"
++            android:stateListAnimator="@animator/ui_press_scale_small"
+             android:layout_weight="1"
+             android:background="@drawable/bg_tbtn"
+             android:clickable="true"
+             android:focusable="true"
++            android:contentDescription="@string/main_tab_settings"
+             android:gravity="center"
+             android:orientation="vertical">
+ 
+@@ -2227,20 +2307,26 @@
+                 android:layout_height="wrap_content"
+                 android:layout_marginTop="2dp"
+                 android:duplicateParentState="true"
++                android:importantForAccessibility="no"
+                 android:text="@string/main_tab_settings"
+                 android:textColor="@color/ui_tab_tint"
+-                android:textSize="11sp"
++                android:textSize="12sp"
+                 android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <LinearLayout
+             android:id="@+id/tabDiagnostics"
+             android:layout_width="0dp"
+-            android:layout_height="56dp"
++            android:layout_height="match_parent"
++            android:minHeight="52dp"
++            android:paddingTop="4dp"
++            android:paddingBottom="4dp"
++            android:stateListAnimator="@animator/ui_press_scale_small"
+             android:layout_weight="1"
+             android:background="@drawable/bg_tbtn"
+             android:clickable="true"
+             android:focusable="true"
++            android:contentDescription="@string/main_tab_diagnostics"
+             android:gravity="center"
+             android:orientation="vertical">
+ 
+@@ -2257,12 +2343,14 @@
+                 android:layout_height="wrap_content"
+                 android:layout_marginTop="2dp"
+                 android:duplicateParentState="true"
++                android:importantForAccessibility="no"
+                 android:text="@string/main_tab_diagnostics"
+                 android:textColor="@color/ui_tab_tint"
+-                android:textSize="11sp"
++                android:textSize="12sp"
+                 android:textStyle="bold" />
+         </LinearLayout>
+-        </LinearLayout>
++        </com.mcarplay.app.ui.kit.GlassDock>
++        </FrameLayout>
+         </LinearLayout>
+ 
+     <!-- Snackbar（自绘 M3 反色胶囊） -->
+@@ -2273,12 +2361,10 @@
+         android:layout_gravity="bottom"
+         android:layout_marginStart="18dp"
+         android:layout_marginEnd="18dp"
+-        android:layout_marginBottom="26dp"
++        android:layout_marginBottom="84dp"
+         android:background="@drawable/bg_card"
+         android:backgroundTint="@color/m3_inverse"
+-        android:drawableStart="@drawable/ic_check_circle_small"
+-        android:drawableTint="@color/ui_ok"
+-        android:drawablePadding="9dp"
++        android:accessibilityLiveRegion="polite"
+         android:elevation="8dp"
+         android:gravity="center_vertical"
+         android:padding="13dp"
+--- a/app/src/main/res/layout/activity_settings_content.xml
++++ b/app/src/main/res/layout/activity_settings_content.xml
+@@ -4,7 +4,7 @@
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+-    android:background="@color/ui_bg"
++    android:background="@drawable/bg_ios_canvas"
+     android:orientation="vertical">
+ 
+     <LinearLayout
+--- a/app/src/main/res/layout/activity_update.xml
++++ b/app/src/main/res/layout/activity_update.xml
+@@ -4,7 +4,7 @@
+     xmlns:app="http://schemas.android.com/apk/res-auto"
+     android:layout_width="match_parent"
+     android:layout_height="match_parent"
+-    android:background="@color/m3_surface"
++    android:background="@drawable/bg_ios_canvas"
+     android:fillViewport="true">
+ 
+     <LinearLayout
+@@ -25,8 +25,8 @@
+ 
+             <ImageView
+                 android:id="@+id/updateBack"
+-                android:layout_width="40dp"
+-                android:layout_height="40dp"
++                android:layout_width="48dp"
++                android:layout_height="48dp"
+                 android:background="@drawable/bg_ripple_circle"
+                 android:contentDescription="@string/update_back"
+                 android:padding="8dp"
+@@ -39,7 +39,7 @@
+                 android:layout_marginStart="8dp"
+                 android:text="@string/update_title"
+                 android:textColor="@color/m3_on_surface"
+-                android:textSize="22sp"
++                android:textSize="26sp"
+                 android:textStyle="bold" />
+         </LinearLayout>
+ 
+--- a/app/src/main/res/layout/dialog_disclaimer.xml
++++ b/app/src/main/res/layout/dialog_disclaimer.xml
+@@ -16,7 +16,7 @@
+         android:layout_height="wrap_content"
+         android:text="@string/main_disclaimer_title"
+         android:textColor="@color/m3_on_surface"
+-        android:textSize="17sp"
++        android:textSize="20sp"
+         android:textStyle="bold" />
+ 
+     <TextView
+@@ -67,7 +67,7 @@
+         <TextView
+             android:id="@+id/btnDecline"
+             android:layout_width="0dp"
+-            android:layout_height="44dp"
++            android:layout_height="48dp"
+             android:layout_weight="1"
+             android:background="@drawable/bg_tbtn"
+             android:gravity="center"
+@@ -79,7 +79,7 @@
+         <TextView
+             android:id="@+id/btnAccept"
+             android:layout_width="0dp"
+-            android:layout_height="44dp"
++            android:layout_height="48dp"
+             android:layout_marginStart="10dp"
+             android:layout_weight="1.4"
+             android:background="@drawable/bg_cta_fill"
+--- a/app/src/main/res/layout/dialog_message.xml
++++ b/app/src/main/res/layout/dialog_message.xml
+@@ -18,7 +18,7 @@
+         android:layout_width="match_parent"
+         android:layout_height="wrap_content"
+         android:textColor="@color/m3_on_surface"
+-        android:textSize="17sp"
++        android:textSize="20sp"
+         android:textStyle="bold" />
+ 
+     <!-- 正文：超长时滚动（最大 46% 屏高，由代码设上限），底部按钮始终可见 -->
+@@ -35,7 +35,7 @@
+             android:layout_height="wrap_content"
+             android:lineSpacingExtra="4dp"
+             android:textColor="@color/m3_on_var"
+-            android:textSize="12.5sp" />
++            android:textSize="14sp" />
+     </ScrollView>
+ 
+     <LinearLayout
+--- a/app/src/main/res/layout/dialog_target_picker.xml
++++ b/app/src/main/res/layout/dialog_target_picker.xml
+@@ -16,7 +16,7 @@
+         android:layout_height="wrap_content"
+         android:text="@string/lay_pick_target"
+         android:textColor="@color/m3_on_surface"
+-        android:textSize="17sp"
++        android:textSize="20sp"
+         android:textStyle="bold" />
+ 
+     <TextView
+--- a/app/src/main/res/layout/fragment_panel_display.xml
++++ b/app/src/main/res/layout/fragment_panel_display.xml
+@@ -1,5 +1,5 @@
+ <?xml version="1.0" encoding="utf-8"?>
+-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true" android:scrollbars="none" android:background="@color/ui_bg">
++<ScrollView xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true" android:scrollbars="none" android:background="@drawable/bg_ios_canvas">
+ 
+     <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:orientation="vertical" android:paddingLeft="16dp" android:paddingTop="12dp" android:paddingRight="16dp" android:paddingBottom="24dp">
+ 
+@@ -9,9 +9,9 @@
+ 
+         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnScreenOffOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnScreenOffOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnScreenOffOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnScreenOffOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <TextView android:id="@+id/screenOffNote" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_screen_off_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+@@ -20,9 +20,9 @@
+ 
+         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnAutoConnectOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnAutoConnectOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnAutoConnectOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnAutoConnectOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <TextView android:id="@+id/autoConnectNote" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_auto_connect_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+@@ -31,9 +31,9 @@
+ 
+         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnHidRawOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnHidRawOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnHidRawOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnHidRawOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <TextView android:id="@+id/hidRawNote" android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_hid_raw_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+@@ -42,9 +42,9 @@
+ 
+         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnPlainFallbackOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnPlainFallbackOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnPlainFallbackOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnPlainFallbackOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_plain_fallback_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+@@ -53,9 +53,9 @@
+ 
+         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnAudioBaselineOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnAudioBaselineOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnAudioBaselineOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnAudioBaselineOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_audio_fallback_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+@@ -66,8 +66,8 @@
+         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:background="@drawable/ui_bg_card" android:orientation="vertical" android:padding="16dp">
+             <TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/r22_e2lb_dual_title" android:textColor="@color/ui_text" android:textSize="16sp" android:textStyle="bold" />
+             <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+-                <TextView android:id="@+id/btnE2lbDualOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+-                <TextView android:id="@+id/btnE2lbDualOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++                <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnE2lbDualOn" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++                <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnE2lbDualOff" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="@string/lay_off_short" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+             </LinearLayout>
+             <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/r22_e2lb_dual_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+         </LinearLayout>
+@@ -75,13 +75,13 @@
+ 
+         <HorizontalScrollView android:layout_width="match_parent" android:layout_height="wrap_content" android:fillViewport="false" android:scrollbars="none"><LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnPassat0" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_off" android:textColor="#FFFFFFFF" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnPassat0" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_off" android:textColor="#FFFFFFFF" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnPassat1" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_retry" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnPassat1" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_retry" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnPassat2" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_disconnect" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnPassat2" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_disconnect" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnPassat3" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_norebuild" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnPassat3" android:minHeight="48dp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="12dp" android:paddingTop="6dp" android:paddingRight="12dp" android:paddingBottom="6dp" android:text="@string/lay_passat_norebuild" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         </HorizontalScrollView><TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_passat_return_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+@@ -112,9 +112,9 @@
+ 
+         <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
+ 
+-            <TextView android:id="@+id/btnFps30" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="30 fps" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnFps30" android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment_sel" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="30 fps" android:textColor="@color/ui_on_accent" android:textSize="13sp" android:textStyle="bold" />
+ 
+-            <TextView android:id="@+id/btnFps60" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="60 fps" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
++            <TextView android:stateListAnimator="@animator/ui_press_scale_small" android:id="@+id/btnFps60" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginLeft="2dp" android:paddingLeft="18dp" android:paddingTop="6dp" android:paddingRight="18dp" android:paddingBottom="6dp" android:text="60 fps" android:textColor="@color/ui_text_secondary" android:textSize="13sp" android:textStyle="bold" />
+         </LinearLayout>
+ 
+         <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/lay_target_fps_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+--- /dev/null
++++ b/app/src/main/res/values-en/strings_glass.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="ui_glass_title">Liquid Glass appearance</string>
++    <string name="ui_glass_tint">Navigation tint: %1$d%%</string>
++</resources>
+--- a/app/src/main/res/values-night/colors_ui.xml
++++ b/app/src/main/res/values-night/colors_ui.xml
+@@ -24,4 +24,13 @@
+     <color name="ui_warn_tint">#2EFF9F0A</color>
+     <color name="ui_ok_tint">#2E30D158</color>
+     <color name="ui_ripple">#1FFFFFFF</color>
++    <color name="ui_glass_surface">#E83A414D</color>
++    <color name="ui_glass_shade">#D0252933</color>
++    <color name="ui_glass_edge">#527D8DA5</color>
++    <color name="ui_glass_selection">#FF394452</color>
++    <color name="ui_canvas_end">#101722</color>
++    <color name="ui_hero_end">#202C40</color>
++    <color name="ui_glass_icon">#28384D</color>
++    <color name="ui_dock_text">#D2D7E1</color>
++    <color name="ui_dock_selected_text">#A8D0FF</color>
+ </resources>
+--- a/app/src/main/res/values-night/themes.xml
++++ b/app/src/main/res/values-night/themes.xml
+@@ -8,5 +8,9 @@
+         <item name="android:windowLightStatusBar">false</item>
+         <item name="android:windowLightNavigationBar">false</item>
+         <item name="android:colorBackground">@color/ui_bg</item>
++        <item name="android:windowBackground">@color/ui_bg</item>
++        <item name="colorAccent">@color/ui_accent</item>
++        <item name="android:colorAccent">@color/ui_accent</item>
++        <item name="android:fontFamily">sans-serif</item>
+     </style>
+ </resources>
+--- a/app/src/main/res/values/colors_ui.xml
++++ b/app/src/main/res/values/colors_ui.xml
+@@ -7,7 +7,7 @@
+     <color name="ui_field">#F5F5F7</color>
+     <color name="ui_track">#E5E5EA</color>
+     <color name="ui_text">#1D1D1F</color>
+-    <color name="ui_text_secondary">#6E6E73</color>
++    <color name="ui_text_secondary">#626267</color>
+     <color name="ui_text_disabled">#AEAEB2</color>
+     <color name="ui_accent">#0071E3</color>
+     <!-- accent 作进度条与图标；accent_fill 是主按钮底（白字 ≥4.5）；accent_text 作文字（次按钮、链接） -->
+@@ -31,4 +31,13 @@
+     <color name="ui_warn_tint">#1FFF9500</color>
+     <color name="ui_ok_tint">#1F34C759</color>
+     <color name="ui_ripple">#14000000</color>
++    <color name="ui_glass_surface">#DDFFFFFF</color>
++    <color name="ui_glass_shade">#B9E3EAF5</color>
++    <color name="ui_glass_edge">#BFFFFFFF</color>
++    <color name="ui_glass_selection">#E0DCE6F6</color>
++    <color name="ui_canvas_end">#E8EDF6</color>
++    <color name="ui_hero_end">#F0F5FF</color>
++    <color name="ui_glass_icon">#E6EDF8</color>
++    <color name="ui_dock_text">#535B69</color>
++    <color name="ui_dock_selected_text">#0059B5</color>
+ </resources>
+--- a/app/src/main/res/values/dimens_ui.xml
++++ b/app/src/main/res/values/dimens_ui.xml
+@@ -1,15 +1,15 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+     <!-- 字号阶梯（sp）：5 档，替换现有 12 种写死字号 -->
+-    <dimen name="ui_text_display">28sp</dimen>
++    <dimen name="ui_text_display">30sp</dimen>
+     <dimen name="ui_text_title">20sp</dimen>
+-    <dimen name="ui_text_body">15sp</dimen>
++    <dimen name="ui_text_body">16sp</dimen>
+     <dimen name="ui_text_label">13sp</dimen>
+     <dimen name="ui_text_caption">12sp</dimen>
+ 
+     <!-- 圆角 -->
+-    <dimen name="ui_radius_card">20dp</dimen>
+-    <dimen name="ui_radius_field">12dp</dimen>
++    <dimen name="ui_radius_card">26dp</dimen>
++    <dimen name="ui_radius_field">16dp</dimen>
+ 
+     <!-- 8dp 栅格 -->
+     <dimen name="ui_space_1">4dp</dimen>
+--- /dev/null
++++ b/app/src/main/res/values/strings_glass.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="ui_glass_title">液态玻璃外观</string>
++    <string name="ui_glass_tint">导航栏着色程度：%1$d%%</string>
++</resources>
+--- a/app/src/main/res/values/styles_ui.xml
++++ b/app/src/main/res/values/styles_ui.xml
+@@ -86,4 +86,8 @@
+         <item name="android:windowEnterAnimation">@anim/ui_sheet_in</item>
+         <item name="android:windowExitAnimation">@anim/ui_sheet_out</item>
+     </style>
++    <style name="Animation.Ui.Dialog" parent="">
++        <item name="android:windowEnterAnimation">@anim/ui_dialog_in</item>
++        <item name="android:windowExitAnimation">@anim/ui_dialog_out</item>
++    </style>
+ </resources>
+--- a/app/src/main/res/values/themes.xml
++++ b/app/src/main/res/values/themes.xml
+@@ -11,6 +11,10 @@
+         <item name="android:windowLightStatusBar">true</item>
+         <item name="android:windowLightNavigationBar">true</item>
+         <item name="android:colorBackground">@color/ui_bg</item>
++        <item name="android:windowBackground">@color/ui_bg</item>
++        <item name="colorAccent">@color/ui_accent</item>
++        <item name="android:colorAccent">@color/ui_accent</item>
++        <item name="android:fontFamily">sans-serif</item>
+     </style>
+ 
+     <!-- 静默投屏跳板（audio/SilentProjectionActivity）：全透明、无动画、不抢焦点。
+--- a/app/src/main/res/values/update_styles.xml
++++ b/app/src/main/res/values/update_styles.xml
+@@ -5,7 +5,7 @@
+         <item name="android:layout_width">match_parent</item>
+         <item name="android:layout_height">wrap_content</item>
+         <item name="android:layout_marginTop">8dp</item>
+-        <item name="android:minHeight">44dp</item>
++        <item name="android:minHeight">48dp</item>
+         <item name="android:gravity">center</item>
+         <item name="android:paddingStart">16dp</item>
+         <item name="android:paddingEnd">16dp</item>
+@@ -14,7 +14,7 @@
+         <item name="android:textStyle">bold</item>
+         <item name="android:background">@drawable/bg_btn_tonal</item>
+         <item name="android:textColor">@color/ui_btn_secondary_text</item>
+-        <item name="android:stateListAnimator">@null</item>
++        <item name="android:stateListAnimator">@animator/ui_press_scale_small</item>
+     </style>
+ 
+     <!-- 主操作（下载/安装）：实心强调胶囊 -->
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/ui/kit/UiLayoutPolicyTest.kt
+@@ -0,0 +1,16 @@
++package com.mcarplay.app.ui.kit
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class UiLayoutPolicyTest {
++    @Test
++    fun compactOrLargeTextUsesScrollableHero() {
++        assertFalse(UiLayoutPolicy.useFixedHero(false, 800, 1f))
++        assertFalse(UiLayoutPolicy.useFixedHero(true, 359, 1f))
++        assertFalse(UiLayoutPolicy.useFixedHero(true, 500, 1.31f))
++        assertTrue(UiLayoutPolicy.useFixedHero(true, 360, 1.3f))
++        assertTrue(UiLayoutPolicy.useFixedHero(true, 600, 1f))
++    }
++}
+--- /dev/null
++++ b/build-r27-signed.ps1
+@@ -0,0 +1,31 @@
++# R27 local release build. Requires Android SDK, JDK, and keystore.properties.
++# Never sends a key or password to the network. Requires the R23 long-term signer.
++param(
++    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
++)
++$ErrorActionPreference = 'Stop'
++Set-Location $PSScriptRoot
++if ($ExpectedCertSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected certificate SHA-256 must contain exactly 64 hex characters.' }
++if (!(Test-Path 'keystore.properties')) { throw 'Missing private keystore.properties. Configure your existing signing key locally; never commit it.' }
++$sdk = $env:ANDROID_HOME
++if (!$sdk) { $sdk = $env:ANDROID_SDK_ROOT }
++if (!$sdk) { throw 'Set ANDROID_HOME to your Android SDK directory.' }
++$signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
++$aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
++if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
++& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.14-test.1 :app:assembleStandardRelease
++if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
++$apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
++if (!(Test-Path $apk)) { throw 'Release APK missing.' }
++$verify = & $signer verify --verbose --print-certs $apk
++if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
++$verify | Write-Output
++$cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
++if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
++$meta = & $aapt dump badging $apk
++if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1140000'")) { throw 'Unexpected package name or versionCode.' }
++New-Item -ItemType Directory -Force dist | Out-Null
++$out = 'dist\mcarplay-0.1.14.apk'
++Copy-Item $apk $out -Force
++Get-FileHash $out -Algorithm SHA256
++Write-Output 'Signed APK verified against expected certificate and package/version.'
+--- /dev/null
++++ b/build-r28-signed.ps1
+@@ -0,0 +1,31 @@
++# R28 local release build. Requires Android SDK, JDK, and keystore.properties.
++# Never sends a key or password to the network. Requires the R23 long-term signer.
++param(
++    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
++)
++$ErrorActionPreference = 'Stop'
++Set-Location $PSScriptRoot
++if ($ExpectedCertSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected certificate SHA-256 must contain exactly 64 hex characters.' }
++if (!(Test-Path 'keystore.properties')) { throw 'Missing private keystore.properties. Configure your existing signing key locally; never commit it.' }
++$sdk = $env:ANDROID_HOME
++if (!$sdk) { $sdk = $env:ANDROID_SDK_ROOT }
++if (!$sdk) { throw 'Set ANDROID_HOME to your Android SDK directory.' }
++$signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
++$aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
++if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
++& .\gradlew.bat --no-daemon spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.15-test.1 :app:assembleStandardRelease
++if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
++$apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
++if (!(Test-Path $apk)) { throw 'Release APK missing.' }
++$verify = & $signer verify --verbose --print-certs $apk
++if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
++$verify | Write-Output
++$cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
++if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
++$meta = & $aapt dump badging $apk
++if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1150000'")) { throw 'Unexpected package name or versionCode.' }
++New-Item -ItemType Directory -Force dist | Out-Null
++$out = 'dist\mcarplay-0.1.15.apk'
++Copy-Item $apk $out -Force
++Get-FileHash $out -Algorithm SHA256
++Write-Output 'Signed APK verified against expected certificate and package/version.'
+--- /dev/null
++++ b/docs/R27-IOS27-UI.md
+@@ -0,0 +1,38 @@
++# R27 / 0.1.14 — iOS 27 风格 UI 重构
++
++本次基于上传的 R26 0.1.13 完整源码。它是 Android 应用的设计语言重构，不是苹果 iOS 系统组件移植。保留原有连接功能和数据流程，版本号升为 0.1.14，未改变 applicationId 或签名要求。
++
++## 设计依据
++
++- Apple, What's new in Design: https://developer.apple.com/design/whats-new/ （iOS/iPadOS 27 UI Kit，2026-09-17）
++- Apple, software platforms: https://www.apple.com/newsroom/2026/09/major-updates-for-apples-software-platforms-are-now-available/ （Liquid Glass 可调着色、可读性改进）
++- HIG Materials: https://developer.apple.com/design/human-interface-guidelines/materials
++- HIG Tab bars: https://developer.apple.com/design/human-interface-guidelines/tab-bars
++
++## 落地内容
++
++| 范围 | 实现 |
++|---|---|
++| 主页面 | 背景渐变、较大标题、连接状态卡、胶囊主操作、适应文字缩放的按钮高度 |
++| 导航 | GlassDock 自定义 LinearLayout，半透明渐变和描边，320ms 选中胶囊插值；选中位置基于实际子控件 bounds，重布局、RTL、快速点击均有处理 |
++| 设置 | 保留原有设置项，新增 0–100% 导航栏着色滑块，保存在独立 ui_appearance preferences |
++| 诊断 | 保留日志、导出、蓝牙诊断等，采用共享主题、按压和展开动画 |
++| 连接状态 | 状态标题短过渡、分段进度色 240ms 插值，仅实际状态变化时播放 |
++| 其他页面 | 更新、车机显示设置、蓝牙分析采用共享浅/深色视觉令牌 |
++| 弹窗 | 通用确认、目标车机选择、检测、蓝牙身份、免责声明等统一进出动画和面板圆角；原确认/取消行为不变 |
++| 可访问性 | Android 系统字体、语义化颜色、触控尺寸改进、系统动画开关、系统触觉反馈、导航文字对比度检查 |
++
++导航栏与系统手势区分离，保留独立布局空间防止遮挡连接内容；使用渐变、透明度和高光描边模拟材质，不包含真实背景采样模糊、折射或苹果私有渲染引擎。并非每一项 iOS 系统动效都已复刻；系统级权限对话框、键盘、通知、CarWith 输出内容仍由各自系统/应用控制。没有使用 SF Pro 或 SF Symbols 专有资产。原 docs/screenshots 为历史截图，不代表 R27 实机外观。
++
++## 验证记录
++
++- `python tools/verify_r27_ui.py <R26源码ZIP>`：通过，148 个主资源 XML 可解析；9 个原布局文件的 ID 全部保留，除 tabBar 从 LinearLayout 改为 FrameLayout 外，原 ID 对应的 View 类型保持不变；206 个非 UI/法律主 Kotlin/Java 文件逐字节不变。浅/深色各 824 项计算对比度检查，最低分别为 4.70:1、4.66:1（只验证指定颜色组合及模拟背景，不代表整应用 WCAG 合规）。
++- `python -m unittest discover -s tools -p 'test_*.py'`：87 项通过；此为 Python 工具测试，并非 Android UI 或协议测试。
++- `./gradlew --offline spotlessCheck :app:testStandardDebugUnitTest :app:lintStandardDebug :app:assembleStandardDebug`：未运行到任务阶段；环境无已缓存 Gradle 8.10.2 且无法解析 services.gradle.org，Android SDK 亦不可用。未生成 APK、未做真机录屏、未完成 Kotlin 编译及 AAPT/Lint 校验。
++
++## 构建与验收
++
++使用 JDK 21、Android SDK Platform 35、Build Tools 35.0.0。先执行 `./gradlew spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:lintStandardDebug :app:assembleStandardDebug :app:testRemoteDebugUnitTest --tests 'com.mcarplay.app.bridge.*'`。
++Windows 原签名发布使用 `build-r27-signed.ps1`；原 R26 签名脚本是历史记录，不能用于 0.1.14。保留原签名密钥，不使用 debug 证书冒充正式升级包。
++
++实机必须检查：360dp 窄屏、大字体、横屏和 RTL；浅深色切换；连续快速切页、旋转与恢复；着色滑块重启持久化；系统关闭动画；连接/取消/断开、日志导出、免责声明及权限弹窗；与 R26 使用同一车机做连接、视频、音频和触控回归对比。未验证之前不要标记正式发布或声称全量 iOS 27 一致。
+--- /dev/null
++++ b/docs/R28-CODE-REVIEW.md
+@@ -0,0 +1,44 @@
++# mcarplay R28 / 0.1.15 — 严格审查与验证报告
++
++## 结论
++以用户上传的 R27 0.1.14 源码为基线，对照 R26，按 UI 状态机、布局/可访问性、弹窗生命周期、构建与发布、协议回归五个维度审查。由单一助手分维度完成，不代表独立多 Agent 或人工审计。源码修复已落地，Android 编译未通过环境准备阶段；不得标为已编译、已发布、实车验证完成。没有生成 APK。
++
++## 审查发现与修复
++
++| 编号 | 严重度 | 发现与处理 |
++|---|---|---|
++| R28-01 | 高 | 横屏固定英雄卡可能高度不足导致连接操作裁切；增加紧凑高度/大字体单列回退和实际布局高度检查，改用相对 padding，扣除侧边系统 inset。删除捕获旧方向的延迟排版。|
++| R28-02 | 中 | GlassDock 外部尺寸不变时子项重排可能保留旧动画目标；使用实际子项 RectF 更新，布局、分离及重附着时清理/复位；避免重复相同 tint 资源分配。|
++| R28-03 | 中 | R27 的永久 LayoutTransition 会响应后续同父布局变化；改为一次性 AutoTransition，快速操作前结束旧过渡，隐藏或禁用动画时直接应用。|
++| R28-04 | 中 | Snackbar 快速替换及后台调用的生命周期风险；主线程执行、每次 generation、旧回调失效、销毁清理，并适配侧边安全区。|
++| R28-05 | 中 | PanelWindow 静态列表的回调可能间接强持有弹窗视图；在 decor detach 时移除登记，并按 Activity 所属关系重算。|
++| R28-06 | 中（继承） | 两种通用弹窗 dismissOnClick=false 时仍禁用按钮，导致校验重试不可用；仅关闭型动作禁用，横排消息操作改为等宽，允许长文案换行。|
++| R28-07 | 中 | 导航子项高度不一致、读屏重复文本及滑块状态恢复可能覆盖持久值；统一高度、父级标签、子文字不单独朗读、设置 labelFor，关闭滑块视图自动保存，保留 prefs 为唯一数据来源。|
++| R28-08 | 中（交付缺口） | 两个上传源码包均缺少 .github、.editorconfig、.gitignore；新增独立无签名/无发布 CI 检查工作流及按 AGENTS.md 描述重建的配置，不声称复原原仓库配置。原签名脚本版本、标签、versionCode 更新为 0.1.15 / 1150000，改为只检查格式而不在签名时静默修改源码。|
++
++修复属于源码层面，具体交互效果和 Android API 类型检查仍需要完整编译和真机测试。未修改 R26 的 206 个非 UI/法律主 Kotlin/Java 文件；MainActivity 的 UI 接入有变化，不等于已证明连接行为无回归。
++
++## 实际执行
++- JDK 21 可用；无 Android SDK、Gradle 8.10.2 缓存。两次 Gradle wrapper（修复前后）均报 `java.net.UnknownHostException: services.gradle.org`，未进入 Gradle task。Spotless、Android JUnit、Lint、AAPT、DEX、APK 全部未执行。没有签名文件，也没有擅自更换证书。
++- Kotlin 1.9.0 PSI 解析：全包 Kotlin/Gradle Kotlin DSL 文件 458 个，0 语法错误。仅解析，不是 Kotlin 2.0.21/Android 类型检查。
++- 独立 Kotlin/JVM 编译 `UiLayoutPolicy.kt` + smoke：7 项通过；另新增 JUnit 测试，待 Android Gradle 执行。
++- Python unittest：87 项通过；Node debug-bridge：20 项通过。
++- R27 静态验证器：148 个主资源 XML 可解析；浅深色各 824 项颜色组合对比度检查通过，最低 4.70:1 / 4.66:1；9 个原布局 ID 保留，206 个非 UI/法律主源码与 R26 字节一致。这些不是 AAPT 或 WCAG 全量认证。
++
++## 复验方式
++在有 JDK 21、Android SDK Platform 35、Build Tools 35.0.0、网络依赖的环境执行：
++
++```sh
++./gradlew --no-daemon spotlessCheck :app:testStandardDebugUnitTest :app:lintStandardDebug :app:assembleStandardDebug
++./gradlew --no-daemon :app:testRemoteDebugUnitTest --tests 'com.mcarplay.app.bridge.*' :app:assembleRemoteDebug
++python -m unittest discover -s tools -p 'test_*.py'
++node --test tools/debug-bridge/*.test.mjs
++```
++
++若 Spotless 不通过，先运行 spotlessApply 并审查 diff，再重新跑全门禁。CI 文件 `.github/workflows/r28-build-check.yml` 可在导入仓库后手动运行，输出报告和 debug APK，不发布、不使用签名秘密；当前未触发远端 CI。Windows 原签名升级包使用 `build-r28-signed.ps1`，必须在本地有原签名密钥，并校验指纹。Debug APK 不可当作原签名升级包。
++
++## 放行条件
++1. Spotless、standard/remote 单测、Lint、两种 debug APK 真实构建通过。
++2. 实机检查系统动画关闭、快速切页/折叠、提示覆盖、横竖屏、RTL、字体 1.0–2.0、深色和着色持久化、TalkBack、弹窗操作及旋转。
++3. 同一手机和车机对比 R26 与 R28 的连接/取消/断开/重连、画面、触控、音频、诊断导出。若长文案弹窗在超短横屏仍溢出，继续整改。
++4. 正式签名、包名、版本号及更新路径验证后再发布。Liquid Glass 仍为 Android 模拟材质，真实折射及苹果级物理动画未完整实现。
+--- /dev/null
++++ b/tools/r28-review/R28PolicySmoke.kt
+@@ -0,0 +1,14 @@
++package com.mcarplay.app.ui.kit
++fun main() {
++    val cases = listOf(
++        Triple(false, 800, 1f) to false,
++        Triple(true, 359, 1f) to false,
++        Triple(true, 500, 1.31f) to false,
++        Triple(true, 360, 1.3f) to true,
++        Triple(true, 600, 1f) to true,
++        Triple(true, 0, 1f) to false,
++        Triple(true, 600, 2f) to false,
++    )
++    cases.forEach { (input, expected) -> check(UiLayoutPolicy.useFixedHero(input.first, input.second, input.third) == expected) }
++    println("UiLayoutPolicy Kotlin JVM: ${cases.size} cases passed")
++}
+--- /dev/null
++++ b/tools/r28-review/R28Syntax.kt
+@@ -0,0 +1,26 @@
++import com.intellij.openapi.util.Disposer
++import com.intellij.psi.PsiErrorElement
++import com.intellij.psi.util.PsiTreeUtil
++import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
++import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
++import org.jetbrains.kotlin.config.CompilerConfiguration
++import org.jetbrains.kotlin.psi.KtPsiFactory
++import java.io.File
++fun main(args: Array<String>) {
++    val disposable = Disposer.newDisposable()
++    try {
++        val env = KotlinCoreEnvironment.createForProduction(disposable, CompilerConfiguration(), EnvironmentConfigFiles.JVM_CONFIG_FILES)
++        val factory = KtPsiFactory(env.project, false)
++        val files = File(args[0]).walkTopDown().filter { it.isFile && it.extension in setOf("kt", "kts") }.toList()
++        var errors = 0
++        for (file in files) {
++            val psi = factory.createFile(file.name, file.readText())
++            for (error in PsiTreeUtil.collectElementsOfType(psi, PsiErrorElement::class.java)) {
++                println("${file.path}:${error.textOffset}: ${error.errorDescription}")
++                errors++
++            }
++        }
++        println("Kotlin PSI syntax: ${files.size} files, $errors errors (not type checking)")
++        check(errors == 0)
++    } finally { Disposer.dispose(disposable) }
++}
+--- /dev/null
++++ b/tools/verify_r27_ui.py
+@@ -0,0 +1,111 @@
++#!/usr/bin/env python3
++"""Offline structural and contrast checks. Not a replacement for Android resource compilation."""
++import re
++import sys
++import xml.etree.ElementTree as ET
++from pathlib import Path
++from zipfile import ZipFile
++
++ROOT = Path(__file__).resolve().parents[1]
++RES = ROOT / 'app/src/main/res'
++ANDROID = '{http://schemas.android.com/apk/res/android}'
++
++
++def tokens(mode):
++    return {e.attrib['name']: e.text for e in ET.parse(RES / mode / 'colors_ui.xml').getroot()}
++
++
++def rgba(value):
++    value = value.lstrip('#')
++    a = int(value[:2], 16) / 255 if len(value) == 8 else 1
++    return tuple(int(value[-6:][i:i + 2], 16) / 255 for i in (0, 2, 4)) + (a,)
++
++
++def over(color, background):
++    return tuple(a * color[3] + b * (1 - color[3]) for a, b in zip(color[:3], background[:3])) + (1,)
++
++
++def luminance(c):
++    return sum((v / 12.92 if v <= .03928 else ((v + .055) / 1.055) ** 2.4) * w
++               for v, w in zip(c, (.2126, .7152, .0722)))
++
++
++def contrast(a, b):
++    x, y = sorted((luminance(a), luminance(b)))
++    return (y + .05) / (x + .05)
++
++
++def check_colors(mode):
++    c = {k: rgba(v) for k, v in tokens(mode).items()}
++    pairs = [('ui_text', 'ui_bg'), ('ui_text', 'ui_card'), ('ui_text_secondary', 'ui_bg'),
++             ('ui_text_secondary', 'ui_card'), ('ui_accent_text', 'ui_card'), ('ui_ok_text', 'ui_card'),
++             ('ui_error_text', 'ui_card'), ('ui_on_accent', 'ui_accent_fill'), ('ui_warn_text', 'ui_card'),
++             ('ui_text_secondary', 'ui_field'), ('ui_text_secondary', 'ui_canvas_end'),
++             ('ui_text_secondary', 'ui_hero_end')]
++    checks = [(a + '/' + b, contrast(c[a], c[b])) for a, b in pairs]
++    for a, b, under in [('ui_accent_text', 'ui_accent_tint', 'ui_bg'), ('ui_error_text', 'ui_error_tint', 'ui_bg'),
++                        ('ui_ok_text', 'ui_ok_tint', 'ui_card'), ('ui_warn_text', 'ui_warn_tint', 'ui_card')]:
++        checks.append((a + '/' + b, contrast(c[a], over(c[b], c[under]))))
++    for tint in range(101):
++        f = tint / 100
++        for surface in ('ui_glass_surface', 'ui_glass_shade'):
++            mixed = tuple(a * (1 - f) + b * f for a, b in zip(c[surface], c['ui_card']))
++            for underlying in ('ui_bg', 'ui_canvas_end'):
++                bg = over(mixed, c[underlying])
++                checks.append((f'dock/{surface}/{underlying}/{tint}', contrast(c['ui_dock_text'], bg)))
++                selected = over(c['ui_glass_selection'], bg)
++                checks.append((f'selected/{surface}/{underlying}/{tint}', contrast(c['ui_dock_selected_text'], selected)))
++    worst = min(checks, key=lambda p: p[1])
++    assert worst[1] >= 4.5, (mode, worst)
++    print(f'{mode}: {len(checks)} contrast checks, minimum {worst[1]:.2f}:1 ({worst[0]})')
++
++
++def ids(tree):
++    return {e.attrib[ANDROID + 'id'].split('/')[-1]: e.tag for e in tree.iter() if ANDROID + 'id' in e.attrib}
++
++
++def main():
++    xml = list(RES.rglob('*.xml'))
++    for f in xml:
++        ET.parse(f)
++    print(f'{len(xml)} resource XML files are well formed')
++    assert tokens('values').keys() == tokens('values-night').keys()
++    check_colors('values')
++    check_colors('values-night')
++    layouts = list((RES / 'layout').glob('*.xml'))
++    main = ET.parse(RES / 'layout/activity_main.xml').getroot()
++    dock = next(e for e in main.iter() if e.attrib.get(ANDROID+'id') == '@+id/glassDock')
++    assert [e.attrib[ANDROID+'id'] for e in dock] == ['@+id/tabConnect', '@+id/tabSettings', '@+id/tabDiagnostics']
++    assert {'glassTintSlider', 'glassTintLabel', 'glassDock'} <= ids(main).keys()
++    if len(sys.argv) > 1:
++        with ZipFile(sys.argv[1]) as archive:
++            names = set(archive.namelist())
++            for f in layouts:
++                name = 'mcarplay-project/' + f.relative_to(ROOT).as_posix()
++                if name not in names:
++                    continue
++                old, new = ids(ET.fromstring(archive.read(name))), ids(ET.parse(f).getroot())
++                assert old.keys() <= new.keys(), (f.name, old.keys() - new.keys())
++                for key in old:
++                    if key != 'tabBar':
++                        assert old[key] == new[key], (f.name, key, old[key], new[key])
++            java = ROOT / 'app/src/main/java/com/mcarplay/app'
++            changed_core = []
++            count = 0
++            for name in names:
++                prefix = 'mcarplay-project/app/src/main/java/com/mcarplay/app/'
++                if not name.startswith(prefix) or not name.endswith(('.kt', '.java')):
++                    continue
++                rel = name[len(prefix):]
++                if rel.split('/')[0] in {'ui', 'legal'} or rel == 'MainActivity.kt':
++                    continue
++                count += 1
++                if (java / rel).read_bytes() != archive.read(name):
++                    changed_core.append(rel)
++            assert not changed_core, changed_core
++            print(f'All original layout IDs preserved ({len(layouts)} layouts); {count} non-UI main Kotlin/Java files byte-identical')
++    print('PASS: static UI structure and contrast only')
++
++
++if __name__ == '__main__':
++    main()

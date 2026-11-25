@@ -1,0 +1,669 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c125e36..ca0407e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.28-test.1] - 2026-11-25
++
++> R41 — projected appearance and media lifecycle candidate.
++
++### English
++- Follow the phone's system light/dark configuration, with clock fallback only when unavailable.
++- Unregister departed media sessions and invalidate old artwork requests on disconnect or selection changes.
++- Bound artwork transfer, decode size and queued requests; retain readable UI and existing video pacing.
++
++### 简体中文
++- 车机玻璃主题跟随手机系统浅色／深色配置，仅在无法读取时使用本地时钟兜底。
++- 注销已退出媒体会话的回调，断开或切换歌曲时使旧封面请求失效。
++- 限制封面传输、解码尺寸和排队请求，保留清晰界面和原有视频调度。
++
+ ## [v0.1.27-test.1] - 2026-11-25
+ 
+ > R40 — media-aware projected shell candidate; real-vehicle validation pending.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 6c4d5cb..49e14af 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.27"
++val appVersionName = "0.1.28"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index c8d838a..cea5265 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -5163,6 +5163,14 @@ object SessionController {
+                                                             ?.currentThermalStatus ?: -1
+                                                     } else -1
+                                                 },
++                                                projectionSystemNight = {
++                                                    val mask = android.content.res.Configuration.UI_MODE_NIGHT_MASK
++                                                    when (appContext?.resources?.configuration?.uiMode?.and(mask)) {
++                                                        android.content.res.Configuration.UI_MODE_NIGHT_YES -> true
++                                                        android.content.res.Configuration.UI_MODE_NIGHT_NO -> false
++                                                        else -> null
++                                                    }
++                                                },
+                                                 projectionPhoneStatus = {
+                                                     val battery =
+                                                         appContext?.getSystemService(android.os.BatteryManager::class.java)
+diff --git a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+index 85fd3dc..b54a0c1 100644
+--- a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
++++ b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+@@ -2,11 +2,15 @@ package com.mcarplay.app.media
+ 
+ import android.content.ComponentName
+ import android.media.MediaMetadata
++import android.media.session.MediaController
++import android.media.session.MediaSession
+ import android.media.session.MediaSessionManager
+ import android.media.session.PlaybackState
+ import android.service.notification.NotificationListenerService
+ import android.service.notification.StatusBarNotification
+ import com.mcarplay.app.carlife.CarWithNotificationProbe
++import com.mcarplay.app.video.ProjectionArtworkBudget
++import com.mcarplay.app.video.ProjectionArtworkGate
+ import com.mcarplay.app.video.ProjectionMediaCapabilities
+ import com.mcarplay.app.video.ProjectionMediaClock
+ 
+@@ -32,6 +36,8 @@ class MediaListenerService : NotificationListenerService() {
+         // 已连上即代表系统认可本应用的通知使用权（此时 metadata 才会可读）。
+         // 两个状态都置位：NotificationAccess 供「是否要再试授权」判断，
+         // MediaSessionsState 供 UI 文案区分「没在播放」与「读不到信息」。
++        if (connected) return
++        connected = true
+         NotificationAccess.markGranted()
+         NotificationAccess.markConnected()
+         MediaSessionsState.accessGranted = true
+@@ -40,6 +46,7 @@ class MediaListenerService : NotificationListenerService() {
+             manager.addOnActiveSessionsChangedListener(
+                 sessionListener,
+                 componentName(this),
++                mainHandler,
+             )
+             MediaSessionsState.resyncHook = { mainHandler.post { refresh() } }
+             MediaSessionsState.projectedMediaHook = { token, key ->
+@@ -50,9 +57,7 @@ class MediaListenerService : NotificationListenerService() {
+             mainHandler.post(periodicRefresh)
+         } catch (_: SecurityException) {
+             // 通知使用权被撤销：静默（授权后系统会重新绑定本服务）
+-            MediaSessionsState.accessGranted = false
+-            MediaSessionsState.projectedMediaHook = null
+-            MediaSessionsState.publish(null)
++            disconnectMedia()
+         }
+     }
+ 
+@@ -87,16 +92,7 @@ class MediaListenerService : NotificationListenerService() {
+ 
+     override fun onListenerDisconnected() {
+         super.onListenerDisconnected()
+-        MediaSessionsState.accessGranted = false
+-        MediaSessionsState.projectedMediaHook = null
+-        mainHandler.removeCallbacks(periodicRefresh)
+-        NotificationAccess.markDisconnected()
+-        CarWithNotificationProbe.onListenerDisconnected()
+-        // 必须清空：否则卡片会保留断开前的歌名/播放状态，出现「正在播放 + 未在播放」
+-        // 甚至「正在播放 + 无法读取播放信息」的自相矛盾显示（2026-10-19 实测：
+-        // 重装后监听器未被系统绑定，卡片长时间停在旧状态）。
+-        MediaSessionsState.publish(null)
+-        watched.clear()
++        disconnectMedia()
+     }
+ 
+     override fun onNotificationPosted(notification: StatusBarNotification?) {
+@@ -110,12 +106,8 @@ class MediaListenerService : NotificationListenerService() {
+     }
+ 
+     override fun onDestroy() {
+-        mainHandler.removeCallbacks(periodicRefresh)
+-        MediaSessionsState.projectedMediaHook = null
+-        MediaSessionsState.accessGranted = false
+-        runCatching { manager.removeOnActiveSessionsChangedListener(sessionListener) }
+-        CarWithNotificationProbe.onListenerDisconnected()
+-        MediaSessionsState.publish(null)
++        disconnectMedia()
++        artExecutor.shutdownNow()
+         super.onDestroy()
+     }
+ 
+@@ -128,8 +120,24 @@ class MediaListenerService : NotificationListenerService() {
+             update(controllers ?: emptyList())
+         }
+ 
+-    /** 已注册播放回调的会话（避免重复注册）。 */
+-    private val watched = HashSet<android.media.session.MediaSession.Token>()
++    private data class Watch(val controller: MediaController, val callback: MediaController.Callback)
++    private val watched = mutableMapOf<MediaSession.Token, Watch>()
++    private var connected = false
++
++    private fun disconnectMedia() {
++        connected = false
++        mainHandler.removeCallbacks(periodicRefresh)
++        MediaSessionsState.accessGranted = false
++        MediaSessionsState.resyncHook = null
++        MediaSessionsState.projectedMediaHook = null
++        runCatching { manager.removeOnActiveSessionsChangedListener(sessionListener) }
++        watched.values.forEach { runCatching { it.controller.unregisterCallback(it.callback) } }
++        watched.clear()
++        clearArt()
++        NotificationAccess.markDisconnected()
++        CarWithNotificationProbe.onListenerDisconnected()
++        MediaSessionsState.publish(null)
++    }
+ 
+     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+ 
+@@ -137,13 +145,30 @@ class MediaListenerService : NotificationListenerService() {
+     private val periodicRefresh =
+         object : Runnable {
+             override fun run() {
++                if (!connected) return
+                 refresh()
+-                mainHandler.postDelayed(this, 1_000)
++                if (connected) mainHandler.postDelayed(this, 1_000)
+             }
+         }
+ 
+     /** 上次封面提取键（会话+歌名+封面 uri）——getBitmap 每次反序列化，1s 轮询不能重复做。 */
+-    private var lastArtKey: String? = null
++    private data class ArtKey(
++        val token: MediaSession.Token,
++        val mediaId: String?,
++        val title: String?,
++        val artist: String?,
++        val album: String?,
++        val uri: String?,
++    )
++    private val artGate = ProjectionArtworkGate<ArtKey>()
++    private var pendingArtTicket: Long? = null
++    private fun clearArt() {
++        artGate.clear()
++        pendingArtTicket = null
++        artExecutor.queue.clear()
++        cachedArt = null
++        artEmptyAt = 0L
++    }
+ 
+     /** 封面位图缓存（键不变时复用同一实例，保证 NowPlaying 的 equals 判稳）。 */
+     private var cachedArt: android.graphics.Bitmap? = null
+@@ -152,42 +177,63 @@ class MediaListenerService : NotificationListenerService() {
+      *  封面字段滞后），空结果只保持 2 秒，之后重试直到封面就绪。 */
+     private var artEmptyAt = 0L
+ 
+-    /** 封面 uri 解码专用单线程（串行；主线程不能做 IO/解码）。 */
+-    private val artExecutor =
+-        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+-            Thread(r, "media-art").apply { isDaemon = true }
++    /** At most one running and one queued artwork request. The latest queued request wins. */
++    private val artExecutor = java.util.concurrent.ThreadPoolExecutor(
++        1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
++        java.util.concurrent.ArrayBlockingQueue<Runnable>(1),
++        { task -> Thread(task, "media-art").apply { isDaemon = true } },
++        java.util.concurrent.ThreadPoolExecutor.DiscardOldestPolicy(),
++    )
++
++    private fun update(controllers: List<MediaController>) {
++        if (!connected) return
++        reconcileWatches(controllers)
++        refresh()
++    }
++
++    private fun reconcileWatches(controllers: List<MediaController>) {
++        val live = controllers.mapTo(HashSet()) { it.sessionToken }
++        val iterator = watched.iterator()
++        while (iterator.hasNext()) {
++            val entry = iterator.next()
++            if (entry.key !in live) {
++                runCatching { entry.value.controller.unregisterCallback(entry.value.callback) }
++                iterator.remove()
++            }
+         }
++        for (controller in controllers) {
++            val token = controller.sessionToken
++            if (token in watched) continue
++            val callback = object : MediaController.Callback() {
++                override fun onPlaybackStateChanged(state: PlaybackState?) {
++                    if (connected && watched[token]?.callback === this) refresh()
++                }
+ 
+-    private fun update(controllers: List<android.media.session.MediaController>) {
+-        controllers.forEach { controller ->
+-            if (watched.add(controller.sessionToken)) {
+-                controller.registerCallback(
+-                    object : android.media.session.MediaController.Callback() {
+-                        override fun onPlaybackStateChanged(state: PlaybackState?) {
+-                            refresh()
+-                        }
+-
+-                        override fun onMetadataChanged(metadata: MediaMetadata?) {
+-                            refresh()
+-                        }
+-                    },
+-                    android.os.Handler(android.os.Looper.getMainLooper()),
+-                )
++                override fun onMetadataChanged(metadata: MediaMetadata?) {
++                    if (connected && watched[token]?.callback === this) refresh()
++                }
++
++                override fun onSessionDestroyed() {
++                    if (connected && watched[token]?.callback === this) refresh()
++                }
++            }
++            if (runCatching { controller.registerCallback(callback, mainHandler) }.isSuccess) {
++                watched[token] = Watch(controller, callback)
+             }
+         }
+-        refresh()
+     }
+ 
+     /** 从活跃会话提取正在播放态：优先 PLAYING 的会话，否则保留第一个有元数据的。 */
+     private fun refresh() {
++        if (!connected) return
+         val controllers =
+             try {
+                 manager.getActiveSessions(componentName(this))
+             } catch (_: SecurityException) {
+-                MediaSessionsState.accessGranted = false
+-                MediaSessionsState.publish(null)
++                disconnectMedia()
+                 return
+             }
++        reconcileWatches(controllers)
+         val picked =
+             controllers.firstOrNull {
+                 it.playbackState?.state == PlaybackState.STATE_PLAYING
+@@ -214,6 +260,7 @@ class MediaListenerService : NotificationListenerService() {
+                     supportedActions = state?.actions ?: 0L,
+                 )
+             }
++        if (now == null) clearArt()
+         MediaSessionsState.publish(now)
+     }
+ 
+@@ -229,54 +276,94 @@ class MediaListenerService : NotificationListenerService() {
+         val artUri =
+             meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+                 ?: meta?.getString(MediaMetadata.METADATA_KEY_ART_URI)
+-        val key = "${controller.sessionToken}/$title/$artUri"
++        val key = ArtKey(
++            controller.sessionToken,
++            meta?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID),
++            title,
++            meta?.getString(MediaMetadata.METADATA_KEY_ARTIST),
++            meta?.getString(MediaMetadata.METADATA_KEY_ALBUM),
++            artUri,
++        )
+         val now = android.os.SystemClock.elapsedRealtime()
+-        if (key == lastArtKey) {
+-            if (cachedArt != null) return cachedArt
+-            // 键没变但封面为空：2 秒内不重试（getBitmap 有成本），超后重提取——
+-            // app 在切歌后补封面（bitmap 键从无到有）靠这条路兜住
+-            if (now - artEmptyAt < 2_000) return null
++        if (artGate.select(key)) {
++            cachedArt = null
++            pendingArtTicket = null
++            artExecutor.queue.clear()
++        } else {
++            cachedArt?.let { return it }
++            if (pendingArtTicket != null || now - artEmptyAt < 2_000) return null
+         }
+-        lastArtKey = key
+-        cachedArt = null
+-        val direct =
+-            meta
+-                ?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+-                ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ART)
++        val ticket = artGate.issue()
++        artEmptyAt = now
++        val direct = meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
++            ?: meta?.getBitmap(MediaMetadata.METADATA_KEY_ART)
+         if (direct != null) {
+-            cachedArt = scaleArt(direct)
++            cachedArt = runCatching { scaleArt(direct) }.getOrNull()
+             return cachedArt
+         }
+-        artEmptyAt = now
+         if (artUri != null) {
+-            // 解码在专用线程；就绪后不主动 refresh——periodicRefresh 下一轮（≤1s）拉取
++            pendingArtTicket = ticket
+             artExecutor.execute {
+-                val bmp =
+-                    runCatching {
+-                        val input =
+-                            if (artUri.startsWith("http")) {
+-                                java.net.URL(artUri).openStream()
+-                            } else {
+-                                contentResolver.openInputStream(android.net.Uri.parse(artUri))
+-                            }
+-                        input?.use { android.graphics.BitmapFactory.decodeStream(it) }
+-                    }.getOrNull()
+-                if (bmp != null && key == lastArtKey) {
+-                    cachedArt = scaleArt(bmp)
++                val bmp = runCatching { decodeArtwork(artUri) }.getOrNull()
++                // Publish only on the service's main thread; a disconnect or A-B-A switch invalidates this ticket.
++                mainHandler.post {
++                    if (pendingArtTicket == ticket) pendingArtTicket = null
++                    if (connected && artGate.accepts(ticket) && bmp != null) {
++                        cachedArt = bmp
++                    } else {
++                        bmp?.recycle()
++                    }
+                 }
+             }
+         }
+         return null
+     }
+ 
++    /** Bound transfer size and decoded bitmap allocation before reading external artwork. */
++    private fun decodeArtwork(uri: String): android.graphics.Bitmap? {
++        val parsed = android.net.Uri.parse(uri)
++        val input = when (parsed.scheme?.lowercase(java.util.Locale.ROOT)) {
++            "http", "https" -> java.net.URL(uri).openConnection().apply {
++                connectTimeout = 3_000
++                readTimeout = 3_000
++            }.getInputStream()
++            "content", "android.resource" -> contentResolver.openInputStream(parsed)
++            else -> null
++        } ?: return null
++        val bytes = input.use { stream ->
++            val out = java.io.ByteArrayOutputStream()
++            val buffer = ByteArray(8192)
++            val started = android.os.SystemClock.elapsedRealtime()
++            while (true) {
++                if (Thread.currentThread().isInterrupted || android.os.SystemClock.elapsedRealtime() - started > 8_000L) return null
++                val count = stream.read(buffer)
++                if (count < 0) break
++                if (count == 0) return null
++                if (!ProjectionArtworkBudget.acceptsBytes(out.size(), count)) return null
++                out.write(buffer, 0, count)
++            }
++            out.toByteArray()
++        }
++        val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
++        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
++        options.inSampleSize = ProjectionArtworkBudget.sampleSize(options.outWidth, options.outHeight) ?: return null
++        options.inJustDecodeBounds = false
++        val decoded = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
++        val scaled = runCatching { scaleArt(decoded) }.getOrElse {
++            decoded.recycle()
++            return null
++        }
++        if (scaled !== decoded) decoded.recycle()
++        return scaled
++    }
++
+     /** 封面缩到 ≤512px（卡片显示 ~120dp，控制内存）。 */
+     private fun scaleArt(src: android.graphics.Bitmap): android.graphics.Bitmap {
+         val maxSide = maxOf(src.width, src.height)
+         if (maxSide <= 512) return src
+-        val sample =
+-            generateSequence(1) { it * 2 }.first { maxSide / it <= 512 }
++        val sample = generateSequence(1) { it * 2 }.first { (maxSide.toLong() + it - 1) / it <= 512 }
+         return android.graphics.Bitmap
+-            .createScaledBitmap(src, src.width / sample, src.height / sample, true)
++            .createScaledBitmap(src, (src.width / sample).coerceAtLeast(1), (src.height / sample).coerceAtLeast(1), true)
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+index 1fc76d4..43e79c9 100644
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -42,6 +42,7 @@ internal class CarWithTranscoder(
+     private val outputFps: Int = 30,
+     private val runtimeFps: () -> Int = { outputFps },
+     private val projectionPhoneStatus: () -> ProjectionPhoneStatus = { ProjectionPhoneStatus(null, null) },
++    private val projectionSystemNight: () -> Boolean? = { null },
+     private val onRenderDuration: (Long) -> Unit = {},
+     private val allowIdleDashboard: () -> Boolean = { true },
+     /** 向 CarWith 要关键帧（解码输入断流后用；转码线程上调用，已限流）。 */
+@@ -479,7 +480,7 @@ internal class CarWithTranscoder(
+         check(EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) { "eglMakeCurrent" }
+ 
+         dashboardLayout?.takeUnless { it.fullContent }?.let { layout ->
+-            dashboard = ProjectedDashboardRenderer(layout, projectionPhoneStatus, runtimeFps)
++            dashboard = ProjectedDashboardRenderer(layout, projectionPhoneStatus, runtimeFps, projectionSystemNight)
+             dashboard?.start()
+         }
+         program = buildProgram()
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+index 32bdef5..f99892e 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -26,6 +26,7 @@ internal class ProjectedDashboardRenderer(
+     private var layout: ProjectedDashboardLayout,
+     private val readPhone: () -> ProjectionPhoneStatus = { ProjectionPhoneStatus(null, null) },
+     private val runtimeFps: () -> Int = { 0 },
++    private val systemNight: () -> Boolean? = { null },
+ ) {
+     private val widgetSampler = ProjectionWidgetSampler()
+     private var program = 0
+@@ -177,7 +178,10 @@ internal class ProjectedDashboardRenderer(
+         }
+     }
+ 
+-    private fun isNight(): Boolean = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY) !in 6..17
++    private fun isNight(): Boolean = ProjectionThemePolicy.isNight(
++        runCatching { systemNight() }.getOrNull(),
++        java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY),
++    )
+ 
+     fun animating(): Boolean = transitionStart >= 0 || pressMoving
+ 
+@@ -583,10 +587,10 @@ internal class ProjectedDashboardRenderer(
+         val x = p.left + p.width * .09f
+         val available = p.width * .82f
+         val now = snapshot.now
+-        val title = now?.title ?: if (snapshot.key.hasAccess) {
+-            if (chinese) "暂无播放" else "No active media"
+-        } else {
+-            if (chinese) "媒体信息不可用" else "Media info unavailable"
++        val title = now?.title?.takeIf { it.isNotBlank() } ?: when {
++            !snapshot.key.hasAccess -> if (chinese) "媒体信息不可用" else "Media info unavailable"
++            now != null -> if (chinese) "曲目信息不可用" else "Track details unavailable"
++            else -> if (chinese) "暂无播放" else "No active media"
+         }
+         label(
+             if (chinese) "正在播放" else "NOW PLAYING", x, p.top + p.height * .09f,
+@@ -653,10 +657,10 @@ internal class ProjectedDashboardRenderer(
+         val x = p.left + p.width * .09f
+         val y = p.top + p.height * .66f
+         val available = p.width * .82f
+-        paint.color = 0xFF72839E.toInt()
++        paint.color = if (night) 0xFF72839E.toInt() else 0xFFB6C9DC.toInt()
+         canvas.drawRoundRect(x, y, x + available, y + layout.height * .008f, 3f, 3f, paint)
+         if (progress > 0) {
+-            paint.color = Color.WHITE
++            paint.color = if (night) Color.WHITE else 0xFF1261AC.toInt()
+             canvas.drawRoundRect(x, y, x + progress.coerceAtMost(available.toInt()), y + layout.height * .008f, 3f, 3f, paint)
+         }
+         snapshot.key.playbackTime?.let { time ->
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionAppearancePolicy.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionAppearancePolicy.kt
+new file mode 100644
+index 0000000..d8dcce7
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionAppearancePolicy.kt
+@@ -0,0 +1,49 @@
++package com.mcarplay.app.video
++
++/** Prefer the phone's configured theme; clock fallback is used only when it is unavailable. */
++internal object ProjectionThemePolicy {
++    fun isNight(systemNight: Boolean?, hour: Int): Boolean = systemNight ?: (hour !in 6..17)
++}
++
++/** Main-thread-only. A-B-A metadata changes and retries must not accept a stale completion. */
++internal class ProjectionArtworkGate<K : Any> {
++    private var key: K? = null
++    private var generation = 0L
++
++    fun select(next: K): Boolean {
++        if (key == next) return false
++        key = next
++        generation++
++        return true
++    }
++
++    fun issue(): Long {
++        check(key != null)
++        return ++generation
++    }
++
++    fun accepts(ticket: Long): Boolean = key != null && generation == ticket
++
++    fun clear() {
++        key = null
++        generation++
++    }
++}
++
++/** Artwork allocation limits are checked before full decoding. */
++internal object ProjectionArtworkBudget {
++    const val MAX_BYTES = 8 * 1024 * 1024
++    const val MAX_DIMENSION = 32768
++    const val MAX_OUTPUT = 512
++
++    fun sampleSize(width: Int, height: Int): Int? {
++        if (width !in 1..MAX_DIMENSION || height !in 1..MAX_DIMENSION) return null
++        val side = maxOf(width, height)
++        var sample = 1
++        while ((side + sample - 1) / sample > MAX_OUTPUT) sample *= 2
++        return sample
++    }
++
++    fun acceptsBytes(current: Int, next: Int): Boolean =
++        current in 0..MAX_BYTES && next in 0..(MAX_BYTES - current)
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+index 7f4f25b..e9e7102 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -76,6 +76,7 @@ class VideoSender(
+     private val thermalStatus: () -> Int = { -1 },
+     private val uptimeMs: () -> Long = { android.os.SystemClock.uptimeMillis() },
+     private val projectionPhoneStatus: () -> ProjectionPhoneStatus = { ProjectionPhoneStatus(null, null) },
++    private val projectionSystemNight: () -> Boolean? = { null },
+ ) {
+     @Volatile
+     private var width: Int = (width / 2) * 2
+@@ -986,6 +987,7 @@ class VideoSender(
+                     outputFps = fps,
+                     runtimeFps = { policy?.fps() ?: fps },
+                     projectionPhoneStatus = projectionPhoneStatus,
++                    projectionSystemNight = projectionSystemNight,
+                     onRenderDuration = { durationNs -> policy?.recordRender(uptimeMs(), durationNs) },
+                     allowIdleDashboard = { running.get() && !quiescing.get() && !screenSuspendedReported.get() && phoneOwnsScreen() },
+                 ) {
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionAppearancePolicyTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionAppearancePolicyTest.kt
+new file mode 100644
+index 0000000..6e8f67e
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionAppearancePolicyTest.kt
+@@ -0,0 +1,98 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionAppearancePolicyTest {
++    @Test
++    fun systemThemeOverridesClockWithFallback() {
++        for (hour in -2..26) {
++            assertTrue(ProjectionThemePolicy.isNight(true, hour))
++            assertFalse(ProjectionThemePolicy.isNight(false, hour))
++            assertEquals(hour !in 6..17, ProjectionThemePolicy.isNight(null, hour))
++        }
++    }
++
++    @Test
++    fun oldArtworkCannotReturnAfterABAOrDisconnect() {
++        val gate = ProjectionArtworkGate<String>()
++        assertTrue(gate.select("A"))
++        val a = gate.issue()
++        assertFalse(gate.select("A"))
++        assertTrue(gate.accepts(a))
++        gate.select("B")
++        val b = gate.issue()
++        gate.select("A")
++        val current = gate.issue()
++        assertFalse(gate.accepts(a))
++        assertFalse(gate.accepts(b))
++        assertTrue(gate.accepts(current))
++        gate.clear()
++        assertFalse(gate.accepts(current))
++        gate.select("A")
++        assertFalse(gate.accepts(current))
++    }
++
++    @Test
++    fun randomArtworkCompletionsOnlyAcceptLatestLiveTicket() {
++        val random = Random(41)
++        val gate = ProjectionArtworkGate<Int>()
++        val old = mutableListOf<Long>()
++        var current: Long? = null
++        var key: Int? = null
++        repeat(10000) {
++            when (random.nextInt(4)) {
++                0 -> {
++                    gate.clear()
++                    key = null
++                    current = null
++                }
++                1 -> {
++                    val next = random.nextInt(4)
++                    assertEquals(key != next, gate.select(next))
++                    if (key != next) current = null
++                    key = next
++                }
++                2 -> if (key != null) {
++                    val ticket = gate.issue()
++                    current = ticket
++                    old.add(ticket)
++                }
++                3 -> Unit
++            }
++            if (old.isNotEmpty()) {
++                val ticket = old.random(random)
++                assertEquals(ticket == current, gate.accepts(ticket))
++            }
++            current?.let { assertTrue(gate.accepts(it)) }
++        }
++        println("Random artwork lifecycle steps: 10000")
++    }
++
++    @Test
++    fun decodeBudgetRejectsInvalidAndOversizedHeaders() {
++        for (side in listOf(Int.MIN_VALUE, 0, -1, 32769, Int.MAX_VALUE)) {
++            assertNull(ProjectionArtworkBudget.sampleSize(side, 1))
++        }
++        assertEquals(1, ProjectionArtworkBudget.sampleSize(512, 1))
++        assertEquals(2, ProjectionArtworkBudget.sampleSize(513, 1))
++        assertEquals(64, ProjectionArtworkBudget.sampleSize(32768, 1))
++        val random = Random(410)
++        repeat(10000) {
++            val w = random.nextInt(1, 32769)
++            val h = random.nextInt(1, 32769)
++            val sample = requireNotNull(ProjectionArtworkBudget.sampleSize(w, h))
++            assertTrue(sample > 0 && (sample and (sample - 1)) == 0)
++            assertTrue((maxOf(w, h) + sample - 1) / sample <= 512)
++        }
++        assertTrue(ProjectionArtworkBudget.acceptsBytes(ProjectionArtworkBudget.MAX_BYTES - 1, 1))
++        assertFalse(ProjectionArtworkBudget.acceptsBytes(ProjectionArtworkBudget.MAX_BYTES, 1))
++        assertFalse(ProjectionArtworkBudget.acceptsBytes(-1, 1))
++        assertFalse(ProjectionArtworkBudget.acceptsBytes(1, Int.MAX_VALUE))
++        println("Random artwork decode budget configurations: 10000")
++    }
++}

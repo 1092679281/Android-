@@ -1,0 +1,597 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 55d2068..6094c33 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.26-test.1] - 2026-11-25
++
++> R39 — projection input generation and playback presentation candidate.
++
++### English
++- Bind submitted UI metadata to its render generation, rejecting obsolete frames after ownership or geometry changes.
++- Use the same input confirmation for full-content projection; preserve unique microsecond PTS and resync local UI after invalidation.
++- Add real media elapsed and duration labels with progress-only texture updates and unknown-data handling.
++
++### 简体中文
++- 绑定画面渲染代际，屏幕所有权或尺寸变化后旧帧不能重新开放触控。
++- 全屏高清模式使用同一输入确认机制，保障微秒时间戳唯一并请求本地 UI 刷新。
++- 增加真实播放时间与总时长，仅更新进度区域，未知数据不伪造。
++
+ ## [v0.1.25-test.1] - 2026-11-25
+ 
+ > R38 — real phone status widgets; receiver and Android build validation pending.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 1667f39..4d636c9 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.25"
++val appVersionName = "0.1.26"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+index 6542065..4f50ba4 100644
+--- a/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
++++ b/app/src/main/java/com/mcarplay/app/media/MediaListenerService.kt
+@@ -176,7 +176,7 @@ class MediaListenerService : NotificationListenerService() {
+                     playing = playing,
+                     art = artFor(controller, meta, title),
+                     pkg = controller.packageName,
+-                    positionMs = state?.position ?: 0L,
++                    positionMs = state?.position ?: -1L,
+                     playbackSpeed = if (playing) (state?.playbackSpeed ?: 1f) else 0f,
+                     durationMs = meta?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
+                     anchoredAtMs = android.os.SystemClock.elapsedRealtime(),
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+index 9bb0a2b..4432c6a 100644
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -56,7 +56,7 @@ internal class CarWithTranscoder(
+     private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+     private var dashboard: ProjectedDashboardRenderer? = null
+     private val pages = dashboardLayout?.let { ProjectionPageState<com.mcarplay.app.media.MediaSessionsState.NowPlaying>(it) }
+-    fun touchLayout(): ProjectedDashboardLayout? = dashboardLayout?.takeIf { it.fullContent } ?: pages?.touchLayout()
++    fun touchLayout(): ProjectedDashboardLayout? = pages?.touchLayout()
+     @Volatile private var pressedBounds: ProjectionRect? = null
+     fun updateProjectedPress(bounds: ProjectionRect?) {
+         if (pressedBounds == bounds) return
+@@ -81,23 +81,34 @@ internal class CarWithTranscoder(
+     }
+     @Volatile private var inputSyncRetry = false
+     private var unmatchedFrameCount = 0
+-    fun onProjectedFrameSent(ptsUs: Long) {
+-        if (dashboardLayout?.fullContent == true) return
+-        if (pages?.markSent(ptsUs) == true) {
+-            unmatchedFrameCount = 0
+-            return
++    fun onProjectedFrameSent(ptsUs: Long): Boolean {
++        when (pages?.confirmSent(ptsUs)) {
++            ProjectionPageState.Confirmation.CURRENT -> {
++                unmatchedFrameCount = 0
++                return pages?.touchLayout() != null
++            }
++            ProjectionPageState.Confirmation.OBSOLETE -> {
++                if (pages?.touchLayout() != null) return true
++                inputSyncRetry = true
++                glHandler.post { if (mayRefreshIdle()) scheduleRender() }
++                return false
++            }
++            else -> Unit
+         }
+         updateProjectedPress(null)
+         if (++unmatchedFrameCount >= 3) {
+-            fail("R35 encoder PTS mismatch; page input disabled")
++            fail("R39 encoder PTS mismatch; page input disabled")
+         } else {
+             inputSyncRetry = true
+-            log("VIDEO: R35 unmatched encoder PTS; requesting local UI resync")
++            log("VIDEO: R39 unmatched encoder PTS; requesting local UI resync")
+             glHandler.post { if (mayRefreshIdle()) scheduleRender() }
+         }
++        return false
+     }
++
+     fun invalidateProjectedInput() {
+         pages?.invalidate()
++        inputSyncRetry = true
+         updateProjectedPress(null)
+     }
+ 
+@@ -605,9 +616,9 @@ internal class CarWithTranscoder(
+                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+             }
+             check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "GL composition failed" }
+-            lastPresentationNs = maxOf(lastPresentationNs + 1, System.nanoTime())
++            lastPresentationNs = maxOf(lastPresentationNs + 1_000L, System.nanoTime())
+             check(EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, lastPresentationNs)) { "eglPresentationTimeANDROID" }
+-            currentLayout?.let { pages?.submit(it, lastPresentationNs / 1_000L, dashboard?.displayedMedia, state?.focus) }
++            state?.let { pages?.submit(it, lastPresentationNs / 1_000L, dashboard?.displayedMedia) }
+             check(EGL14.eglSwapBuffers(eglDisplay, eglSurface)) { "eglSwapBuffers" }
+             framesRendered++
+             if (!source) dashboardOnlyFrames++
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+index 4883647..20ab86c 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+@@ -14,11 +14,13 @@ internal enum class ProjectionPage { DASHBOARD, HOME, NAVIGATION, MUSIC, WIDGETS
+ internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
+     @Volatile var requested = initial
+         private set
+-    data class RenderState(val layout: ProjectedDashboardLayout, val focus: ProjectionFocusTarget?)
+-    private data class Frame<T>(val layout: ProjectedDashboardLayout, val media: T?, val focus: ProjectionFocusTarget?)
++    data class RenderState(val layout: ProjectedDashboardLayout, val focus: ProjectionFocusTarget?, val generation: Long)
++    enum class Confirmation { CURRENT, OBSOLETE, UNKNOWN }
++    private data class Frame<T>(val state: RenderState, val media: T?)
++    private var generation = 0L
+     private var focus: ProjectionFocusTarget? = null
+ 
+-    @Synchronized fun renderState() = RenderState(requested, focus)
++    @Synchronized fun renderState() = RenderState(requested, focus, generation)
+     @Synchronized fun clearFocus(): Boolean {
+         if (focus == null) return false
+         focus = null
+@@ -26,7 +28,7 @@ internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
+     }
+ 
+     @Synchronized fun moveFocus(direction: ProjectionDirection): Boolean {
+-        if (requested.fullContent || !requested.shell || sent?.layout !== requested) return false
++        if (requested.fullContent || !requested.shell || sent?.state?.layout !== requested) return false
+         val next = ProjectionFocus.move(requested, focus, direction) ?: return false
+         if (next == focus) return false
+         focus = next
+@@ -34,40 +36,53 @@ internal class ProjectionPageState<T>(initial: ProjectedDashboardLayout) {
+     }
+ 
+     @Synchronized fun confirmedFocus(): ProjectionFocusTarget? =
+-        focus?.takeIf { sent?.layout === requested && sent?.focus == it }
++        focus?.takeIf { sent?.state?.layout === requested && sent?.state?.focus == it }
+ 
+     private val frames = LinkedHashMap<Long, Frame<T>>()
+     private var sent: Frame<T>? = null
+     private var lastSentPts = Long.MIN_VALUE
+ 
+     @Synchronized fun select(page: ProjectionPage): Boolean {
+-        if (requested.fullContent || requested.page == page || sent?.layout !== requested) return false
++        if (requested.fullContent || requested.page == page || sent?.state?.layout !== requested) return false
+         requested = requested.withPage(page)
+         focus = null
+         return true
+     }
+ 
+-    @Synchronized fun submit(layout: ProjectedDashboardLayout, ptsUs: Long, media: T?, renderedFocus: ProjectionFocusTarget? = null) {
+-        frames[ptsUs] = Frame(layout, media, renderedFocus)
++    @Synchronized
++    fun submit(state: RenderState, ptsUs: Long, media: T?) {
++        // Preserve the generation captured before GL drawing, including obsolete frames.
++        frames[ptsUs] = Frame(state, media)
+         while (frames.size > 64) frames.remove(frames.keys.first())
+     }
+ 
+-    @Synchronized fun markSent(ptsUs: Long): Boolean {
+-        if (ptsUs <= lastSentPts) return sent != null
++    @Synchronized
++    fun confirmSent(ptsUs: Long): Confirmation {
++        if (ptsUs <= lastSentPts) return Confirmation.OBSOLETE
+         lastSentPts = ptsUs
+-        // Unknown or rewritten timestamps must not enable input against unconfirmed geometry.
+-        sent = frames[ptsUs]
++        val frame = frames[ptsUs]
+         frames.entries.removeAll { it.key <= ptsUs }
+-        return sent != null
++        sent = frame?.takeIf { it.state.generation == generation }
++        return when {
++            frame == null -> Confirmation.UNKNOWN
++            sent == null -> Confirmation.OBSOLETE
++            else -> Confirmation.CURRENT
++        }
+     }
+ 
+-    @Synchronized fun invalidate() {
++    @Synchronized
++    fun invalidate() {
++        generation++
+         sent = null
+-        frames.clear()
++        // Keep bounded metadata for old outputs so they are not mistaken for rewritten PTS.
+         focus = null
+     }
+-    @Synchronized fun touchLayout(): ProjectedDashboardLayout? = sent?.layout?.takeIf { it === requested }
+-    @Synchronized fun sentMedia(): T? = sent?.takeIf { it.layout === requested }?.media
++
++    @Synchronized
++    fun touchLayout(): ProjectedDashboardLayout? = sent?.state?.layout?.takeIf { it === requested }
++
++    @Synchronized
++    fun sentMedia(): T? = sent?.takeIf { it.state.layout === requested }?.media
+ }
+ 
+ internal class ProjectedDashboardLayout(
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+index e8683de..69b0d70 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -85,7 +85,7 @@ internal class ProjectedDashboardRenderer(
+         val y = r.top + r.height * .66f
+         ProjectionRect((x - 2).toInt(), (y - 2).toInt(),
+             kotlin.math.ceil(x + r.width * .82f + 2).toInt(),
+-            kotlin.math.ceil(y + layout.height * .008f + 2).toInt())
++            kotlin.math.ceil(r.top + r.height * .715f).toInt())
+     }
+     private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+     private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG)
+@@ -332,11 +332,15 @@ internal class ProjectedDashboardRenderer(
+             widgetSampler.sample(SystemClock.elapsedRealtime(), runtimeFps(), readPhone)
+         } else null
+         val duration = now?.durationMs ?: 0L
+-        val progress = if (duration > 0 && now != null) {
+-            (now.displayPositionAt(SystemClock.elapsedRealtime()).toDouble() / duration * (layout.panel.width * .82f)).toInt()
++        val position = now?.displayPositionAt(SystemClock.elapsedRealtime()) ?: 0L
++        val playbackTime = if (MediaSessionsState.accessGranted && now != null && now.positionMs >= 0L) {
++            ProjectionPlaybackTime.from(position, duration)
++        } else null
++        val progress = if (playbackTime != null) {
++            (position.toDouble() / duration * (layout.panel.width * .82f)).toInt()
+         } else -1
+         return Snapshot(DashboardVisualKey(clock.format(at), date.format(at), now?.title, now?.artist,
+-            now?.playing == true, MediaSessionsState.accessGranted, progress, now?.art, now?.sessionToken, widgets), now)
++            now?.playing == true, MediaSessionsState.accessGranted, progress, now?.art, now?.sessionToken, widgets, playbackTime), now)
+     }
+ 
+     private fun uploadRegion(bounds: ProjectionRect, pixels: Bitmap, render: () -> Unit) {
+@@ -624,6 +628,15 @@ internal class ProjectedDashboardRenderer(
+             paint.color = Color.WHITE
+             canvas.drawRoundRect(x, y, x + progress.coerceAtMost(available.toInt()), y + layout.height * .008f, 3f, 3f, paint)
+         }
++        snapshot.key.playbackTime?.let { time ->
++            val size = minOf(layout.height * .024f, p.height * .034f)
++            val baseline = p.top + p.height * .705f
++            val halfWidth = available * .48f
++            label(time.elapsed, x, baseline, size, halfWidth, secondary)
++            textPaint.textSize = size
++            val duration = TextUtils.ellipsize(time.duration, textPaint, halfWidth, TextUtils.TruncateAt.END).toString()
++            label(duration, x + available - textPaint.measureText(duration), baseline, size, halfWidth, secondary)
++        }
+     }
+     fun release() {
+         if (texture != 0) GL.glDeleteTextures(1, intArrayOf(texture), 0)
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+index 8e021df..ee15d92 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+@@ -50,6 +50,7 @@ internal data class DashboardVisualKey(
+     val art: Any?,
+     val mediaIdentity: Any? = null,
+     val widgets: ProjectionWidgetStatus? = null,
++    val playbackTime: ProjectionPlaybackTime? = null,
+ ) {
+     fun widgetsChangedFrom(old: DashboardVisualKey?): Boolean =
+         old == null || clock != old.clock || date != old.date || widgets != old.widgets
+@@ -58,7 +59,8 @@ internal data class DashboardVisualKey(
+         if (old == null) return DashboardDirty(true, true, true)
+         val panel = date != old.date || title != old.title || artist != old.artist || playing != old.playing ||
+             hasAccess != old.hasAccess || art !== old.art || mediaIdentity != old.mediaIdentity
+-        return DashboardDirty(clock != old.clock, panel, !panel && progressPixels != old.progressPixels)
++        val progress = !panel && (progressPixels != old.progressPixels || playbackTime != old.playbackTime)
++        return DashboardDirty(clock != old.clock, panel, progress)
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionPlaybackTime.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionPlaybackTime.kt
+new file mode 100644
+index 0000000..89f2c4e
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionPlaybackTime.kt
+@@ -0,0 +1,24 @@
++package com.mcarplay.app.video
++
++/** Whole-second media timestamps. Unknown or invalid duration is never displayed as 0:00. */
++internal data class ProjectionPlaybackTime(val elapsedSeconds: Long, val durationSeconds: Long) {
++    val elapsed: String get() = format(elapsedSeconds)
++    val duration: String get() = format(durationSeconds)
++
++    companion object {
++        fun from(positionMs: Long, durationMs: Long): ProjectionPlaybackTime? {
++            if (durationMs <= 0L || positionMs < 0L) return null
++            return ProjectionPlaybackTime(positionMs.coerceAtMost(durationMs) / 1_000L, durationMs / 1_000L)
++        }
++
++        private fun format(seconds: Long): String {
++            val minutes = (seconds / 60) % 60
++            val secondText = (seconds % 60).toString().padStart(2, '0')
++            return if (seconds >= 3_600L) {
++                "${seconds / 3_600}:${minutes.toString().padStart(2, '0')}:$secondText"
++            } else {
++                "$minutes:$secondText"
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+index ec16b8d..3365e46 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -181,11 +181,20 @@ class VideoSender(
+         }
+         val (px, py) = layout.displayPoint(x, y, displayWidth, displayHeight) ?: return DashboardTouchRouter.Result()
+         val result = dashboardTouch.route(layout, px, py, down, targetWidth, targetHeight)
++        if (dashboardCancelPending.getAndSet(false) || pipeline.touchLayout() !== layout ||
++            !runCatching { phoneOwnsScreen() }.getOrDefault(false)
++        ) {
++            dashboardTouch.reset()
++            pipeline.updateProjectedPress(null)
++            capturedMediaIdentity = null
++            suppressDashboardGesture = down
++            return DashboardTouchRouter.Result(cancelSource = true)
++        }
+         pipeline.updateProjectedPress(dashboardTouch.pressedBounds())
+         result.page?.let { pipeline.selectPage(it) }
+         val identity = capturedMediaIdentity
+         if (!down) capturedMediaIdentity = null
+-        return result.copy(cancelSource = dashboardCancelPending.getAndSet(false) || result.cancelSource, mediaIdentity = identity)
++        return result.copy(mediaIdentity = identity)
+     }
+ 
+     /** Consume only shell navigation; never synthesize directional input into the live source. */
+@@ -1314,8 +1323,7 @@ class VideoSender(
+                                 }
+                             if (sent > 0) {
+                                 transcoder?.takeIf { it.dashboardLayout != null }?.let {
+-                                    it.onProjectedFrameSent(bufferInfo.presentationTimeUs)
+-                                    dashboardFrameSent = true
++                                    dashboardFrameSent = it.onProjectedFrameSent(bufferInfo.presentationTimeUs)
+                                 }
+                                 r5Cadence.recordForwardedFrame(bufferInfo.presentationTimeUs, System.nanoTime())
+                                 r5StallLogged.set(false)
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt
+index c5ea057..45526fe 100644
+--- a/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionFocusTest.kt
+@@ -48,28 +48,27 @@ class ProjectionFocusTest {
+         val l = base()
+         val state = ProjectionPageState<String>(l)
+         assertFalse(state.moveFocus(ProjectionDirection.DOWN))
+-        state.submit(l, 1, "A")
+-        state.markSent(1)
++        state.submit(state.renderState(), 1, "A")
++        state.confirmSent(1)
+         assertTrue(state.moveFocus(ProjectionDirection.DOWN))
+         val first = state.renderState().focus
+         assertNull(state.confirmedFocus())
+-        state.submit(l, 2, "A", first)
++        state.submit(state.renderState().copy(focus = first), 2, "A")
+         assertTrue(state.moveFocus(ProjectionDirection.DOWN))
+         val second = state.renderState().focus
+         assertTrue(first != second)
+-        state.markSent(2)
++        state.confirmSent(2)
+         assertNull(state.confirmedFocus())
+-        state.submit(l, 3, "B", second)
+-        state.markSent(3)
++        state.submit(state.renderState().copy(focus = second), 3, "B")
++        state.confirmSent(3)
+         assertEquals(second, state.confirmedFocus())
+         assertEquals("B", state.sentMedia())
+         assertTrue(state.select(ProjectionPage.HOME))
+         assertNull(state.confirmedFocus())
+         assertNull(state.renderState().focus)
+         assertFalse(state.moveFocus(ProjectionDirection.RIGHT))
+-        val home = state.requested
+-        state.submit(home, 4, null)
+-        state.markSent(4)
++        state.submit(state.renderState(), 4, null)
++        state.confirmSent(4)
+         assertTrue(state.moveFocus(ProjectionDirection.RIGHT))
+         state.invalidate()
+         assertNull(state.confirmedFocus())
+@@ -80,12 +79,12 @@ class ProjectionFocusTest {
+     fun focusClearCannotBeRearmedByAnInFlightFrame() {
+         val l = base()
+         val state = ProjectionPageState<String>(l)
+-        state.submit(l, 1, null)
+-        state.markSent(1)
++        state.submit(state.renderState(), 1, null)
++        state.confirmSent(1)
+         state.moveFocus(ProjectionDirection.DOWN)
+-        state.submit(l, 2, null, state.renderState().focus)
++        state.submit(state.renderState(), 2, null)
+         assertTrue(state.clearFocus())
+-        state.markSent(2)
++        state.confirmSent(2)
+         assertNull(state.confirmedFocus())
+         assertNull(state.renderState().focus)
+     }
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionPresentationTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionPresentationTest.kt
+new file mode 100644
+index 0000000..31f1bab
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionPresentationTest.kt
+@@ -0,0 +1,104 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionPresentationTest {
++    private fun layout(full: Boolean = false) =
++        ProjectedDashboardLayout(1920, 1080, 1920, 1080, true, fullContent = full, shell = true)
++
++    @Test
++    fun oldRenderSubmittedAfterInvalidationCannotReopenTouch() {
++        for (full in listOf(false, true)) {
++            val l = layout(full)
++            val pages = ProjectionPageState<String>(l)
++            val old = pages.renderState()
++            pages.submit(old, 1, "old")
++            pages.confirmSent(1)
++            assertEquals(l, pages.touchLayout())
++            pages.invalidate()
++            pages.submit(old, 2, "old")
++            assertEquals(ProjectionPageState.Confirmation.OBSOLETE, pages.confirmSent(2))
++            assertNull(pages.touchLayout())
++            assertNull(pages.sentMedia())
++            pages.submit(pages.renderState(), 3, "new")
++            assertEquals(ProjectionPageState.Confirmation.CURRENT, pages.confirmSent(3))
++            assertEquals(l, pages.touchLayout())
++            assertEquals("new", pages.sentMedia())
++            assertEquals(ProjectionPageState.Confirmation.OBSOLETE, pages.confirmSent(2))
++            assertEquals("new", pages.sentMedia())
++        }
++    }
++
++    @Test
++    fun pendingMetadataAcrossSeveralInvalidationsCannotRearm() {
++        val pages = ProjectionPageState<String>(layout())
++        repeat(5) { i ->
++            pages.submit(pages.renderState(), i.toLong(), "old")
++            pages.invalidate()
++        }
++        repeat(5) { i ->
++            assertEquals(ProjectionPageState.Confirmation.OBSOLETE, pages.confirmSent(i.toLong()))
++            assertNull(pages.touchLayout())
++        }
++        pages.submit(pages.renderState(), 5, "new")
++        assertEquals(ProjectionPageState.Confirmation.CURRENT, pages.confirmSent(5))
++        assertEquals("new", pages.sentMedia())
++    }
++
++    @Test
++    fun randomizedOldAndNewGenerationConfirmations() {
++        val random = Random(39)
++        val pages = ProjectionPageState<Long>(layout())
++        var pts = 0L
++        repeat(10000) {
++            val captured = pages.renderState()
++            val invalidated = random.nextBoolean()
++            if (invalidated) pages.invalidate()
++            pages.submit(captured, ++pts, pts)
++            val result = pages.confirmSent(pts)
++            if (invalidated) {
++                assertEquals(ProjectionPageState.Confirmation.OBSOLETE, result)
++                assertNull(pages.touchLayout())
++            } else {
++                assertEquals(ProjectionPageState.Confirmation.CURRENT, result)
++                assertEquals(pts, pages.sentMedia())
++            }
++        }
++        println("Random generation confirmations: 10000")
++    }
++
++    @Test
++    fun playbackTimestampsAreClampedAndUnknownDurationRemainsUnavailable() {
++        assertNull(ProjectionPlaybackTime.from(0, 0))
++        assertNull(ProjectionPlaybackTime.from(-1, 120_000))
++        val time = requireNotNull(ProjectionPlaybackTime.from(61_999, 3_661_999))
++        assertEquals("1:01", time.elapsed)
++        assertEquals("1:01:01", time.duration)
++        val clamped = requireNotNull(ProjectionPlaybackTime.from(Long.MAX_VALUE, 60_000))
++        assertEquals("1:00", clamped.elapsed)
++        assertEquals("1:00", clamped.duration)
++        val random = Random(390)
++        repeat(10000) {
++            val duration = random.nextLong(1L, Long.MAX_VALUE)
++            val position = random.nextLong(0L, Long.MAX_VALUE)
++            val label = requireNotNull(ProjectionPlaybackTime.from(position, duration))
++            assertTrue(label.elapsedSeconds in 0..label.durationSeconds)
++        }
++        println("Random playback time bounds: 10000")
++    }
++
++    @Test
++    fun elapsedLabelUpdatesOnlyTheProgressRegion() {
++        val time = ProjectionPlaybackTime.from(1_000, 100_000)
++        val key = DashboardVisualKey("12:00", "Wed", "Title", "Artist", true, true, 5, null, playbackTime = time)
++        val nextSecond = key.copy(playbackTime = ProjectionPlaybackTime.from(2_000, 100_000))
++        val sameSecond = key.copy(playbackTime = ProjectionPlaybackTime.from(1_999, 100_000))
++        assertEquals(DashboardDirty(false, false, true), nextSecond.changesFrom(key))
++        assertEquals(DashboardDirty(false, false, false), sameSecond.changesFrom(key))
++        assertEquals(DashboardDirty(false, false, true), key.copy(playbackTime = null).changesFrom(key))
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt
+index d3bb4d9..378d40a 100644
+--- a/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionShellTest.kt
+@@ -15,33 +15,33 @@ class ProjectionShellTest {
+         val initial = layout()
+         val pages = ProjectionPageState<String>(initial)
+         assertNull(pages.touchLayout())
+-        pages.submit(initial, 100, "A")
++        pages.submit(pages.renderState().copy(layout = initial), 100, "A")
+         assertNull(pages.touchLayout())
+-        pages.markSent(100)
++        pages.confirmSent(100)
+         assertEquals(initial, pages.touchLayout())
+         assertEquals("A", pages.sentMedia())
+         assertTrue(pages.select(ProjectionPage.MUSIC))
+         assertNull(pages.touchLayout())
+         assertNull(pages.sentMedia())
+         assertFalse(pages.select(ProjectionPage.HOME))
+-        pages.submit(initial, 110, "A")
+-        pages.markSent(110)
++        pages.submit(pages.renderState().copy(layout = initial), 110, "A")
++        pages.confirmSent(110)
+         assertNull(pages.touchLayout())
+         val music = pages.requested
+-        pages.submit(music, 120, "B")
+-        pages.markSent(120)
++        pages.submit(pages.renderState().copy(layout = music), 120, "B")
++        pages.confirmSent(120)
+         assertEquals(music, pages.touchLayout())
+         assertEquals("B", pages.sentMedia())
+-        pages.markSent(110)
++        pages.confirmSent(110)
+         assertEquals("B", pages.sentMedia())
+         pages.invalidate()
+         assertNull(pages.touchLayout())
+         assertNull(pages.sentMedia())
+-        pages.submit(music, 130, "C")
+-        pages.markSent(131)
++        pages.submit(pages.renderState().copy(layout = music), 130, "C")
++        pages.confirmSent(131)
+         assertNull(pages.touchLayout())
+-        pages.submit(music, 140, "C")
+-        pages.markSent(140)
++        pages.submit(pages.renderState().copy(layout = music), 140, "C")
++        pages.confirmSent(140)
+         assertEquals("C", pages.sentMedia())
+     }
+ 
+@@ -49,13 +49,13 @@ class ProjectionShellTest {
+     fun metadataEvictionAndUnknownTimestampFailClosed() {
+         val l = layout()
+         val pages = ProjectionPageState<String>(l)
+-        repeat(100) { pages.submit(l, it.toLong(), "player-$it") }
+-        assertFalse(pages.markSent(0))
++        repeat(100) { pages.submit(pages.renderState(), it.toLong(), "player-$it") }
++        assertEquals(ProjectionPageState.Confirmation.UNKNOWN, pages.confirmSent(0))
+         assertNull(pages.touchLayout())
+-        assertTrue(pages.markSent(99))
++        assertEquals(ProjectionPageState.Confirmation.CURRENT, pages.confirmSent(99))
+         assertEquals("player-99", pages.sentMedia())
+         pages.invalidate()
+-        assertFalse(pages.markSent(100))
++        assertEquals(ProjectionPageState.Confirmation.UNKNOWN, pages.confirmSent(100))
+         assertNull(pages.touchLayout())
+     }
+ 
+@@ -113,8 +113,8 @@ class ProjectionShellTest {
+         assertEquals(ProjectionRect(0, 0, 1920, 1080), full.video)
+         assertTrue(full.dock.isEmpty())
+         val pages = ProjectionPageState<String>(full)
+-        pages.submit(full, 1, null)
+-        pages.markSent(1)
++        pages.submit(pages.renderState(), 1, null)
++        pages.confirmSent(1)
+         assertFalse(pages.select(ProjectionPage.HOME))
+     }
+ 

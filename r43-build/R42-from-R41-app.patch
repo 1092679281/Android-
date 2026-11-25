@@ -1,0 +1,488 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ca0407e1c47bdd7f502e454daa781bb607c6c9b4..754c9eab72b5eb7f395c4bb008ccf7a1bd664c16 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.29-test.1] - 2026-11-25
++
++> R42 — projected navigation source status candidate.
++
++### English
++- Distinguish a quiet source image from an explicitly detected input gap; wait for a post-gap decoded timestamp before reporting recovery.
++- Show a passive navigation-source card in available letterbox space, without shrinking the video or overlapping controls.
++- Retain the existing CarWith source, original touch geometry, dynamic pacing and theme; no independent navigation data is claimed.
++
++### 简体中文
++- 区分静止画面和已检测到的输入断流，等待断流后的解码时间戳再解除恢复状态。
++- 在可用留白区域显示导航源状态卡，不缩小视频或覆盖控制区。
++- 保留 CarWith 源、原触控坐标、动态调度及主题；不声称具备独立导航数据。
++
+ ## [v0.1.28-test.1] - 2026-11-25
+ 
+ > R41 — projected appearance and media lifecycle candidate.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 49e14af551f8cc5838f94cf807d6bb7e31482c91..2460f06c1581721eb9d0d82f2d013892839494d6 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.28"
++val appVersionName = "0.1.29"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+index 43e79c9d66610305e15bdd4377c63e07be1e5804..4f2440d71d9f015ff2fc9d7a5fc28577b468d221 100644
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -133,6 +133,7 @@ internal class CarWithTranscoder(
+     private var renderScheduled = false
+     private var lastTexturePts: Long? = null
+     @Volatile private var lastSourceNs = 0L
++    private val sourceMonitor = ProjectionSourceMonitor()
+     @Volatile private var coalescedFrames = 0L
+     @Volatile private var dashboardOnlyFrames = 0L
+     @Volatile private var uploadedPixels = 0L
+@@ -176,6 +177,7 @@ internal class CarWithTranscoder(
+ 
+     /** Called only by the external queue consumer, before the first post-gap access unit. */
+     fun markInputDiscontinuity() {
++        sourceMonitor.gap()
+         resync.discontinuity()
+     }
+ 
+@@ -188,7 +190,7 @@ internal class CarWithTranscoder(
+         val now = android.os.SystemClock.uptimeMillis()
+         val state = pages?.renderState() ?: return false
+         return renderer.needsRefresh(
+-            state.layout, now, System.nanoTime() - lastSourceNs > 2_000_000_000L, pressedBounds, state.focus?.bounds,
++            state.layout, now, sourceMonitor.status(System.nanoTime()), pressedBounds, state.focus?.bounds,
+         )
+     }
+ 
+@@ -254,16 +256,19 @@ internal class CarWithTranscoder(
+         val codec =
+             decoder ?: run {
+                 if (!frame.keyFrame) {
++                    sourceMonitor.gap()
+                     resync.discontinuity()
+                     requestSourceKeyFrameIfDue()
+                     return
+                 }
+                 val sets = decoderParameterSets(frame) ?: run {
++                    sourceMonitor.gap()
+                     resync.discontinuity()
+                     requestSourceKeyFrameIfDue()
+                     return
+                 }
+                 startDecoder(sets.first, sets.second) ?: run {
++                    sourceMonitor.gap()
+                     resync.discontinuity()
+                     requestSourceKeyFrameIfDue()
+                     return
+@@ -296,6 +301,7 @@ internal class CarWithTranscoder(
+             }
+             buffer.put(frame.data)
+             lastInputPtsUs = maxOf(lastInputPtsUs + 1, System.nanoTime() / 1_000L)
++            if (frame.keyFrame) sourceMonitor.keyFrameQueued(lastInputPtsUs)
+             codec.queueInputBuffer(index, 0, frame.data.size, lastInputPtsUs, 0)
+             consecutiveInputErrors = 0
+         } catch (error: Exception) {
+@@ -314,6 +320,7 @@ internal class CarWithTranscoder(
+                 "null=${inputDropsByReason.get(1)} oversize=${inputDropsByReason.get(2)} " +
+                 "codec=${inputDropsByReason.get(3)}（等下一 IDR）")
+         }
++        sourceMonitor.gap()
+         resync.discontinuity()
+         requestSourceKeyFrameIfDue()
+     }
+@@ -516,6 +523,7 @@ internal class CarWithTranscoder(
+             if (pts != 0L && lastTexturePts == pts) return
+             lastTexturePts = pts
+             lastSourceNs = System.nanoTime()
++            sourceMonitor.frameLatched(pts, lastSourceNs)
+             texture.getTransformMatrix(texMatrix)
+             latchErrors = 0
+             if (dashboardLayout == null) {
+@@ -570,7 +578,7 @@ internal class CarWithTranscoder(
+             val currentLayout = state?.layout
+             dashboard?.let { renderer ->
+                 renderer.draw(
+-                    currentLayout ?: error("missing dashboard layout"), System.nanoTime() - lastSourceNs > 2_000_000_000L,
++                    currentLayout ?: error("missing dashboard layout"), sourceMonitor.status(System.nanoTime()),
+                     pressedBounds, state?.focus?.bounds,
+                 )
+             }
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+index 25e061a544a57db757f15cf249534618625153fc..790d6b3ed5e3a9b0cd12001705d6f033bae4c282 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+@@ -141,6 +141,8 @@ internal class ProjectedDashboardLayout(
+     } else emptyList()
+     val panel: ProjectionRect
+     val miniPanel: ProjectionRect?
++    val navigationStatus: ProjectionRect?
++    val sourceResolution get() = "${sourceWidth} × ${sourceHeight}"
+     val musicArt: ProjectionRect?
+     val content = if (page == ProjectionPage.NAVIGATION) workspace else ProjectionRect(rail.right + gap, gap, panelLeft - gap, height - gap)
+     val dock = if (shell && !fullContent) ProjectionPage.entries.mapIndexed { i, dest ->
+@@ -184,6 +186,9 @@ internal class ProjectedDashboardLayout(
+             val cardY = workspace.top + (workspace.height - cardH) / 2
+             ProjectionRect(cardX, cardY, cardX + cardW, cardY + cardH)
+         } else null
++        navigationStatus = if (shell && !fullContent && page == ProjectionPage.NAVIGATION) {
++            ProjectionNavigationStatus.card(workspace, video, miniPanel, gap / 2, height)
++        } else null
+         musicArt = if (page == ProjectionPage.MUSIC && !fullContent) {
+             val artArea = workspace.width * 43 / 100
+             val size = minOf(artArea - gap * 3, (workspace.height * .70f).toInt()).coerceAtLeast(1)
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+index f99892e1fe47a0deb2ab442a01cddbccf2bf8e98..c924e95bf7201dd82739dc3343e0616b03abad28 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt
+@@ -61,7 +61,7 @@ internal class ProjectedDashboardRenderer(
+     private var wallpaperAccent: Int? = null
+     private var night = true
+     private var desiredNight = true
+-    private var stale = false
++    private var sourceStatus = ProjectionSourceStatus.WAITING
+     private var transitionStart = -1L
+     private var brightness = -1
+     var displayedMedia: MediaSessionsState.NowPlaying? = null
+@@ -77,6 +77,7 @@ internal class ProjectedDashboardRenderer(
+     private var railBitmap: Bitmap? = null
+     private var panelBitmap: Bitmap? = null
+     private var progressBitmap: Bitmap? = null
++    private var navigationBitmap: Bitmap? = null
+     private var p = -1
+     private var t = -1
+     private var sampler = -1
+@@ -202,9 +203,13 @@ internal class ProjectedDashboardRenderer(
+     }
+ 
+     fun needsRefresh(
+-        next: ProjectedDashboardLayout, nowMs: Long, sourceStale: Boolean, pressed: ProjectionRect?, focused: ProjectionRect?,
++        next: ProjectedDashboardLayout,
++        nowMs: Long,
++        nextSourceStatus: ProjectionSourceStatus,
++        pressed: ProjectionRect?,
++        focused: ProjectionRect?,
+     ): Boolean {
+-        if (next !== layout || sourceStale != stale || pressed != pressTarget || focused != focusBounds || animating()) return true
++        if (next !== layout || nextSourceStatus != sourceStatus || pressed != pressTarget || focused != focusBounds || animating()) return true
+         if (lastPoll < 0 || nowMs - lastPoll >= 250) {
+             lastPoll = nowMs
+             pendingSnapshot = snapshot()
+@@ -217,14 +222,14 @@ internal class ProjectedDashboardRenderer(
+         return dirty.rail || (layout.showsMedia && (dirty.panel || dirty.progress)) || widgetsDirty
+     }
+ 
+-    fun draw(next: ProjectedDashboardLayout, sourceStale: Boolean, pressed: ProjectionRect?, focused: ProjectionRect?) {
++    fun draw(next: ProjectedDashboardLayout, nextSourceStatus: ProjectionSourceStatus, pressed: ProjectionRect?, focused: ProjectionRect?) {
+         GL.glViewport(0, 0, layout.width, layout.height)
+         GL.glUseProgram(program)
+         GL.glActiveTexture(GL.GL_TEXTURE0)
+         GL.glBindTexture(GL.GL_TEXTURE_2D, texture)
+         val now = SystemClock.uptimeMillis()
+         val pageChanged = layout !== next
+-        needsRefresh(next, now, sourceStale, pressed, focused)
++        needsRefresh(next, now, nextSourceStatus, pressed, focused)
+         val nightNow = desiredNight
+         if (pageChanged || nightNow != night) {
+             layout = next
+@@ -242,11 +247,12 @@ internal class ProjectedDashboardRenderer(
+                 pressFrom = 0f
+                 pressMoving = false
+             }
+-            stale = sourceStale
++            sourceStatus = nextSourceStatus
+             if (pageChanged) transitionStart = now
+             railBitmap?.recycle(); railBitmap = null
+             panelBitmap?.recycle(); panelBitmap = null
+             progressBitmap?.recycle(); progressBitmap = null
++            navigationBitmap?.recycle(); navigationBitmap = null
+             val current = snapshot()
+             val pixels = Bitmap.createBitmap(layout.width, layout.height, Bitmap.Config.ARGB_8888)
+             try {
+@@ -267,17 +273,24 @@ internal class ProjectedDashboardRenderer(
+             }
+             pendingSnapshot = null
+         } else {
+-            val staleChanged = stale != sourceStale
+-            stale = sourceStale
+-            needsRefresh(layout, now, sourceStale, pressed, focused)
+-            val current = pendingSnapshot ?: if (staleChanged) snapshot() else null
++            val sourceChanged = sourceStatus != nextSourceStatus
++            sourceStatus = nextSourceStatus
++            needsRefresh(layout, now, nextSourceStatus, pressed, focused)
++            val current = pendingSnapshot ?: if (sourceChanged) snapshot() else null
+             current?.let {
+                 val dirty = it.key.changesFrom(lastKey)
+-                if (dirty.rail || staleChanged) {
++                if (dirty.rail || sourceChanged) {
+                     val r = layout.rail
+                     val pixels = railBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888).also { railBitmap = it }
+                     uploadRegion(r, pixels) { renderRail(current) }
+                 }
++                if (sourceChanged) {
++                    layout.navigationStatus?.let { r ->
++                        val pixels = navigationBitmap ?: Bitmap.createBitmap(r.width, r.height, Bitmap.Config.ARGB_8888)
++                            .also { navigationBitmap = it }
++                        uploadRegion(r, pixels) { renderNavigationStatus() }
++                    }
++                }
+                 val widgetsDirty = layout.page == ProjectionPage.WIDGETS && it.key.widgetsChangedFrom(lastKey)
+                 if ((layout.showsMedia && dirty.panel) || widgetsDirty) {
+                     val r = if (layout.page == ProjectionPage.WIDGETS || layout.page == ProjectionPage.MUSIC) {
+@@ -440,13 +453,9 @@ internal class ProjectedDashboardRenderer(
+         val railX = rail.left + rail.width * .10f
+         label(snapshot.key.clock, railX, rail.top + h * .085f, rail.width * .26f, rail.width * .8f, bold = true)
+         // Connection indicator is local composition status, not claimed GPS or phone signal.
+-        paint.color = if (stale) 0xFFE9AE55.toInt() else 0xFF71E6B2.toInt()
++        paint.color = sourceColor()
+         canvas.drawCircle(rail.left + rail.width * .5f, rail.top + h * .13f, rail.width * .065f, paint)
+-        val status = if (stale) {
+-            if (chinese) "静止" else "IDLE"
+-        } else {
+-            if (chinese) "有新帧" else "FRAME"
+-        }
++        val status = sourceLabel()
+         label(status, railX, rail.top + h * .20f, rail.width * .19f, rail.width * .8f)
+         for ((page, bounds) in layout.dock) icon(page, bounds, page == layout.page)
+ 
+@@ -530,7 +539,10 @@ internal class ProjectedDashboardRenderer(
+         val h = layout.height.toFloat()
+         when (layout.page) {
+             ProjectionPage.DASHBOARD, ProjectionPage.MUSIC -> renderPanel(snapshot)
+-            ProjectionPage.NAVIGATION -> if (layout.showsMedia) renderPanel(snapshot) else Unit
++            ProjectionPage.NAVIGATION -> {
++                if (layout.showsMedia) renderPanel(snapshot)
++                renderNavigationStatus()
++            }
+             ProjectionPage.HOME -> {
+                 label(pageName(layout.page), w.left+h*.06f,w.top+h*.12f,h*.065f,w.width-h*.12f,bold=true)
+                 for ((page,bounds) in layout.tiles) icon(page,bounds,false,true)
+@@ -541,6 +553,34 @@ internal class ProjectedDashboardRenderer(
+         }
+     }
+ 
++    private fun sourceColor(): Int = when (sourceStatus) {
++        ProjectionSourceStatus.UPDATING -> if (night) 0xFF71E6B2.toInt() else 0xFF217C53.toInt()
++        ProjectionSourceStatus.RECOVERING -> if (night) 0xFFFFC56A.toInt() else 0xFF995700.toInt()
++        else -> if (night) 0xFFC0D7EF.toInt() else 0xFF425B76.toInt()
++    }
++
++    private fun sourceLabel(): String = when (sourceStatus) {
++        ProjectionSourceStatus.WAITING -> if (chinese) "等待" else "WAIT"
++        ProjectionSourceStatus.UPDATING -> if (chinese) "更新" else "FRAME"
++        ProjectionSourceStatus.STILL -> if (chinese) "静止" else "STILL"
++        ProjectionSourceStatus.RECOVERING -> if (chinese) "恢复中" else "SYNC"
++    }
++
++    private fun renderNavigationStatus() {
++        val r = layout.navigationStatus ?: return
++        val pad = r.height * .18f
++        val x = r.left + pad
++        val radius = r.height * .22f
++        paint.color = if (night) 0xB229405D.toInt() else 0xB2FFFFFF.toInt()
++        canvas.drawRoundRect(rect(r), radius, radius, paint)
++        paint.color = sourceColor()
++        canvas.drawCircle(x + r.height * .06f, r.top + r.height * .32f, r.height * .045f, paint)
++        val titleX = x + r.height * .19f
++        val title = if (chinese) "导航源 · ${sourceLabel()}" else "Source · ${sourceLabel()}"
++        label(title, titleX, r.top + r.height * .43f, r.height * .24f, r.right - titleX - pad, bold = true)
++        label(layout.sourceResolution, x, r.top + r.height * .79f, r.height * .23f, r.width - pad * 2, secondary)
++    }
++
+     private fun renderWidgets(snapshot: Snapshot) {
+         val cards = layout.widgetCards
+         if (cards.size != 2) return
+@@ -680,6 +720,8 @@ internal class ProjectedDashboardRenderer(
+         railBitmap?.recycle()
+         panelBitmap?.recycle()
+         progressBitmap?.recycle()
++        navigationBitmap?.recycle()
++        navigationBitmap = null
+         railBitmap = null
+         panelBitmap = null
+         progressBitmap = null
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionNavigationStatus.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionNavigationStatus.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8e5aa4c669b55dba105773eec01f7f941ffb186
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionNavigationStatus.kt
+@@ -0,0 +1,69 @@
++package com.mcarplay.app.video
++
++internal enum class ProjectionSourceStatus { WAITING, UPDATING, STILL, RECOVERING }
++
++/** Input gaps are explicit evidence; a quiet map alone is not a connection failure. */
++internal class ProjectionSourceMonitor {
++    private var lastFrameNs: Long? = null
++    private var recovering = false
++    private var recoveryPtsUs: Long? = null
++
++    @Synchronized
++    fun gap() {
++        recovering = true
++        recoveryPtsUs = null
++    }
++
++    @Synchronized
++    fun keyFrameQueued(ptsUs: Long) {
++        if (recovering && recoveryPtsUs == null && ptsUs > 0) recoveryPtsUs = ptsUs
++    }
++
++    @Synchronized
++    fun frameLatched(ptsNs: Long, nowNs: Long) {
++        lastFrameNs = nowNs
++        // A delayed pre-gap decoder output must not claim recovery. Surface timestamps use ns.
++        val fence = recoveryPtsUs
++        if (recovering && fence != null && ptsNs > 0 && ptsNs / 1_000L >= fence) {
++            recovering = false
++            recoveryPtsUs = null
++        }
++    }
++
++    @Synchronized
++    fun status(nowNs: Long): ProjectionSourceStatus {
++        if (recovering) return ProjectionSourceStatus.RECOVERING
++        val last = lastFrameNs ?: return ProjectionSourceStatus.WAITING
++        return if (nowNs >= last && nowNs - last > 2_000_000_000L) {
++            ProjectionSourceStatus.STILL
++        } else ProjectionSourceStatus.UPDATING
++    }
++}
++
++/** A passive status card may occupy letterbox space, never alter the video or control geometry. */
++internal object ProjectionNavigationStatus {
++    fun card(workspace: ProjectionRect, video: ProjectionRect, mini: ProjectionRect?, gap: Int, height: Int): ProjectionRect? {
++        val candidates = if (mini != null) {
++            listOf(
++                ProjectionRect(mini.left, workspace.top, mini.right, mini.top - gap),
++                ProjectionRect(mini.left, mini.bottom + gap, mini.right, workspace.bottom),
++            )
++        } else {
++            listOf(
++                ProjectionRect(workspace.left, workspace.top, workspace.right, video.top - gap),
++                ProjectionRect(workspace.left, video.bottom + gap, workspace.right, workspace.bottom),
++                ProjectionRect(workspace.left, video.top, video.left - gap, video.bottom),
++                ProjectionRect(video.right + gap, video.top, workspace.right, video.bottom),
++            )
++        }
++        return candidates.filter { it.width >= height * .30f && it.height >= height * .10f }
++            .maxByOrNull { it.width.toLong() * it.height }
++            ?.let { r ->
++                val w = minOf(r.width, (height * .70f).toInt())
++                val h = minOf(r.height, (height * .16f).toInt())
++                val x = r.left + (r.width - w) / 2
++                val y = r.top + (r.height - h) / 2
++                ProjectionRect(x, y, x + w, y + h)
++            }
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionNavigationStatusTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionNavigationStatusTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d012514530df1eaba9d2d696d1316e7fb0ad0a7
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionNavigationStatusTest.kt
+@@ -0,0 +1,94 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class ProjectionNavigationStatusTest {
++    @Test
++    fun quietSourceIsNotRecovery() {
++        val m = ProjectionSourceMonitor()
++        assertEquals(ProjectionSourceStatus.WAITING, m.status(100))
++        m.frameLatched(1000, 100)
++        assertEquals(ProjectionSourceStatus.UPDATING, m.status(2_000_000_100))
++        assertEquals(ProjectionSourceStatus.STILL, m.status(2_000_000_101))
++        m.frameLatched(2000, 3_000_000_000)
++        assertEquals(ProjectionSourceStatus.UPDATING, m.status(3_000_000_001))
++    }
++
++    @Test
++    fun recoveryWaitsForPostGapKeyframeTimestamp() {
++        val m = ProjectionSourceMonitor()
++        m.frameLatched(100_000, 100_000)
++        m.gap()
++        m.frameLatched(200_000, 200_000)
++        assertEquals(ProjectionSourceStatus.RECOVERING, m.status(200_000))
++        m.keyFrameQueued(300)
++        m.frameLatched(299_999, 300_000)
++        assertEquals(ProjectionSourceStatus.RECOVERING, m.status(300_000))
++        m.frameLatched(0, 301_000)
++        assertEquals(ProjectionSourceStatus.RECOVERING, m.status(301_000))
++        m.frameLatched(300_000, 302_000)
++        assertEquals(ProjectionSourceStatus.UPDATING, m.status(302_000))
++    }
++
++    @Test
++    fun repeatedGapInvalidatesOldRecoveryFence() {
++        val random = Random(42)
++        repeat(10_000) {
++            val m = ProjectionSourceMonitor()
++            val first = random.nextLong(1, 100_000_000)
++            val second = first + random.nextLong(1, 1_000)
++            m.gap()
++            m.keyFrameQueued(first)
++            m.gap()
++            m.keyFrameQueued(second)
++            m.frameLatched(first * 1000, first * 1000)
++            assertEquals(ProjectionSourceStatus.RECOVERING, m.status(second * 1000))
++            m.frameLatched(second * 1000, second * 1000)
++            assertEquals(ProjectionSourceStatus.UPDATING, m.status(second * 1000))
++        }
++    }
++
++    @Test
++    fun statusCardDoesNotShrinkOrCoverSource() {
++        val random = Random(4201)
++        var count = 0
++        var cards = 0
++        repeat(20_000) {
++            val w = random.nextInt(640, 2561)
++            val h = random.nextInt(360, 1081)
++            if (!ProjectedDashboardLayout.supports(w, h)) return@repeat
++            val l = ProjectedDashboardLayout(w, h, random.nextInt(320, 3841), random.nextInt(180, 2161),
++                random.nextBoolean(), page = ProjectionPage.NAVIGATION, shell = true)
++            val r = l.navigationStatus
++            count++
++            if (r != null) {
++                cards++
++                assertTrue(r.width >= h * .30f - 1 && r.height >= h * .10f - 1)
++                assertTrue(r.left >= l.workspace.left && r.top >= l.workspace.top)
++                assertTrue(r.right <= l.workspace.right && r.bottom <= l.workspace.bottom)
++                fun disjoint(b: ProjectionRect) = r.right <= b.left || b.right <= r.left || r.bottom <= b.top || b.bottom <= r.top
++                assertTrue(disjoint(l.video))
++                l.miniPanel?.let { assertTrue(disjoint(it)) }
++                val result = DashboardTouchRouter().route(l, r.left, r.top, true, 1920, 1080)
++                assertNull(result.point)
++                assertNull(result.action)
++                assertNull(result.page)
++            }
++            assertNull(l.withPage(ProjectionPage.MUSIC).navigationStatus)
++        }
++        assertTrue(count > 10_000 && cards > 1_000)
++        println("R42 navigation layouts=$count cards=$cards")
++    }
++
++    @Test
++    fun fullContentKeepsUnmodifiedVideoGeometry() {
++        val full = ProjectedDashboardLayout(1920, 1080, 1920, 1080, fullContent = true, shell = true,
++            page = ProjectionPage.NAVIGATION)
++        assertEquals(ProjectionRect(0, 0, 1920, 1080), full.video)
++        assertNull(full.navigationStatus)
++    }
++}

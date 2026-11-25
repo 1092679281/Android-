@@ -1,0 +1,1237 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index dcc1b04..01424c0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,31 +3,57 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.21-test.1] - 2026-11-25
++
++> R34 — runtime projection quality candidate; no physical receiver validation.
++> R34 动态投屏性能候选版，尚未实车验收。
++
++### English
++- Phase-aligned frame scheduling, source queue age expiry and IDR chain recovery.
++- Thermal and congestion-aware GPU pacing and encoder bitrate limits; gradual recovery.
++- Independent encoder lifecycle per configuration tier and blocked video socket watchdog.
++- Optional full-screen source content with aspect-fit input mapping.
++
++### 简体中文
++- 修复帧率节拍漂移、队列帧龄及关键帧恢复。
++- 温控、网络和 GPU 压力联动调节帧率及编码码率，条件恢复后分级提帧。
++- 编码器阶梯独立释放，视频数据口写停滞安全退出。
++- 新增可选全屏高清内容及一致触控映射。
++
+ ## [v0.1.20-test.1] - 2026-11-25
+ 
+ > R33 — negotiated 60 FPS candidate; real receiver and codec performance unverified.
+ 
++### English
+ - Remove the experimental GM E2LB 30 FPS hard cap; honor valid receiver limits and saved preference.
+ - Opt-in dashboard defaults to 60 FPS; unknown or malformed receiver capability falls back to 30 FPS.
+ - Allow up to 15 Mbps at 60 FPS, keep existing ABR; retry local encoder initialization once at 30 FPS if high rate is rejected.
+ - Display actual configured target separately from sent frame count; preferences take effect after reconnect.
++
++### 简体中文
+ - 君越实验仪表盘优先协商 60 FPS，保留 30 FPS 回退；真实帧率仍需车机验证。
+ 
+ ## [v0.1.19-test.1] - 2026-11-25
+ 
+ > R32 — projection recovery candidate; not device validated.
+ 
++### English
+ - Guard dashboard source geometry; stop stale-layout output and touch after a source size change.
+ - Suppress dashboard on the next known-peer connection for ten minutes after a confirmed local pipeline fault; no persistent setting changes.
+ - Honor MediaCodec BufferInfo offset and size; avoid starting dashboard GL while the phone does not own the screen.
++
++### 简体中文
+ - 君越投屏故障降级、尺寸变化保护、编码缓冲区边界校验；尚待实车验证。
+ 
+ ## [v0.1.18-test.1] - 2026-11-25
+ 
+ > R31 — GM E2LB conservative projection candidate for the 2023 LaCrosse target. Not vehicle-validated.
+ 
++### English
+ - Opt-in dashboard uses explicit receiver geometry, conservative 30 FPS maximum and up to 8 Mbps local encoding, no physical 6K assumption.
+ - Adapt media panel to wide displays, retain aspect-fit content and matching touch mapping; unsupported geometry keeps compatibility mode.
++
++### 简体中文
+ - 君越目标车型适配：仅在 E2LB 自报身份及有效显示能力、开启实验仪表盘时应用保守视频参数。原连接协议不改动，仍需实车验证。
+ 
+ ## [v0.1.17-test.1] - 2026-11-25
+@@ -50,8 +76,11 @@ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
+ > R29 — experimental receiver-side composition. Not Android-compiled or vehicle-validated.
+ 
++### English
+ - Opt-in glass dashboard: decode CarWith video, compose a live viewport and real media metadata, then use the existing encoder and transport.
+ - Map touch to the source viewport; isolate media controls and preserve compatibility mode. No independent map provider, app launcher or Apple native renderer yet.
++
++### 简体中文
+ - 实验性车机投屏仪表盘：实时内容、真实媒体信息、触控映射。默认关闭，暂未真机验证。
+ 
+ ## [v0.1.15-test.1] - 2026-11-25
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 6d698a5..169ceb7 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.20"
++val appVersionName = "0.1.21"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/MainActivity.kt b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+index a31660f..b5442c1 100644
+--- a/app/src/main/java/com/mcarplay/app/MainActivity.kt
++++ b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+@@ -1759,7 +1759,7 @@ class MainActivity : AppCompatActivity() {
+         lastStatsSender = sender
+         lastSentFrames = sent
+         lastFpsSampleNs = now
+-        val target = sender?.configuredTargetFps ?: SessionController.activeTargetFps
++        val target = sender?.runtimeTargetFps ?: SessionController.activeTargetFps
+         heroStats.text =
+             getString(R.string.ma_hero_stats, SessionController.activeScalePercent, fps, target)
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index dbd6bcf..02880c3 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -5136,6 +5136,14 @@ object SessionController {
+                                                 externalVideoSource = carLifeSource,
+                                                 projectedDashboard = dashboardEnabled && dashboardAllowedForPeer(),
+                                                 lacrosseProjection = lacrosseOutput != null,
++                                                fullContentProjection =
++                                                    appContext?.let(DisplayPrefs::fullContentProjection) == true,
++                                                thermalStatus = {
++                                                    if (android.os.Build.VERSION.SDK_INT >= 29) {
++                                                        appContext?.getSystemService(android.os.PowerManager::class.java)
++                                                            ?.currentThermalStatus ?: -1
++                                                    } else -1
++                                                },
+                                                 onDashboardLocalFailure = { reason ->
+                                                     if (videoSender === sender) {
+                                                         projectionRecovery.recordLocalFailure(
+diff --git a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+index 0eebace..20328f0 100644
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+@@ -289,6 +289,15 @@ class DisplayPanelFragment : SettingsPanelFragment() {
+             hostToast(getString(R.string.r29_projection_next_connection))
+         }
+ 
++        bindToggle(
++            view.findViewById(R.id.btnFullContentOn),
++            view.findViewById(R.id.btnFullContentOff),
++            DisplayPrefs.fullContentProjection(ctx),
++        ) { enabled ->
++            DisplayPrefs.setFullContentProjection(ctx, enabled)
++            hostToast(getString(R.string.r29_projection_next_connection))
++        }
++
+         fun applyFps(fps: Int) {
+             DisplayPrefs.setFps(ctx, fps)
+             refreshFps(fps < 60)
+diff --git a/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt b/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
+index 9d875c3..9c7be06 100644
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
+@@ -36,6 +36,13 @@ object DisplayPrefs {
+     private const val KEY_SCREEN_OFF = "screen_off_on_connect"
+     private const val KEY_HID_RAW_LOG = "hid_raw_log"
+ 
++    fun fullContentProjection(context: Context): Boolean =
++        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean("full_content_projection", false)
++
++    fun setFullContentProjection(context: Context, enabled: Boolean) {
++        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean("full_content_projection", enabled).apply()
++    }
++
+     /** Experimental receiver-side composition; opt-in, applies on next connection. */
+     fun projectedDashboard(context: Context): Boolean = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean("projected_dashboard", false)
+     fun setProjectedDashboard(context: Context, enabled: Boolean) {
+diff --git a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+index 9cfeee8..eec6b1e 100644
+--- a/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
++++ b/app/src/main/java/com/mcarplay/app/video/CarWithTranscoder.kt
+@@ -40,6 +40,8 @@ internal class CarWithTranscoder(
+     private val log: (String) -> Unit,
+     val dashboardLayout: ProjectedDashboardLayout? = null,
+     private val outputFps: Int = 30,
++    private val runtimeFps: () -> Int = { outputFps },
++    private val onRenderDuration: (Long) -> Unit = {},
+     private val allowIdleDashboard: () -> Boolean = { true },
+     /** 向 CarWith 要关键帧（解码输入断流后用；转码线程上调用，已限流）。 */
+     private val requestSourceKeyFrame: () -> Unit = {},
+@@ -407,7 +409,7 @@ internal class CarWithTranscoder(
+         check(eglSurface != EGL14.EGL_NO_SURFACE) { "eglCreateWindowSurface" }
+         check(EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) { "eglMakeCurrent" }
+ 
+-        dashboardLayout?.let { layout ->
++        dashboardLayout?.takeUnless { it.fullContent }?.let { layout ->
+             dashboard = ProjectedDashboardRenderer(layout)
+             dashboard?.start()
+         }
+@@ -446,7 +448,7 @@ internal class CarWithTranscoder(
+             lastSourceNs = System.nanoTime()
+             texture.getTransformMatrix(texMatrix)
+             latchErrors = 0
+-            if (dashboard == null) {
++            if (dashboardLayout == null) {
+                 drawFrame(source = true)
+             } else {
+                 pacer.sourceArrived()
+@@ -461,6 +463,7 @@ internal class CarWithTranscoder(
+ 
+     private fun scheduleRender() {
+         if (renderScheduled || !running.get() || failure != null) return
++        pacer.updateRate(runtimeFps().coerceIn(1, outputFps))
+         renderScheduled = true
+         glHandler.postDelayed(renderTask, pacer.delayMs(System.nanoTime()))
+     }
+@@ -470,6 +473,7 @@ internal class CarWithTranscoder(
+         val source = pacer.sourcePending
+         if (!source && (!mayRefreshIdle() || dashboard?.hasVisualChange(android.os.SystemClock.uptimeMillis()) != true)) return
+         val startNs = System.nanoTime()
++        pacer.updateRate(runtimeFps().coerceIn(1, outputFps))
+         if (pacer.delayMs(startNs) > 0) {
+             scheduleRender()
+             return
+@@ -482,6 +486,11 @@ internal class CarWithTranscoder(
+         if (!running.get() || failure != null) return
+         val startNs = System.nanoTime()
+         try {
++            if (dashboardLayout?.fullContent == true) {
++                GLES20.glViewport(0, 0, outWidth, outHeight)
++                GLES20.glClearColor(0f, 0f, 0f, 1f)
++                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
++            }
+             dashboard?.draw()
+             val viewport = dashboardLayout?.video
+             val drawWidth = viewport?.width ?: outWidth
+@@ -534,7 +543,9 @@ internal class CarWithTranscoder(
+                 uploadedPixels = it.uploadedPixels
+                 textureUpdates = it.textureUpdates
+             }
+-            maxRenderNs = maxOf(maxRenderNs, System.nanoTime() - startNs)
++            val durationNs = System.nanoTime() - startNs
++            maxRenderNs = maxOf(maxRenderNs, durationNs)
++            onRenderDuration(durationNs)
+             renderErrors = 0
+             if (framesRendered == 1L) log("VIDEO: ✓ 转码首帧已写入编码器（${outWidth}x$outHeight）")
+         } catch (error: Exception) {
+diff --git a/app/src/main/java/com/mcarplay/app/video/FreshVideoQueue.kt b/app/src/main/java/com/mcarplay/app/video/FreshVideoQueue.kt
+new file mode 100644
+index 0000000..5bc2a9e
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/FreshVideoQueue.kt
+@@ -0,0 +1,54 @@
++package com.mcarplay.app.video
++
++import java.util.concurrent.LinkedBlockingQueue
++import java.util.concurrent.TimeUnit
++
++/** One consumer, serialized producers. Discontinuity invalidates the whole old reference chain. */
++internal class FreshVideoQueue(capacity: Int) {
++    data class Entry(val frame: ExternalVideoFrame, val queuedAtNs: Long, val generation: Long)
++    data class Offer(val accepted: Boolean, val gap: Boolean)
++    private val queue = LinkedBlockingQueue<Entry>(capacity)
++    private val lock = Any()
++    private var generation = 0L
++    private var awaitingIdr = false
++    private var closed = false
++    val size: Int get() = queue.size
++
++    fun offer(frame: ExternalVideoFrame, nowNs: Long): Offer = synchronized(lock) {
++        if (closed) return@synchronized Offer(false, false)
++        var gap = false
++        if (queue.peek()?.let { VideoQueueBudget.expired(it.queuedAtNs, nowNs) } == true || queue.remainingCapacity() == 0) {
++            invalidateLocked()
++            gap = true
++        }
++        if (awaitingIdr && !frame.keyFrame) return@synchronized Offer(false, true)
++        awaitingIdr = false
++        check(queue.offer(Entry(frame, nowNs, generation)))
++        Offer(true, gap)
++    }
++
++    fun poll(timeoutMs: Long): Entry? = queue.poll(timeoutMs, TimeUnit.MILLISECONDS)
++
++    /** Called immediately before processing, with the actual monotonic clock. */
++    fun admit(entry: Entry, nowNs: Long): Boolean = synchronized(lock) {
++        if (closed || entry.generation != generation) return@synchronized false
++        if (VideoQueueBudget.expired(entry.queuedAtNs, nowNs)) {
++            invalidateLocked()
++            return@synchronized false
++        }
++        true
++    }
++
++    fun clear() = synchronized(lock) { invalidateLocked() }
++
++    fun close() = synchronized(lock) {
++        closed = true
++        invalidateLocked()
++    }
++
++    private fun invalidateLocked() {
++        generation++
++        queue.clear()
++        awaitingIdr = true
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+index 2da9903..f19609c 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectedDashboardLayout.kt
+@@ -15,6 +15,7 @@ internal class ProjectedDashboardLayout(
+     sourceWidth: Int,
+     sourceHeight: Int,
+     wideReceiver: Boolean = false,
++    val fullContent: Boolean = false,
+ ) {
+     init {
+         require(supports(width, height) && sourceWidth > 0 && sourceHeight > 0)
+@@ -37,7 +38,8 @@ internal class ProjectedDashboardLayout(
+     val controls: List<Pair<DashboardAction, ProjectionRect>>
+     init {
+         val inset = gap / 2
+-        val area = ProjectionRect(content.left + inset, content.top + inset, content.right - inset, content.bottom - inset)
++        val area = if (fullContent) ProjectionRect(0, 0, width, height)
++        else ProjectionRect(content.left + inset, content.top + inset, content.right - inset, content.bottom - inset)
+         val fit = minOf(area.width.toDouble() / sourceWidth, area.height.toDouble() / sourceHeight)
+         val w = (sourceWidth * fit).toInt().coerceIn(1, area.width)
+         val h = (sourceHeight * fit).toInt().coerceIn(1, area.height)
+@@ -46,7 +48,7 @@ internal class ProjectedDashboardLayout(
+         video = ProjectionRect(x, y, x + w, y + h)
+         val top = panel.top + (panel.height * 0.72).toInt()
+         val bottom = panel.top + (panel.height * 0.90).toInt()
+-        controls = DashboardAction.entries.mapIndexed { index, action ->
++        controls = if (fullContent) emptyList() else DashboardAction.entries.mapIndexed { index, action ->
+             val l = panel.left + panel.width * index / 3
+             val r = panel.left + panel.width * (index + 1) / 3
+             action to ProjectionRect(l, top, r, bottom)
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+index 75f4065..b6985d9 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionFramePacer.kt
+@@ -2,8 +2,17 @@ package com.mcarplay.app.video
+ 
+ /** GL-thread-only output budget. A late render never schedules a catch-up burst. */
+ internal class ProjectionFramePacer(fps: Int) {
+-    val intervalNs = (1_000_000_000L + fps.coerceIn(1, 120) - 1) / fps.coerceIn(1, 120)
++    private var rate = fps.coerceIn(1, 120)
++    val intervalNs get() = (1_000_000_000L + rate - 1) / rate
+     private var nextAllowedNs: Long? = null
++    private var lastRenderNs: Long? = null
++
++    fun updateRate(fps: Int) {
++        val next = fps.coerceIn(1, 120)
++        if (next == rate) return
++        rate = next
++        nextAllowedNs = lastRenderNs?.plus(intervalNs)
++    }
+     var sourcePending = false
+         private set
+     var coalesced = 0L
+@@ -21,7 +30,11 @@ internal class ProjectionFramePacer(fps: Int) {
+ 
+     fun rendered(startNs: Long) {
+         sourcePending = false
+-        nextAllowedNs = startNs + intervalNs
++        val previous = nextAllowedNs
++        // Preserve sub-ms phase despite Handler rounding; large stalls rebase, never burst.
++        val lateness = previous?.let { startNs - it } ?: Long.MAX_VALUE
++        nextAllowedNs = if (previous != null && lateness in 0..999_999L) previous + intervalNs else startNs + intervalNs
++        lastRenderNs = startNs
+     }
+ }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionRuntimePolicy.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionRuntimePolicy.kt
+new file mode 100644
+index 0000000..d3a259e
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionRuntimePolicy.kt
+@@ -0,0 +1,105 @@
++package com.mcarplay.app.video
++
++/** Session-local GPU output budget. Never drops encoded reference frames to change FPS. */
++internal class ProjectionRuntimePolicy(private val maximumFps: Int) {
++    private val rates = (listOf(maximumFps, 50, 45, 30, 24).filter { it in 1..maximumFps }.distinct().sortedDescending())
++    private var networkIndex = 0
++    private var thermal = 0
++    private var thermalCap = maximumFps
++    private var coolSince: Long? = null
++    private var lastThermalAt: Long? = null
++    private var lastRenderAt: Long? = null
++    private var lastRenderDurationNs = 0L
++    private var lastBadAt: Long? = null
++    private var lastStepAt: Long? = null
++    private var healthySince: Long? = null
++    private var badCount = 0
++    private var lastSampleAt: Long? = null
++
++    init { require(maximumFps in 1..120) }
++
++    @Synchronized
++    fun updateThermal(status: Int, nowMs: Long) {
++        if (status !in 0..6) {
++            coolSince = null
++            lastThermalAt = null
++            return
++        }
++        if (lastThermalAt?.let { nowMs - it !in 0..2_500L } == true) coolSince = null
++        lastThermalAt = nowMs
++        thermal = status
++        val cap = minOf(maximumFps, when (status) {
++            0, 1 -> maximumFps
++            2 -> 45
++            3 -> 30
++            else -> 24
++        })
++        if (cap < thermalCap) {
++            thermalCap = cap
++            coolSince = null
++        } else if (cap > thermalCap) {
++            val since = coolSince ?: nowMs.also { coolSince = it }
++            if (nowMs - since >= 10_000) {
++                thermalCap = rates.filter { it > thermalCap && it <= cap }.minOrNull() ?: cap
++                coolSince = nowMs
++            }
++        } else coolSince = null
++    }
++
++    @Synchronized
++    fun recordRender(nowMs: Long, durationNs: Long) {
++        lastRenderAt = nowMs
++        lastRenderDurationNs = durationNs.coerceAtLeast(0L)
++    }
++
++    @Synchronized
++    fun observe(nowMs: Long, writeNs: Long, queueMs: Long) {
++        val renderRecent = lastRenderAt?.let { nowMs - it in 0..1_000L } == true
++        val renderBudget = 1_000_000_000L / minOf(rates[networkIndex], thermalCap)
++        val renderSlow = renderRecent && lastRenderDurationNs >= renderBudget
++        val bad = writeNs >= 12_000_000L || queueMs >= 120 || renderSlow
++        val severe = writeNs >= 80_000_000L || queueMs >= 250 ||
++            (renderRecent && lastRenderDurationNs >= 80_000_000L)
++        if (bad) {
++            healthySince = null
++            lastBadAt = nowMs
++        }
++        val sample = lastSampleAt
++        if (sample != null && nowMs - sample in 0 until 200) return
++        if (sample != null && nowMs - sample !in 0..1_500L) {
++            healthySince = null
++            badCount = 0
++        }
++        lastSampleAt = nowMs
++        if (bad) {
++            badCount++
++            val canStep = lastStepAt?.let { nowMs - it >= 1_500 } ?: true
++            if ((severe || badCount >= 3) && canStep) {
++                networkIndex = (networkIndex + if (severe) 2 else 1).coerceAtMost(rates.lastIndex)
++                lastStepAt = nowMs
++                badCount = 0
++            }
++        } else {
++            badCount = 0
++            val healthy = writeNs < 4_000_000L && queueMs < 60 && thermal < 2 &&
++                (!renderRecent || lastRenderDurationNs < renderBudget * 3 / 4)
++            if (!healthy) {
++                healthySince = null
++                return
++            }
++            if (healthySince == null) healthySince = nowMs
++            if (nowMs - requireNotNull(healthySince) >= 10_000 &&
++                (lastBadAt?.let { nowMs - it >= 10_000 } ?: true)
++            ) {
++                networkIndex = (networkIndex - 1).coerceAtLeast(0)
++                lastStepAt = nowMs
++                healthySince = nowMs
++            }
++        }
++    }
++
++    @Synchronized
++    fun fps(): Int {
++        return minOf(rates[networkIndex], thermalCap)
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt b/app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
+index 7bffe5f..2479ccd 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoEncoderAbr.kt
+@@ -53,6 +53,7 @@ internal class VideoEncoderAbr(
+         frameBytes: Int,
+         writeNanos: Long,
+         nowMs: Long,
++        runtimeCeilingBps: Int = maxBitrateBps,
+     ): Decision? =
+         synchronized(lock) {
+             val writeMs = writeNanos / 1_000_000f
+@@ -73,9 +74,14 @@ internal class VideoEncoderAbr(
+             val rejectedAt = lastRejectedAtMs
+             if (rejectedAt != null && nowMs - rejectedAt < minStepIntervalMs) return@synchronized null
+ 
++            val ceiling = runtimeCeilingBps.coerceIn(minBitrateBps, maxBitrateBps)
+             val nextBps: Int
+             val reason: String
+             when {
++                currentBitrateBps > ceiling -> {
++                    nextBps = ceiling
++                    reason = "runtime-budget"
++                }
+                 writeMs >= severeStallMs || ewmaWriteMs >= congestThresholdMs * 1.6f -> {
+                     nextBps = (currentBitrateBps * 0.65f).toInt().coerceAtLeast(minBitrateBps)
+                     reason = "severe-stall(write=${"%.1f".format(writeMs)}ms,ewma=${"%.1f".format(ewmaWriteMs)}ms)"
+@@ -86,8 +92,8 @@ internal class VideoEncoderAbr(
+                     reason = "congestion(ewma=${"%.1f".format(ewmaWriteMs)}ms,starved=$linkStarved)"
+                 }
+ 
+-                consecutiveHealthyFrames >= 180 && currentBitrateBps < maxBitrateBps -> {
+-                    nextBps = (currentBitrateBps + 750_000).coerceAtMost(maxBitrateBps)
++                consecutiveHealthyFrames >= 180 && currentBitrateBps < ceiling -> {
++                    nextBps = (currentBitrateBps + 750_000).coerceAtMost(ceiling)
+                     reason = "recovery(ewma=${"%.1f".format(ewmaWriteMs)}ms)"
+                 }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoQueueBudget.kt b/app/src/main/java/com/mcarplay/app/video/VideoQueueBudget.kt
+index b85fe75..469152f 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoQueueBudget.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoQueueBudget.kt
+@@ -4,6 +4,9 @@ package com.mcarplay.app.video
+ internal object VideoQueueBudget {
+     const val DEFAULT_BUDGET_MS = 300
+ 
++    fun expired(enqueuedNs: Long, nowNs: Long): Boolean =
++        nowNs - enqueuedNs >= DEFAULT_BUDGET_MS * 1_000_000L
++
+     fun capacity(
+         targetFps: Int,
+         budgetMs: Int = DEFAULT_BUDGET_MS,
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+index 70f2ea1..8d9b72d 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -72,6 +72,8 @@ class VideoSender(
+     private val lacrosseProjection: Boolean = false,
+     private val allowCompatibilityTranscode: Boolean = true,
+     private val onDashboardLocalFailure: (String) -> Unit = {},
++    private val fullContentProjection: Boolean = false,
++    private val thermalStatus: () -> Int = { -1 },
+     private val uptimeMs: () -> Long = { android.os.SystemClock.uptimeMillis() },
+ ) {
+     @Volatile
+@@ -84,6 +86,14 @@ class VideoSender(
+     var configuredTargetFps: Int = targetFps
+         private set
+ 
++    @Volatile private var runtimePolicy: ProjectionRuntimePolicy? = null
++    val runtimeTargetFps: Int get() = runtimePolicy?.fps() ?: configuredTargetFps
++    private var lastThermalSampleMs: Long? = null
++    @Volatile private var recentQueueAgeMs = 0L
++    @Volatile private var lastQueueGapNs: Long? = null
++    private var lastRuntimeLoggedFps = 0
++    @Volatile private var recentThermalStatus = -1
++
+     val videoWidth: Int get() = width
+     val videoHeight: Int get() = height
+ 
+@@ -166,6 +176,31 @@ class VideoSender(
+ 
+     /** 透传线程与转码编码线程可能同时写数据口：所有网络写入串行。 */
+     private val writeLock = Any()
++    private val writeDeadline = VideoWriteDeadline()
++
++    private fun writePacket(output: java.io.OutputStream, first: ByteArray, second: ByteArray? = null) {
++        val client = socket ?: throw java.io.IOException("video socket closed")
++        val ticket = writeDeadline.begin(client, System.nanoTime())
++        try {
++            output.write(first)
++            if (second != null) output.write(second)
++            output.flush()
++        } finally {
++            writeDeadline.finish(ticket)
++        }
++    }
++
++    private fun startWriteWatchdog(client: Socket) {
++        Thread({
++            while (!client.isClosed && !stopped.get()) {
++                try { Thread.sleep(250) } catch (_: InterruptedException) { break }
++                if (runCatching { writeDeadline.expire(client, System.nanoTime()) }.getOrDefault(false)) {
++                    log("VIDEO: R34 socket write stalled for 5s; close stream for safe reconnect")
++                    break
++                }
++            }
++        }, "video-write-watchdog").apply { isDaemon = true; start() }
++    }
+     /** Hardware bitrate configuration must not hold the network write lock. */
+     private val abrApplyLock = Any()
+ 
+@@ -225,21 +260,10 @@ class VideoSender(
+     private val reprimePending = AtomicBoolean(false)
+     private val encoderReprimePending = AtomicBoolean(false)
+ 
+-    private data class R8QueuedFrame(
+-        val frame: ExternalVideoFrame,
+-        val queuedAtNs: Long,
+-        val generation: Long,
+-    )
+-
+-    // Serialize producers so a dropped access unit creates a new reference-chain generation.
+-    // The consumer compares the queued generation, not a global flag that could be consumed by an older frame.
+-    private val externalEnqueueLock = Any()
+-    private var inputGeneration = 0L
+     private val r8QueueDelay = VideoQueueDelayMeter()
+-    private val externalQueue =
+-        java.util.concurrent.LinkedBlockingQueue<R8QueuedFrame>(
+-            VideoQueueBudget.capacity(if (receiverMaxFps > 0) minOf(targetFps, receiverMaxFps) else targetFps),
+-        )
++    private val externalQueue = FreshVideoQueue(
++        VideoQueueBudget.capacity(if (receiverMaxFps > 0) minOf(targetFps, receiverMaxFps) else targetFps),
++    )
+ 
+     @Volatile
+     private var framesSent = 0L
+@@ -329,6 +353,7 @@ class VideoSender(
+                     "rcvBuf=${runCatching { client.receiveBufferSize }.getOrNull()}",
+             )
+             startInboundMonitor(client)
++            startWriteWatchdog(client)
+             true
+         } catch (error: Exception) {
+             // connect(), TCP setup, observer startup and logging may all throw.
+@@ -407,7 +432,7 @@ class VideoSender(
+                 log("VIDEO: 外部 CarWith H.264 输入已启动 ${width}x$height@$targetFps")
+                 return true
+             }
+-            val (codec, surface) = createEncoder(width, height, targetFps)
++            val (codec, surface, abr) = createEncoder(width, height, targetFps)
+             val published =
+                 synchronized(lifecycleLock) {
+                     if (stopped.get() || quiescing.get()) {
+@@ -415,6 +440,7 @@ class VideoSender(
+                     } else {
+                         encoder = codec
+                         inputSurface = surface
++                        encoderAbr = abr
+                         running.set(true)
+                         lastKeepAliveAt = android.os.SystemClock.uptimeMillis()
+                         true
+@@ -443,6 +469,8 @@ class VideoSender(
+      * 建 H.264 硬编码器（Surface 输入）。本地画面源与转码共用：level 4.0 固定、
+      * 被拒时回退自动选择的约束两者一致。
+      */
++    private data class StartedEncoder(val codec: MediaCodec, val surface: Surface, val abr: VideoEncoderAbr)
++
+     private fun createEncoder(
+         encodeWidth: Int,
+         encodeHeight: Int,
+@@ -457,7 +485,7 @@ class VideoSender(
+          * 手机编码器默认出 High(100)+CABAC，切换后车机仍要关键帧、13 s 后关闭屏幕数据口。
+          */
+         baselineProfile: Boolean = false,
+-    ): Pair<MediaCodec, Surface> {
++    ): StartedEncoder {
+         val bitrate = if (lacrosseProjection) LacrosseProjectionPolicy.bitrate(encodeWidth, encodeHeight, fps)
+         else ProjectionEncoderPolicy.initialBitrate(encodeWidth, encodeHeight, fps)
+         log("VIDEO: 启动编码器 ${encodeWidth}x$encodeHeight@$fps ${bitrate / 1_000_000}Mbps（端口已连通）")
+@@ -505,50 +533,43 @@ class VideoSender(
+                 // that requires AVC Baseline back to an unsupported High profile.
+                 "tier3-minimal-fallback" to buildFormat(false, baselineProfile, false, false, false),
+             )
+-        val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+-        var configured = false
+         var lastError: Exception? = null
+         for ((tierName, format) in tiers) {
++            var codec: MediaCodec? = null
++            var surface: Surface? = null
++            var success = false
+             try {
+-                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+-                if (tierName != "tier1-low-latency") {
+-                    log("VIDEO: 编码器降级为 $tierName${if (baselineProfile) "（保留 Baseline）" else ""}")
+-                }
+-                configured = true
+-                break
++                val candidate = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
++                codec = candidate
++                candidate.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++                val createdSurface = candidate.createInputSurface()
++                surface = createdSurface
++                candidate.start()
++                val abr = VideoEncoderAbr(
++                    minBitrateBps = (bitrate / 3).coerceAtLeast(2_000_000),
++                    maxBitrateBps = bitrate,
++                    initialBitrateBps = bitrate,
++                )
++                if (tierName != "tier1-low-latency") log("VIDEO: encoder fallback $tierName")
++                success = true
++                return StartedEncoder(candidate, createdSurface, abr)
+             } catch (error: Exception) {
+                 lastError = error
+-                log("VIDEO: 编码配置 $tierName 被拒绝（${error.message}）——尝试下一回退阶梯")
+-                runCatching { codec.reset() }
++                log("VIDEO: encoder tier $tierName rejected: ${error.message}")
++            } finally {
++                if (!success) {
++                    runCatching { codec?.release() }
++                    runCatching { surface?.release() }
++                }
+             }
+         }
+-        if (!configured) {
+-            runCatching { codec.release() }
+-            throw lastError ?: IllegalStateException("MediaCodec configure failed")
+-        }
+-        encoderAbr =
+-            VideoEncoderAbr(
+-                minBitrateBps = (bitrate / 3).coerceAtLeast(2_000_000),
+-                maxBitrateBps = bitrate,
+-                initialBitrateBps = bitrate,
+-            )
+-        var surface: Surface? = null
+-        try {
+-            val createdSurface = codec.createInputSurface()
+-            surface = createdSurface
+-            codec.start()
+-            return codec to createdSurface
+-        } catch (error: Exception) {
+-            runCatching { codec.release() }
+-            runCatching { surface?.release() }
+-            throw error
+-        }
++        throw lastError ?: IllegalStateException("MediaCodec configure failed")
+     }
+ 
+     fun stop() {
+         stopped.set(true)
+         running.set(false)
+-        externalQueue.clear()
++        externalQueue.close()
+         // 先关 socket：解开阻塞在写入上的线程（它持有 writeLock，转码发布方持有 lifecycleLock 等它）
+         val closing = socket
+         socket = null
+@@ -563,6 +584,8 @@ class VideoSender(
+             surface = inputSurface
+             transcoder = null
+             encoder = null
++            encoderAbr = null
++            runtimePolicy = null
+             inputSurface = null
+         }
+         synchronized(abrApplyLock) { releaseVideoResources(active, codec, surface) }
+@@ -575,7 +598,7 @@ class VideoSender(
+     /** 不等待写锁或关闭 socket：阻塞中的写仍可由随后的 stop() 解开。 */
+     fun quiesceForOrderlyStop() {
+         quiescing.set(true)
+-        externalQueue.clear()
++        externalQueue.close()
+     }
+ 
+     /** 先停转码（停止往编码器 Surface 渲染），再释放编码器与其输入 Surface。 */
+@@ -747,9 +770,7 @@ class VideoSender(
+         val output = socket?.getOutputStream() ?: return
+         synchronized(writeLock) {
+             if (quiescing.get()) return
+-            output.write(buildVideoConfigHeader(avcC.size, width, height))
+-            output.write(avcC)
+-            output.flush()
++            writePacket(output, buildVideoConfigHeader(avcC.size, width, height), avcC)
+             log("VIDEO: 主屏输出恢复——重发 VideoConfig avcC=${avcC.size}B ${width}x$height")
+         }
+     }
+@@ -764,30 +785,21 @@ class VideoSender(
+      */
+     fun submitExternalFrame(frame: ExternalVideoFrame): Boolean {
+         if (externalVideoSource == null || !running.get() || quiescing.get()) return false
+-        synchronized(externalEnqueueLock) {
+-            if (!running.get() || quiescing.get()) return false
+-            if (externalQueue.offer(R8QueuedFrame(frame, System.nanoTime(), inputGeneration))) return true
+-            inputGeneration++
+-            // An IDR replaces the backlog safely; all subsequently queued frames carry the new generation.
+-            if (frame.keyFrame) {
+-                externalQueue.clear()
+-                streamStats.onQueueDrop()
+-                if (externalQueue.offer(R8QueuedFrame(frame, System.nanoTime(), inputGeneration))) return true
+-            }
+-        }
+-        val drops = streamStats.onQueueDrop()
+-        val shouldRequestIdr =
+-            synchronized(passthroughDropResync) {
+-                passthroughDropResync.discontinuity()
+-                passthroughDropResync.requestDue(uptimeMs())
+-            }
+-        if (shouldRequestIdr && transcoder == null) {
+-            runCatching { externalVideoSource?.requestKeyFrame() }
+-        }
+-        if (drops <= 3 || drops % 50 == 0L) {
+-            log("VIDEO: 透传队列已满（${externalQueue.size} 帧），丢弃 CarWith 帧，累计 $drops 次（随后等下一个 IDR）")
++        val result = externalQueue.offer(frame, System.nanoTime())
++        if (result.gap) lastQueueGapNs = System.nanoTime()
++        if (result.gap && !result.accepted) requestFreshSourceFrame()
++        else if (result.gap) streamStats.onQueueDrop()
++        return result.accepted
++    }
++
++    private fun requestFreshSourceFrame() {
++        lastQueueGapNs = System.nanoTime()
++        streamStats.onQueueDrop()
++        val request = synchronized(passthroughDropResync) {
++            passthroughDropResync.discontinuity()
++            passthroughDropResync.requestDue(uptimeMs())
+         }
+-        return false
++        if (request) runCatching { externalVideoSource?.requestKeyFrame() }
+     }
+ 
+     /** Align the CarPlay canvas to the SPS dimensions from CarWith. */
+@@ -804,10 +816,7 @@ class VideoSender(
+             val previousSize = sourceSize
+             sourceSize = newSize
+             if (projectedDashboard && previousSize.first > 0) {
+-                synchronized(externalEnqueueLock) {
+-                    inputGeneration++
+-                    externalQueue.clear()
+-                }
++                externalQueue.clear()
+                 dashboardFrameSent = false
+                 dashboardTouch.reset()
+                 dashboardCancelPending.set(true)
+@@ -867,14 +876,23 @@ class VideoSender(
+                 fps = fallback
+                 createEncoder(streamWidth, streamHeight, fps, capEncoderFps = true, baselineProfile = true)
+             }
+-            codec = created.first
+-            surface = created.second
+-            val layout = if (composeDashboard) ProjectedDashboardLayout(streamWidth, streamHeight, initialSourceSize.first, initialSourceSize.second, lacrosseProjection) else null
++            codec = created.codec
++            surface = created.surface
++            val policy = if (composeDashboard) ProjectionRuntimePolicy(fps) else null
++            policy?.updateThermal(runCatching { thermalStatus() }.getOrDefault(-1), uptimeMs())
++            val layout = if (composeDashboard) {
++                ProjectedDashboardLayout(
++                    streamWidth, streamHeight, initialSourceSize.first, initialSourceSize.second,
++                    lacrosseProjection, fullContentProjection,
++                )
++            } else null
+             pipeline =
+                 CarWithTranscoder(
+                     surface, streamWidth, streamHeight, initialSourceSize.first, initialSourceSize.second, log,
+                     dashboardLayout = layout,
+                     outputFps = fps,
++                    runtimeFps = { policy?.fps() ?: fps },
++                    onRenderDuration = { durationNs -> policy?.recordRender(uptimeMs(), durationNs) },
+                     allowIdleDashboard = { running.get() && !quiescing.get() && !screenSuspendedReported.get() && phoneOwnsScreen() },
+                 ) {
+                     externalVideoSource?.requestKeyFrame()
+@@ -891,8 +909,10 @@ class VideoSender(
+                         cachedVideoConfig = null
+                         encoder = codec
+                         inputSurface = surface
++                        encoderAbr = created.abr
+                         dashboardSourceSize = if (composeDashboard) initialSourceSize else null
+                         configuredTargetFps = fps
++                        runtimePolicy = policy
+                         transcoder = pipeline
+                     }
+                     true
+@@ -921,11 +941,31 @@ class VideoSender(
+     private fun drainExternalVideo() {
+         val output = socket?.getOutputStream() ?: return
+         var lastTranscodeGeneration: Long? = null
++        var lastPassthroughGeneration: Long? = null
+         try {
+             while (running.get()) {
+-                val queued = externalQueue.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS)
++                val queued = externalQueue.poll(250)
++                val nowNs = System.nanoTime()
++                if (queued != null) {
++                    r8QueueDelay.record(queued.queuedAtNs, nowNs)
++                    recentQueueAgeMs = ((nowNs - queued.queuedAtNs) / 1_000_000).coerceAtLeast(0)
++                } else recentQueueAgeMs = 0
++                val nowMs = uptimeMs()
++                val lastSample = lastThermalSampleMs
++                if (lastSample == null || nowMs - lastSample >= 1_000) {
++                    lastThermalSampleMs = nowMs
++                    if (runtimePolicy != null) {
++                        recentThermalStatus = runCatching { thermalStatus() }.getOrDefault(-1)
++                        runtimePolicy?.updateThermal(recentThermalStatus, nowMs)
++                    }
++                }
++                if (queued != null && !externalQueue.admit(queued, System.nanoTime())) {
++                    requestFreshSourceFrame()
++                    val active = transcoder
++                    if (active != null) active.markInputDiscontinuity() else maybeSendKeepAlive(output)
++                    continue
++                }
+                 val frame = queued?.frame
+-                if (queued != null) r8QueueDelay.record(queued.queuedAtNs, System.nanoTime())
+                 // 转码中：帧改喂解码器，数据口（含 keepAlive）由编码线程独占
+                 if (quiescing.get()) continue
+                 if (projectedDashboard && !dashboardFallback && transcoder == null && frame != null) {
+@@ -963,8 +1003,12 @@ class VideoSender(
+                             pipeline.markInputDiscontinuity()
+                         }
+                         lastTranscodeGeneration = queued.generation
+-                        if (screenFeedPaused()) pipeline.markInputDiscontinuity()
+-                        else pipeline.submit(queued.frame)
++                        if (screenFeedPaused()) {
++                            pipeline.markInputDiscontinuity()
++                        } else if (!externalQueue.admit(queued, System.nanoTime())) {
++                            pipeline.markInputDiscontinuity()
++                            requestFreshSourceFrame()
++                        } else pipeline.submit(queued.frame)
+                     }
+                     continue
+                 }
+@@ -973,6 +1017,11 @@ class VideoSender(
+                     maybeReportR5Stall()
+                     continue
+                 }
++                if (queued != null && lastPassthroughGeneration != queued.generation) {
++                    synchronized(passthroughDropResync) { passthroughDropResync.discontinuity() }
++                    reprimePending.set(true)
++                    lastPassthroughGeneration = queued.generation
++                }
+                 var nalUnits = splitAnnexB(frame.data)
+                 if (nalUnits.isEmpty()) continue
+                 if (!admitScreenFrame(frame.keyFrame, passthrough = true)) {
+@@ -1009,6 +1058,11 @@ class VideoSender(
+                 }
+                 if (!configSent) continue
+                 val packed = packLengthPrefixed(nalUnits)
++                if (queued != null && !externalQueue.admit(queued, System.nanoTime())) {
++                    requestFreshSourceFrame()
++                    maybeSendKeepAlive(output)
++                    continue
++                }
+                 val writeStart = android.os.SystemClock.uptimeMillis()
+                 if (!sendPlainFrame(packed, frame.keyFrame, output)) continue
+                 r5Cadence.recordForwardedFrame(frame.timestampUs, System.nanoTime())
+@@ -1078,9 +1132,7 @@ class VideoSender(
+             // 已切换转码：透传线程在切换前取到的旧配置不得混进新流
+             if (transcoder != null || quiescing.get()) return@synchronized false
+             val header = buildVideoConfigHeader(avcC.size, width, height)
+-            output.write(header)
+-            output.write(avcC)
+-            output.flush()
++            writePacket(output, header, avcC)
+             cachedVideoConfig = avcC
+             configSent = true
+             log(
+@@ -1117,9 +1169,7 @@ class VideoSender(
+                     }
+                 }
+             frameCounter++
+-            output.write(header)
+-            output.write(sealed)
+-            output.flush()
++            writePacket(output, header, sealed)
+             framesSent++
+             framesSinceKeepAlive++
+             bytesSinceKeepAlive += plain.size.toLong()
+@@ -1250,8 +1300,7 @@ class VideoSender(
+         lastKeepAliveAt = now
+         keepAliveCount++
+         val frame = buildKeepAliveFrame(keepAliveWithStats, frames, bytesPerSecond, framesPerSecond)
+-        output.write(frame)
+-        output.flush()
++        writePacket(output, frame)
+         if (keepAliveCount <= 3 || keepAliveCount % 30 == 0L) {
+             log(
+                 "VIDEO: keepAlive #$keepAliveCount " +
+@@ -1286,9 +1335,7 @@ class VideoSender(
+             // 旧实现三项都没写——DiPlay/WinPlay 只读 body、不校验头，所以测试台一直正常，
+             // 真车（Audi 4851）却黑屏（2026-10-19 用户日志）。
+             val header = buildVideoConfigHeader(body.size, width, height)
+-            output.write(header)
+-            output.write(body)
+-            output.flush()
++            writePacket(output, header, body)
+             configSent = true
+             log(
+                 "VIDEO: ✓ VideoConfig 已发送 avcC=${body.size}B（SPS ${rawSps.size}B/PPS ${pps.size}B，" +
+@@ -1355,14 +1402,30 @@ class VideoSender(
+                 }
+             frameCounter++
+             val writeStartNs = System.nanoTime()
+-            output.write(header)
+-            output.write(sealed)
+-            output.flush()
++            writePacket(output, header, sealed)
+             val writeNanos = System.nanoTime() - writeStartNs
+             val activeCodec = encoder
+             val abr = encoderAbr
+             if (activeCodec != null && abr != null) {
+-                abr.onFrameWritten(header.size + sealed.size, writeNanos, uptimeMs())?.let { decision ->
++                val nowMs = uptimeMs()
++                val recentGap = lastQueueGapNs?.let { System.nanoTime() - it in 0..500_000_000L } == true
++                val queuePressureMs = if (recentGap) maxOf(150L, recentQueueAgeMs) else recentQueueAgeMs
++                runtimePolicy?.observe(nowMs, writeNanos, queuePressureMs)
++                val rate = runtimeTargetFps
++                if (runtimePolicy != null && lastRuntimeLoggedFps != rate) {
++                    lastRuntimeLoggedFps = rate
++                    log(
++                        "VIDEO: R34 runtime fps=$rate configured=$configuredTargetFps " +
++                            "queueMs=$recentQueueAgeMs thermal=$recentThermalStatus bitrate=${abr.currentBitrate}",
++                    )
++                }
++                val ceiling = if (runtimePolicy != null) {
++                    val budget = if (lacrosseProjection) {
++                        LacrosseProjectionPolicy.bitrate(streamWidth, streamHeight, rate)
++                    } else ProjectionEncoderPolicy.initialBitrate(streamWidth, streamHeight, rate)
++                    if (rate <= 24) minOf(budget, 5_000_000) else budget
++                } else Int.MAX_VALUE
++                abr.onFrameWritten(header.size + sealed.size, writeNanos, nowMs, ceiling)?.let { decision ->
+                     pendingAbr = Triple(activeCodec, abr, decision)
+                 }
+             }
+@@ -1421,9 +1484,7 @@ class VideoSender(
+         declaredLength: Int,
+         output: java.io.OutputStream,
+     ) {
+-        output.write(buildHeader(opcode, declaredLength))
+-        output.write(body)
+-        output.flush()
++        writePacket(output, buildHeader(opcode, declaredLength), body)
+     }
+ 
+     /** 按 00 00 00 01 / 00 00 01 起始码切分 AnnexB 码流为 NAL 列表。 */
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoWriteDeadline.kt b/app/src/main/java/com/mcarplay/app/video/VideoWriteDeadline.kt
+new file mode 100644
+index 0000000..d113841
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/video/VideoWriteDeadline.kt
+@@ -0,0 +1,29 @@
++package com.mcarplay.app.video
++
++import java.net.Socket
++import java.util.concurrent.atomic.AtomicReference
++
++/** Atomic write ownership. A watchdog may retire only the exact in-flight packet on its own socket. */
++internal class VideoWriteDeadline(private val timeoutNs: Long = 5_000_000_000L) {
++    class Ticket(val socket: Socket, val startedNs: Long)
++    private val active = AtomicReference<Ticket?>()
++
++    fun begin(socket: Socket, nowNs: Long): Ticket {
++        val ticket = Ticket(socket, nowNs)
++        check(active.compareAndSet(null, ticket)) { "concurrent video write" }
++        return ticket
++    }
++
++    fun finish(ticket: Ticket) {
++        active.compareAndSet(ticket, null)
++    }
++
++    fun expire(socket: Socket, nowNs: Long): Boolean {
++        val ticket = active.get() ?: return false
++        if (ticket.socket !== socket || nowNs - ticket.startedNs < timeoutNs) return false
++        // Close the exact socket immediately on success; never resume a partial encrypted packet.
++        if (!active.compareAndSet(ticket, null)) return false
++        socket.close()
++        return true
++    }
++}
+diff --git a/app/src/main/res/layout/fragment_panel_display.xml b/app/src/main/res/layout/fragment_panel_display.xml
+index e666fb6..9688a38 100644
+--- a/app/src/main/res/layout/fragment_panel_display.xml
++++ b/app/src/main/res/layout/fragment_panel_display.xml
+@@ -12,6 +12,12 @@
+                 <TextView android:id="@+id/btnProjectedDashboardOff" android:layout_width="wrap_content" android:layout_height="wrap_content" android:minHeight="48dp" android:gravity="center" android:paddingHorizontal="18dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" />
+             </LinearLayout>
+             <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="6dp" android:text="@string/r29_projection_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
++            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginTop="12dp" android:text="@string/r34_full_content" android:textColor="@color/ui_text" android:textSize="16sp" android:textStyle="bold" />
++            <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:background="@drawable/bg_segment" android:orientation="horizontal" android:padding="3dp">
++                <TextView android:id="@+id/btnFullContentOn" android:layout_width="wrap_content" android:layout_height="wrap_content" android:minHeight="48dp" android:gravity="center" android:paddingHorizontal="18dp" android:text="@string/lay_on" android:textColor="@color/ui_text_secondary" />
++                <TextView android:id="@+id/btnFullContentOff" android:layout_width="wrap_content" android:layout_height="wrap_content" android:minHeight="48dp" android:gravity="center" android:paddingHorizontal="18dp" android:text="@string/lay_off_short" android:textColor="@color/ui_text_secondary" />
++            </LinearLayout>
++            <TextView android:layout_width="match_parent" android:layout_height="wrap_content" android:text="@string/r34_full_content_desc" android:textColor="@color/ui_text_secondary" android:textSize="13sp" />
+         </LinearLayout>
+ 
+         <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content" android:layout_marginBottom="12dp" android:background="@drawable/ui_bg_card" android:orientation="vertical" android:padding="16dp"><TextView android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="@string/lay_screen_off" android:textColor="@color/ui_text" android:textSize="16sp" android:layout_marginTop="0dp" android:textStyle="bold" />
+diff --git a/app/src/main/res/values-en/r29_projection.xml b/app/src/main/res/values-en/r29_projection.xml
+index 9007a50..69ee2ba 100644
+--- a/app/src/main/res/values-en/r29_projection.xml
++++ b/app/src/main/res/values-en/r29_projection.xml
+@@ -3,4 +3,6 @@
+     <string name="r29_projection_title">Glass dashboard projection (experimental)</string>
+     <string name="r29_projection_desc">Compose a new receiver-side dashboard on the next connection, with live CarWith content and media controls. Turn off to use compatibility projection.</string>
+     <string name="r29_projection_next_connection">Applies on next connection</string>
++    <string name="r34_full_content">Full-screen HD content (experimental)</string>
++    <string name="r34_full_content_desc">Requires the experimental dashboard. Hide extra panels and fit live CarWith content to the screen. Reconnect to apply.</string>
+ </resources>
+diff --git a/app/src/main/res/values-en/strings_lay.xml b/app/src/main/res/values-en/strings_lay.xml
+index 1038ffe..133269c 100644
+--- a/app/src/main/res/values-en/strings_lay.xml
++++ b/app/src/main/res/values-en/strings_lay.xml
+@@ -25,7 +25,7 @@
+     <string name="lay_stream_resolution">Stream resolution</string>
+     <string name="lay_next_connection">Applies on the next connection</string>
+     <string name="lay_target_fps">Target frame rate</string>
+-    <string name="lay_target_fps_desc">The experimental dashboard prefers 60 fps. Reconnect to apply. The status card shows sent/configured FPS, not display refresh.</string>
++    <string name="lay_target_fps_desc">The experimental dashboard prefers 60 fps. Reconnect to apply. The status card shows sent/runtime target FPS, not display refresh.</string>
+     <string name="lay_pick_target">Choose the target head unit</string>
+     <string name="lay_pick_target_desc">Paired devices can be selected directly; tapping an unpaired device starts system Bluetooth pairing</string>
+     <string name="lay_paired">Paired</string>
+diff --git a/app/src/main/res/values/r29_projection.xml b/app/src/main/res/values/r29_projection.xml
+index b2ff475..fe8e2c9 100644
+--- a/app/src/main/res/values/r29_projection.xml
++++ b/app/src/main/res/values/r29_projection.xml
+@@ -3,4 +3,6 @@
+     <string name="r29_projection_title">车机玻璃仪表盘（实验）</string>
+     <string name="r29_projection_desc">下次连接时合成独立投屏界面；保留 CarWith 实时内容和媒体控制。关闭即恢复原样投屏。</string>
+     <string name="r29_projection_next_connection">下次连接生效</string>
++    <string name="r34_full_content">全屏高清内容（实验）</string>
++    <string name="r34_full_content_desc">开启玻璃仪表盘后生效。隐藏附加面板，按源比例扩大 CarWith 内容；重新连接生效。</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings_lay.xml b/app/src/main/res/values/strings_lay.xml
+index 4a14fbe..605faa5 100644
+--- a/app/src/main/res/values/strings_lay.xml
++++ b/app/src/main/res/values/strings_lay.xml
+@@ -25,7 +25,7 @@
+     <string name="lay_stream_resolution">流分辨率</string>
+     <string name="lay_next_connection">保存后下次连接起效</string>
+     <string name="lay_target_fps">目标帧率</string>
+-    <string name="lay_target_fps_desc">实验仪表盘默认优先 60 fps；重新连接生效。首页显示发送帧率/配置目标，不代表车机刷新率。</string>
++    <string name="lay_target_fps_desc">实验仪表盘默认优先 60 fps；重新连接生效。首页显示发送帧率/运行时目标，不代表车机刷新率。</string>
+     <string name="lay_pick_target">选择目标车机</string>
+     <string name="lay_pick_target_desc">已配对设备可直接选用；点击未配对的设备会发起系统蓝牙配对</string>
+     <string name="lay_paired">已配对</string>
+diff --git a/app/src/test/java/com/mcarplay/app/video/R34RuntimePolicyTest.kt b/app/src/test/java/com/mcarplay/app/video/R34RuntimePolicyTest.kt
+new file mode 100644
+index 0000000..25bbb2e
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/video/R34RuntimePolicyTest.kt
+@@ -0,0 +1,124 @@
++package com.mcarplay.app.video
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.net.Socket
++
++class R34RuntimePolicyTest {
++    @Test
++    fun phaseAligned60HzDoesNotDriftOnMillisecondHandler() {
++        val pacer = ProjectionFramePacer(60)
++        var count = 0
++        for (ms in 0L until 60_000L) {
++            pacer.sourceArrived()
++            if (pacer.delayMs(ms * 1_000_000) == 0L) {
++                pacer.rendered(ms * 1_000_000)
++                count++
++            }
++        }
++        assertEquals(3600, count)
++        pacer.updateRate(30)
++        pacer.rendered(60_000_000_000L)
++        assertEquals(34L, pacer.delayMs(60_000_000_000L))
++    }
++
++    @Test
++    fun sustainedCongestionAndCoolingRecoverInStages() {
++        val policy = ProjectionRuntimePolicy(60)
++        policy.observe(0, 100_000_000, 0)
++        assertEquals(45, policy.fps())
++        policy.observe(1600, 100_000_000, 0)
++        assertEquals(24, policy.fps())
++        for (t in 2000L..44000L step 200) policy.observe(t, 1_000_000, 0)
++        assertEquals(60, policy.fps())
++        policy.updateThermal(3, 45000)
++        assertEquals(30, policy.fps())
++        for (t in 46000L..55000L step 1000) policy.updateThermal(0, t)
++        assertEquals(30, policy.fps())
++        policy.updateThermal(0, 56000)
++        assertEquals(45, policy.fps())
++        policy.updateThermal(-1, 57000)
++        policy.updateThermal(0, 100000)
++        assertEquals(45, policy.fps())
++    }
++
++    @Test
++    fun slowGpuAndIdleTimeAreNotMistakenForHealthyVideo() {
++        val policy = ProjectionRuntimePolicy(60)
++        for (t in 0L..400L step 200) {
++            policy.recordRender(t, 25_000_000)
++            policy.observe(t, 1_000_000, 0)
++        }
++        assertEquals(50, policy.fps())
++        policy.observe(2000, 1_000_000, 0)
++        policy.observe(40000, 1_000_000, 0)
++        assertEquals(50, policy.fps())
++    }
++
++    @Test
++    fun queueExpiryInvalidatesOldAccessUnitsAndRequiresIdr() {
++        val q = FreshVideoQueue(2)
++        fun frame(key: Boolean) = ExternalVideoFrame(byteArrayOf(1), key, 0)
++        assertTrue(q.offer(frame(true), 0).accepted)
++        assertTrue(q.offer(frame(false), 1).accepted)
++        val old = requireNotNull(q.poll(0))
++        assertTrue(q.offer(frame(false), 2).accepted)
++        assertFalse(q.offer(frame(false), 3).accepted)
++        assertFalse(q.admit(old, 4))
++        assertFalse(q.offer(frame(false), 5).accepted)
++        assertTrue(q.offer(frame(true), 6).accepted)
++        assertTrue(q.admit(requireNotNull(q.poll(0)), 6))
++        assertTrue(q.offer(frame(false), 10).accepted)
++        assertFalse(q.admit(requireNotNull(q.poll(0)), 300_000_010))
++        assertFalse(q.offer(frame(false), 300_000_011).accepted)
++        assertTrue(q.offer(frame(true), 300_000_012).accepted)
++        q.close()
++        assertFalse(q.offer(frame(true), 300_000_013).accepted)
++    }
++
++    @Test
++    fun bitrateCeilingDoesNotClaimUnappliedHardwareChanges() {
++        val abr = VideoEncoderAbr(5_000_000, 15_000_000, 15_000_000)
++        val decision = requireNotNull(abr.onFrameWritten(8000, 1_000_000, 1000, 8_000_000))
++        assertEquals(8_000_000, decision.bitrateBps)
++        assertEquals(15_000_000, abr.currentBitrate)
++        assertTrue(abr.onApplied(decision, 1000))
++        repeat(400) { assertNull(abr.onFrameWritten(8000, 1_000_000, 3000L + it * 20, 8_000_000)) }
++        assertEquals(8_750_000, abr.onFrameWritten(8000, 1_000_000, 12000, 15_000_000)?.bitrateBps)
++    }
++
++    @Test
++    fun fullContentPreservesAspectAndTouchCoordinates() {
++        val full = ProjectedDashboardLayout(1920, 1080, 1920, 1080, true, true)
++        assertEquals(ProjectionRect(0, 0, 1920, 1080), full.video)
++        assertTrue(full.controls.isEmpty())
++        assertEquals(1919 to 1079, full.sourcePoint(1919, 1079, 1920, 1080))
++        val wide = ProjectedDashboardLayout(2400, 800, 1920, 1080, true, true)
++        assertEquals(800, wide.video.height)
++        assertTrue(wide.video.left > 0)
++        assertNull(DashboardTouchRouter().route(wide, 0, 400, true, 1920, 1080).point)
++    }
++
++    @Test
++    fun watchdogCannotCloseTheWrongSocketOrCompletedWrite() {
++        Socket().use { a ->
++            Socket().use { b ->
++                val deadline = VideoWriteDeadline(100)
++                val first = deadline.begin(a, 0)
++                assertFalse(deadline.expire(b, 200))
++                assertFalse(deadline.expire(a, 99))
++                deadline.finish(first)
++                assertFalse(deadline.expire(a, 200))
++                val next = deadline.begin(a, 200)
++                deadline.finish(first)
++                assertTrue(deadline.expire(a, 300))
++                assertTrue(a.isClosed)
++                assertFalse(b.isClosed)
++                deadline.finish(next)
++            }
++        }
++    }
++}

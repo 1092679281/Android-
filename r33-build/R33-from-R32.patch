@@ -1,0 +1,307 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 1ab810f..dcc1b04 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,2 +5,12 @@ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.20-test.1] - 2026-11-25
++
++> R33 — negotiated 60 FPS candidate; real receiver and codec performance unverified.
++
++- Remove the experimental GM E2LB 30 FPS hard cap; honor valid receiver limits and saved preference.
++- Opt-in dashboard defaults to 60 FPS; unknown or malformed receiver capability falls back to 30 FPS.
++- Allow up to 15 Mbps at 60 FPS, keep existing ABR; retry local encoder initialization once at 30 FPS if high rate is rejected.
++- Display actual configured target separately from sent frame count; preferences take effect after reconnect.
++- 君越实验仪表盘优先协商 60 FPS，保留 30 FPS 回退；真实帧率仍需车机验证。
++
+ ## [v0.1.19-test.1] - 2026-11-25
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 963fd62..6d698a5 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -17,3 +17,3 @@ plugins {
+  */
+-val appVersionName = "0.1.19"
++val appVersionName = "0.1.20"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+diff --git a/app/src/main/java/com/mcarplay/app/MainActivity.kt b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+index ff84296..a31660f 100644
+--- a/app/src/main/java/com/mcarplay/app/MainActivity.kt
++++ b/app/src/main/java/com/mcarplay/app/MainActivity.kt
+@@ -78,2 +78,4 @@ import com.mcarplay.app.util.DeviceIdentity
+ import com.mcarplay.app.util.LogExporter
++import com.mcarplay.app.video.VideoSender
++import kotlin.math.roundToInt
+ 
+@@ -157,4 +159,6 @@ class MainActivity : AppCompatActivity() {
+ 
+-    // 英雄卡实时帧率：1s 轮询对 VideoSender 已发帧计数取差值
++    // Sent-frame count sampled against actual elapsed time; not receiver display FPS.
+     private var lastSentFrames = 0L
++    private var lastFpsSampleNs = 0L
++    private var lastStatsSender: VideoSender? = null
+ 
+@@ -1739,12 +1743,23 @@ class MainActivity : AppCompatActivity() {
+      * 英雄卡统计行（仅连接时显示）：运行时分辨率 + 实际/目标帧率。
+-     * 实际帧率 = 1s 轮询对已发帧计数取差值；新会话计数归零时先对齐基线。
++     * 发送帧率按实际采样时间计算；更换会话时重新建立基线。
+      */
+     private fun updateHeroStats() {
+-        if (heroState != HeroState.CONNECTED) return
+-        val sent = SessionController.videoSender?.framesSentTotal ?: 0
+-        if (sent < lastSentFrames) lastSentFrames = sent
+-        val fps = sent - lastSentFrames
++        if (heroState != HeroState.CONNECTED) {
++            lastStatsSender = null
++            lastFpsSampleNs = 0L
++            return
++        }
++        val sender = SessionController.videoSender
++        val sent = sender?.framesSentTotal ?: 0L
++        val now = SystemClock.elapsedRealtimeNanos()
++        val elapsed = now - lastFpsSampleNs
++        val fps = if (sender != null && sender === lastStatsSender && sent >= lastSentFrames && lastFpsSampleNs != 0L && elapsed > 0) {
++            ((sent - lastSentFrames) * 1_000_000_000.0 / elapsed).roundToInt()
++        } else 0
++        lastStatsSender = sender
+         lastSentFrames = sent
++        lastFpsSampleNs = now
++        val target = sender?.configuredTargetFps ?: SessionController.activeTargetFps
+         heroStats.text =
+-            getString(R.string.ma_hero_stats, SessionController.activeScalePercent, fps.toInt(), SessionController.activeTargetFps)
++            getString(R.string.ma_hero_stats, SessionController.activeScalePercent, fps, target)
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt b/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
+index 298d135..e1290ba 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
+@@ -1250,3 +1250,3 @@ class AirPlayClient(
+                     ),
+-                maxFps = ((display?.get("maxFPS") as? Long) ?: 30L).toInt(),
++                maxFps = com.mcarplay.app.video.SourceFpsPolicy.reportedMaxOrDefault(display?.get("maxFPS") as? Long),
+                 displayGeometryReported = com.mcarplay.app.video.LacrosseProjectionPolicy.reportedGeometry(
+diff --git a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+index 8bbef13..0eebace 100644
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPanelFragment.kt
+@@ -17,3 +17,3 @@ import com.mcarplay.app.compat.PassatReturnStrategy
+  * 「显示」面板：流分辨率缩放（30%–160%，下次连接起效）+ 目标帧率（30/60，
+- * 运行中实时切换）。英雄卡展示的是会话运行时生效值（SessionController 快照），
++ * 下次连接协商）。英雄卡展示的是会话运行时发送帧率和配置目标，
+  * 与本页偏好值相区别。
+@@ -37,7 +37,2 @@ class DisplayPanelFragment : SettingsPanelFragment() {
+ 
+-        bindToggle(view.findViewById(R.id.btnProjectedDashboardOn), view.findViewById(R.id.btnProjectedDashboardOff), DisplayPrefs.projectedDashboard(ctx)) { enabled ->
+-            DisplayPrefs.setProjectedDashboard(ctx, enabled)
+-            hostToast(getString(R.string.r29_projection_next_connection))
+-        }
+-
+         // 连接时真息屏（物理面板断电）：默认开；会话中切换立即生效
+@@ -285,4 +280,12 @@ class DisplayPanelFragment : SettingsPanelFragment() {
+ 
+-        val savedFps = DisplayPrefs.fps(ctx)
+-        refreshFps(savedFps < 60)
++        refreshFps(DisplayPrefs.fps(ctx) < 60)
++        bindToggle(
++            view.findViewById(R.id.btnProjectedDashboardOn),
++            view.findViewById(R.id.btnProjectedDashboardOff),
++            DisplayPrefs.projectedDashboard(ctx),
++        ) { enabled ->
++            DisplayPrefs.setProjectedDashboard(ctx, enabled)
++            refreshFps(DisplayPrefs.fps(ctx) < 60)
++            hostToast(getString(R.string.r29_projection_next_connection))
++        }
+ 
+@@ -295,3 +298,2 @@ class DisplayPanelFragment : SettingsPanelFragment() {
+             hostToast(getString(if (live) R.string.sf_fps_live else R.string.sf_fps_set, fps))
+-            if (live) SessionController.activeTargetFps = fps
+         }
+diff --git a/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt b/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
+index 3a00d71..9d875c3 100644
+--- a/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
++++ b/app/src/main/java/com/mcarplay/app/settings/DisplayPrefs.kt
+@@ -10,3 +10,3 @@ import android.content.Context
+  *   编码器与全部虚拟屏按会话建立时的尺寸创建，运行中改无意义。
+- * - 帧率（30/60）：合成器出帧节奏上限，运行中可实时切换。
++ * - 帧率（30/60）：下次连接协商的目标，实验仪表盘默认优先 60。
+  *
+@@ -104,7 +104,8 @@ object DisplayPrefs {
+ 
+-    /** 目标帧率（30/60；驱动合成器出帧节奏，运行中切换实时生效）。 */
+-    fun fps(context: Context): Int =
+-        context
+-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+-            .getInt(KEY_FPS, FPS_DEFAULT)
++    /** Saved explicit preference wins; only the opt-in dashboard defaults to 60. */
++    fun fps(context: Context): Int {
++        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++        val defaultFps = if (projectedDashboard(context)) 60 else FPS_DEFAULT
++        return if (prefs.getInt(KEY_FPS, defaultFps) >= 60) 60 else 30
++    }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/video/LacrosseProjectionPolicy.kt b/app/src/main/java/com/mcarplay/app/video/LacrosseProjectionPolicy.kt
+index 1245650..821be1d 100644
+--- a/app/src/main/java/com/mcarplay/app/video/LacrosseProjectionPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/video/LacrosseProjectionPolicy.kt
+@@ -26,3 +26,3 @@ internal object LacrosseProjectionPolicy {
+         if (!reported || width !in 640..8192 || height !in 360..8192 || width.toDouble() / height !in 1.2..3.5) return null
+-        val fps = minOf(30, SourceFpsPolicy.effective(requestedFps, receiverMaxFps))
++        val fps = SourceFpsPolicy.effective(requestedFps, SourceFpsPolicy.reportedMaxOrDefault(receiverMaxFps.toLong()))
+         for (scale in requestedScale.coerceIn(30, 100) downTo 1) {
+@@ -38,4 +38,11 @@ internal object LacrosseProjectionPolicy {
+     /** Budget only the experimental local encoder; passthrough bitrates cannot be controlled here. */
+-    fun bitrate(width: Int, height: Int, fps: Int): Int =
+-        ProjectionEncoderPolicy.initialBitrate(width, height, fps).coerceAtMost(8_000_000)
++    fun bitrate(width: Int, height: Int, fps: Int): Int {
++        val extra = (fps - 30).coerceIn(0, 30)
++        val cap = 8_000_000L + 7_000_000L * extra / 30
++        val base = ProjectionEncoderPolicy.initialBitrate(width, height, 30).toLong()
++        return (base * (60 + extra) / 60).coerceAtMost(cap).toInt()
++    }
++
++    /** A rejected high-rate local encoder may retry once at 30 FPS. */
++    fun fallbackFps(fps: Int): Int? = if (fps > 30) 30 else null
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/video/SourceFpsPolicy.kt b/app/src/main/java/com/mcarplay/app/video/SourceFpsPolicy.kt
+index de1f48d..afa47c4 100644
+--- a/app/src/main/java/com/mcarplay/app/video/SourceFpsPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/video/SourceFpsPolicy.kt
+@@ -4,2 +4,5 @@ package com.mcarplay.app.video
+ internal object SourceFpsPolicy {
++    /** Validate the wire value before narrowing Long to Int. Missing/malformed is conservative. */
++    fun reportedMaxOrDefault(raw: Long?): Int = raw?.takeIf { it in 1L..240L }?.toInt() ?: 30
++
+     fun effective(
+diff --git a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+index 4effe7f..70f2ea1 100644
+--- a/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
++++ b/app/src/main/java/com/mcarplay/app/video/VideoSender.kt
+@@ -82,2 +82,6 @@ class VideoSender(
+ 
++    @Volatile
++    var configuredTargetFps: Int = targetFps
++        private set
++
+     val videoWidth: Int get() = width
+@@ -833,3 +837,3 @@ class VideoSender(
+         if (!running.get() || quiescing.get()) return
+-        val fps = TranscodePolicy.cappedFps(targetFps, receiverMaxFps)
++        var fps = TranscodePolicy.cappedFps(targetFps, receiverMaxFps)
+         val reason =
+@@ -856,3 +860,11 @@ class VideoSender(
+         try {
+-            val created = createEncoder(streamWidth, streamHeight, fps, capEncoderFps = true, baselineProfile = true)
++            val created = try {
++                createEncoder(streamWidth, streamHeight, fps, capEncoderFps = true, baselineProfile = true)
++            } catch (error: Exception) {
++                val fallback = if (composeDashboard && lacrosseProjection) LacrosseProjectionPolicy.fallbackFps(fps) else null
++                if (fallback == null || !running.get() || quiescing.get()) throw error
++                log("VIDEO: R33 encoder rejected ${fps}fps; retry at ${fallback}fps - ${error.message}")
++                fps = fallback
++                createEncoder(streamWidth, streamHeight, fps, capEncoderFps = true, baselineProfile = true)
++            }
+             codec = created.first
+@@ -882,2 +894,3 @@ class VideoSender(
+                         dashboardSourceSize = if (composeDashboard) initialSourceSize else null
++                        configuredTargetFps = fps
+                         transcoder = pipeline
+diff --git a/app/src/main/res/values-en/strings_car.xml b/app/src/main/res/values-en/strings_car.xml
+index 2ce3a0b..fb6daa1 100644
+--- a/app/src/main/res/values-en/strings_car.xml
++++ b/app/src/main/res/values-en/strings_car.xml
+@@ -16,4 +16,4 @@
+     <string name="sf_duck_off">Music not lowered during navigation</string>
+-    <string name="sf_fps_set">Frame rate set to %1$d fps</string>
+-    <string name="sf_fps_live">Frame rate set to %1$d fps (applied now)</string>
++    <string name="sf_fps_set">Target %1$d fps saved (next connection)</string>
++    <string name="sf_fps_live">Target %1$d fps saved (reconnect to apply)</string>
+ </resources>
+diff --git a/app/src/main/res/values-en/strings_lay.xml b/app/src/main/res/values-en/strings_lay.xml
+index 52e02a2..1038ffe 100644
+--- a/app/src/main/res/values-en/strings_lay.xml
++++ b/app/src/main/res/values-en/strings_lay.xml
+@@ -7,3 +7,3 @@
+     <string name="cd_bt_device">Bluetooth device</string>
+-    <string name="lay_display_desc">The video stream encodes the picture at a percentage of the head-unit resolution. Resolution changes apply on the next connection; frame rate is the streaming refresh rate and applies immediately.</string>
++    <string name="lay_display_desc">Resolution and target frame rate are negotiated on the next connection, subject to receiver and phone capabilities.</string>
+     <string name="lay_screen_off">Turn the panel off while connected</string>
+@@ -27,3 +27,3 @@
+     <string name="lay_target_fps">Target frame rate</string>
+-    <string name="lay_target_fps_desc">Changes apply immediately while connected; the status card shows actual/target frame rate</string>
++    <string name="lay_target_fps_desc">The experimental dashboard prefers 60 fps. Reconnect to apply. The status card shows sent/configured FPS, not display refresh.</string>
+     <string name="lay_pick_target">Choose the target head unit</string>
+diff --git a/app/src/main/res/values/strings_car.xml b/app/src/main/res/values/strings_car.xml
+index 34036eb..95a7d93 100644
+--- a/app/src/main/res/values/strings_car.xml
++++ b/app/src/main/res/values/strings_car.xml
+@@ -16,4 +16,4 @@
+     <string name="sf_duck_off">导航时不压低音乐</string>
+-    <string name="sf_fps_set">帧率已切换为 %1$dfps</string>
+-    <string name="sf_fps_live">帧率已切换为 %1$dfps（实时生效）</string>
++    <string name="sf_fps_set">目标帧率已保存为 %1$dfps（下次连接协商）</string>
++    <string name="sf_fps_live">目标帧率已保存为 %1$dfps（重新连接生效）</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings_lay.xml b/app/src/main/res/values/strings_lay.xml
+index 544140c..4a14fbe 100644
+--- a/app/src/main/res/values/strings_lay.xml
++++ b/app/src/main/res/values/strings_lay.xml
+@@ -7,3 +7,3 @@
+     <string name="cd_bt_device">蓝牙设备</string>
+-    <string name="lay_display_desc">视频流按车机分辨率的百分比编码画面。分辨率改动下次连接起效；帧率为推流刷新频率，切换实时生效。</string>
++    <string name="lay_display_desc">分辨率与目标帧率在下次连接时协商；实际输出取决于车机和手机能力。</string>
+     <string name="lay_screen_off">连接时真息屏</string>
+@@ -27,3 +27,3 @@
+     <string name="lay_target_fps">目标帧率</string>
+-    <string name="lay_target_fps_desc">连接中切换实时生效；英雄卡实时显示「实际/目标」帧率</string>
++    <string name="lay_target_fps_desc">实验仪表盘默认优先 60 fps；重新连接生效。首页显示发送帧率/配置目标，不代表车机刷新率。</string>
+     <string name="lay_pick_target">选择目标车机</string>
+diff --git a/app/src/test/java/com/mcarplay/app/video/LacrosseProjectionPolicyTest.kt b/app/src/test/java/com/mcarplay/app/video/LacrosseProjectionPolicyTest.kt
+index 8165974..ba01cac 100644
+--- a/app/src/test/java/com/mcarplay/app/video/LacrosseProjectionPolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/video/LacrosseProjectionPolicyTest.kt
+@@ -21,4 +21,4 @@ class LacrosseProjectionPolicyTest {
+     }
+-    @Test fun noUpscalingAndCapFps() {
+-        assertEquals(LacrosseProjectionPolicy.Output(1280, 720, 100, 30), LacrosseProjectionPolicy.choose(1280, 720, true, 160, 60, 60))
++    @Test fun noUpscalingAndNegotiatedFps() {
++        assertEquals(LacrosseProjectionPolicy.Output(1280, 720, 100, 60), LacrosseProjectionPolicy.choose(1280, 720, true, 160, 60, 60))
+         assertEquals(24, LacrosseProjectionPolicy.choose(1920, 1080, true, 100, 60, 24)?.fps)
+@@ -30,3 +30,21 @@ class LacrosseProjectionPolicyTest {
+         assertEquals(50, p.scalePercent)
+-        assertTrue(LacrosseProjectionPolicy.bitrate(p.width, p.height, p.fps) <= 8_000_000)
++        assertEquals(15_000_000, LacrosseProjectionPolicy.bitrate(p.width, p.height, p.fps))
++    }
++    @Test fun highRateRequiresValidReceiverReport() {
++        for (cap in listOf(-1, 0, 241, Int.MAX_VALUE)) {
++            assertEquals(30, LacrosseProjectionPolicy.choose(1920, 1080, true, 100, 60, cap)?.fps)
++        }
++        for (cap in listOf(15, 24, 30, 40, 45, 50, 60, 120)) {
++            assertEquals(minOf(60, cap), LacrosseProjectionPolicy.choose(1920, 1080, true, 100, 60, cap)?.fps)
++        }
++        assertEquals(30, LacrosseProjectionPolicy.choose(1920, 1080, true, 100, 30, 60)?.fps)
++    }
++    @Test fun bitrateBudgetAndLocalEncoderFallback() {
++        assertEquals(8_000_000, LacrosseProjectionPolicy.bitrate(1920, 1080, 30))
++        assertEquals(11_500_000, LacrosseProjectionPolicy.bitrate(1920, 1080, 45))
++        assertEquals(15_000_000, LacrosseProjectionPolicy.bitrate(1920, 1080, 60))
++        assertEquals(30, LacrosseProjectionPolicy.fallbackFps(60))
++        assertEquals(30, LacrosseProjectionPolicy.fallbackFps(45))
++        assertNull(LacrosseProjectionPolicy.fallbackFps(30))
++        assertNull(LacrosseProjectionPolicy.fallbackFps(24))
+     }
+diff --git a/app/src/test/java/com/mcarplay/app/video/SourceFpsPolicyTest.kt b/app/src/test/java/com/mcarplay/app/video/SourceFpsPolicyTest.kt
+index 4d3b241..87ffd89 100644
+--- a/app/src/test/java/com/mcarplay/app/video/SourceFpsPolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/video/SourceFpsPolicyTest.kt
+@@ -26,2 +26,11 @@ class SourceFpsPolicyTest {
+ 
++    @Test
++    fun malformedWireRateCannotWrapInto60() {
++        for (raw in listOf(null, -1L, 0L, 241L, 4_294_967_356L, Long.MAX_VALUE)) {
++            assertEquals(30, SourceFpsPolicy.reportedMaxOrDefault(raw))
++        }
++        assertEquals(60, SourceFpsPolicy.reportedMaxOrDefault(60L))
++        assertEquals(24, SourceFpsPolicy.reportedMaxOrDefault(24L))
++    }
++
+     @Test
