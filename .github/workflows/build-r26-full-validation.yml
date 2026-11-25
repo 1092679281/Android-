@@ -115,10 +115,22 @@ jobs:
           for p in paths:
               h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
           print("Pre-format source fingerprint",len(paths),h.hexdigest())
+          manifest=Path("r26-source-fingerprint.tsv")
+          manifest.write_text("".join(f"{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n" for p in paths))
+          for p in paths[-3:]:
+              print("Critical file",p,sha256(p.read_bytes()).hexdigest())
           assert len(paths)==603 and h.hexdigest()=="7b56514c4cdec90e0776cd8c464eb550b31db88a3d77c947e6ebc11d21cd6493", "R26 source does not match local validated snapshot"
           PY
           grep -F 'val appVersionName = "0.1.13"' app/build.gradle.kts
           echo "Exact R26 app source reconstruction completed"
+      - name: Preserve pre-format source fingerprint evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R26-source-fingerprint-evidence
+          path: baseline/mcarplay-project/r26-source-fingerprint.tsv
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Full Kotlin/JVM tests, formatting, Android Lint and real APK compilation
         working-directory: baseline/mcarplay-project
         run: |
