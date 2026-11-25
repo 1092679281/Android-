@@ -1,0 +1,112 @@
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index 58f4aec..3b4bb70 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -5116,7 +5116,9 @@ object SessionController {
+                                                 log = { line -> appendLog(line) },
+                                                 keepAliveWithStats = setup.keepAliveSendStatsAsBody,
+                                                 externalVideoSource = carLifeSource,
+-                                                projectedDashboard = dashboardEnabled && projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis()),
++                                                projectedDashboard =
++                                                    dashboardEnabled &&
++                                                        projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis()),
+                                                 lacrosseProjection = lacrosseOutput != null,
+                                                 onDashboardLocalFailure = { reason ->
+                                                     if (videoSender === sender) {
+@@ -5124,7 +5126,10 @@ object SessionController {
+                                                         appendLog("DISPLAY: R32 local projection fault: $reason")
+                                                     }
+                                                 },
+-                                                allowCompatibilityTranscode = !gmE2lb || !dashboardPreference || (lacrosseOutput != null && projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis())),
++                                                allowCompatibilityTranscode =
++                                                    !gmE2lb || !dashboardPreference ||
++                                                        (lacrosseOutput != null &&
++                                                            projectionRecovery.allowsDashboard(peerAddress, SystemClock.uptimeMillis())),
+                                                 receiverMaxFps = setup.maxFps,
+                                                 // 车机拿走主屏（原车界面、倒车影像等）时暂停屏幕视频，归还后从新的 IDR 恢复
+                                                 phoneOwnsScreen = { client.modes.phoneOwnsScreen },
+diff --git a/app/src/main/java/com/mcarplay/app/video/ProjectionRecoveryPolicy.kt b/app/src/main/java/com/mcarplay/app/video/ProjectionRecoveryPolicy.kt
+index 5b35eee..a5bb998 100644
+--- a/app/src/main/java/com/mcarplay/app/video/ProjectionRecoveryPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/video/ProjectionRecoveryPolicy.kt
+@@ -1,22 +1,37 @@
+ package com.mcarplay.app.video
+ 
++import java.util.Locale
++
+ /** Local dashboard failure only: never infer a codec fault from a network disconnect. */
+ internal class ProjectionRecoveryPolicy(private val cooldownMs: Long = 600_000L) {
+-    private var failedPeer: String? = null
+-    private var failedAtMs = 0L
++    private val failedPeers = LinkedHashMap<String, Long>()
+ 
+     @Synchronized
+     fun recordLocalFailure(peer: String?, nowMs: Long) {
+-        if (peer.isNullOrBlank()) return
+-        failedPeer = peer
+-        failedAtMs = nowMs
++        val key = peerKey(peer) ?: return
++        failedPeers.entries.removeAll { (_, failedAt) -> !isCoolingDown(failedAt, nowMs) }
++        failedPeers.remove(key)
++        failedPeers[key] = nowMs
++        while (failedPeers.size > MAX_TRACKED_PEERS) {
++            failedPeers.remove(failedPeers.keys.first())
++        }
+     }
+ 
+     @Synchronized
+     fun allowsDashboard(peer: String?, nowMs: Long): Boolean {
+-        if (peer.isNullOrBlank() || !peer.equals(failedPeer, ignoreCase = true)) return true
+-        val elapsed = nowMs - failedAtMs
+-        return elapsed < 0L || elapsed >= cooldownMs
++        val key = peerKey(peer) ?: return true
++        val failedAt = failedPeers[key] ?: return true
++        if (isCoolingDown(failedAt, nowMs)) return false
++        failedPeers.remove(key)
++        return true
++    }
++
++    private fun peerKey(peer: String?): String? = peer?.trim()?.takeIf { it.isNotEmpty() }?.uppercase(Locale.ROOT)
++
++    private fun isCoolingDown(failedAt: Long, nowMs: Long): Boolean = nowMs >= failedAt && nowMs - failedAt < cooldownMs
++
++    private companion object {
++        const val MAX_TRACKED_PEERS = 16
+     }
+ }
+ 
+diff --git a/app/src/test/java/com/mcarplay/app/video/ProjectionRecoveryPolicyTest.kt b/app/src/test/java/com/mcarplay/app/video/ProjectionRecoveryPolicyTest.kt
+index b65e0af..e2517b2 100644
+--- a/app/src/test/java/com/mcarplay/app/video/ProjectionRecoveryPolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/video/ProjectionRecoveryPolicyTest.kt
+@@ -18,6 +18,30 @@ class ProjectionRecoveryPolicyTest {
+         assertTrue(policy.allowsDashboard(null, 101L))
+     }
+ 
++    @Test
++    fun failuresOfDifferentPeersDoNotClearEachOthersCooldown() {
++        val policy = ProjectionRecoveryPolicy(100L)
++        policy.recordLocalFailure("AA", 10L)
++        policy.recordLocalFailure("bb", 30L)
++        assertFalse(policy.allowsDashboard(" aa ", 40L))
++        assertFalse(policy.allowsDashboard("BB", 40L))
++        assertTrue(policy.allowsDashboard("AA", 110L))
++        assertFalse(policy.allowsDashboard("BB", 110L))
++        assertTrue(policy.allowsDashboard("BB", 130L))
++    }
++
++    @Test
++    fun expiredAndOldestEntriesAreRemovedFromBoundedCache() {
++        val policy = ProjectionRecoveryPolicy(100L)
++        repeat(17) { policy.recordLocalFailure("peer-$it", it.toLong()) }
++        assertTrue(policy.allowsDashboard("peer-0", 17L))
++        assertFalse(policy.allowsDashboard("peer-1", 17L))
++        assertFalse(policy.allowsDashboard("peer-16", 17L))
++        assertTrue(policy.allowsDashboard("peer-16", 116L))
++        policy.recordLocalFailure("peer-1", 120L)
++        assertFalse(policy.allowsDashboard("peer-1", 121L))
++    }
++
+     @Test
+     fun codecWindowUsesOffsetAndDoesNotMutateOriginal() {
+         val buffer = ByteBuffer.wrap(byteArrayOf(0, 1, 2, 3, 4))
