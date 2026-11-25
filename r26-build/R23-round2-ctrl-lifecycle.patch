@@ -1,0 +1,551 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,21 @@
+ 
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
++
++## [v0.1.10-test.1] - 2026-11-24
++
++> Experimental candidate; full Android CI and vehicle validation pending.
++> 实验候选版，完整 Android CI 与实车验证尚未完成。
++
++### English
++- Reject incomplete ctrl requests and obsolete invitation callbacks.
++- Scope invitation waiting and retries to the current connection.
++- Keep unverified authentication evidence distinct from actual verification.
++
++### 简体中文
++- 拒绝不完整的 ctrl 请求与过期邀请回调。
++- 将邀请等待和重连限制在当前会话。
++- 保持未验证认证证据与真实验证结果的区别。
+ 
+ ## [v0.1.9-test.1] - 2026-11-24
+ 
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.9"
++val appVersionName = "0.1.10"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+--- a/app/src/main/java/com/mcarplay/app/CtrlInviteEvidence.kt
++++ b/app/src/main/java/com/mcarplay/app/CtrlInviteEvidence.kt
+@@ -9,6 +9,7 @@
+     val localAddress: String?,
+     val network: N?,
+     val observation: ReceiverObservation? = null,
++    val inviteGeneration: Long? = null,
+ ) {
+     fun verifiedNetwork(
+         nowMillis: Long,
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -607,8 +607,7 @@
+     private var userStopGeneration = 0L
+ 
+     /** 最近一次 ctrl 邀请的原子快照；换目标/换网后旧邀请不能继续免除确认。 */
+-    @Volatile
+-    private var ctrlInviteEvidence: CtrlInviteEvidence<Network>? = null
++    private val ctrlInviteEvidence = AtomicReference<CtrlInviteEvidence<Network>?>(null)
+ 
+     private val activeReceiverObservations = ActiveReceiverObservations()
+ 
+@@ -886,7 +885,9 @@
+         ) {
+             return null
+         }
+-        return ctrlInviteEvidence?.verifiedNetwork(
++        val evidence = ctrlInviteEvidence.get() ?: return null
++        if (evidence.inviteGeneration != ctrlAdvertiser?.inviteGeneration) return null
++        return evidence.verifiedNetwork(
+             nowMillis = SystemClock.uptimeMillis(),
+             freshnessMillis = CTRL_INVITE_FRESH_MS,
+             currentTarget = selected ?: observation?.binding,
+@@ -1036,7 +1037,7 @@
+                         ConnectionDiagnostics.issueCurrent(DiagnosticCode.WIFI_LOST)
+                         boundCarSsid = null
+                         ctrlAdvertiser?.resetInviteCount()
+-                        ctrlInviteEvidence = null
++                        ctrlInviteEvidence.set(null)
+                         endpointBrowser?.resetCache()
+                         phaseHint = t(R.string.sc_hotspot_lost, ssid)
+                         uiHintSink?.invoke(t(R.string.sc_hotspot_lost_hint, ssid))
+@@ -1104,9 +1105,8 @@
+                 CarPlayCtrlAdvertiser(context, connectionIdentity = { bluetoothIdentityAtStart }) { line ->
+                     appendLog(line)
+                 }.also { advertiser ->
+-                    advertiser.onInvite = { localAddress ->
+-                        ConnectionDiagnostics.milestoneCurrent(ConnectionMilestone.CTRL_INVITED)
+-                        onCtrlInvite(localAddress)
++                    advertiser.onInvite = { localAddress, receivedAtMillis, generation ->
++                        onCtrlInvite(localAddress, receivedAtMillis, generation)
+                     }
+                 }
+             endpointBrowser =
+@@ -1360,7 +1360,7 @@
+             // 上一轮弹窗的答案不代表用户这一次的选择：新一轮从干净状态开始。
+             wifiPromptBroker.clear()
+             ctrlAdvertiser?.resetInviteCount()
+-            ctrlInviteEvidence = null
++            ctrlInviteEvidence.set(null)
+             pendingStartSessionEndpoint.set(null)
+             currentReceiverMatchesArrizo8 = false
+             inviteRetryCount = 0
+@@ -1455,6 +1455,8 @@
+         // “看到 disconnectCompletion=null” 后重新 begin 并清掉 connectCancelled。
+         handoffOwnership.blockNewHandoffs()
+         connectCancelled = true
++        ctrlAdvertiser?.resetInviteCount()
++        ctrlInviteEvidence.set(null)
+         bluetoothIdentityPreparation = null
+         bluetoothIdentityAtStart = null
+         // 先读本轮 attempt：retireSession 后时间线仍保留结果，但这里尽早固定标识
+@@ -2922,6 +2924,7 @@
+         ssid: String,
+         timeoutMillis: Long,
+         observation: ReceiverObservation?,
++        cancelled: () -> Boolean,
+     ): Boolean {
+         val advertiser = ctrlAdvertiser
+         val deadline = android.os.SystemClock.uptimeMillis() + timeoutMillis
+@@ -2929,14 +2932,14 @@
+         var lastLogAt = startedAt
+         var reannouncedAt = 0L
+         while (android.os.SystemClock.uptimeMillis() < deadline) {
+-            if (connectCancelled) return false
++            if (cancelled()) return false
+             val invites = advertiser?.inviteCount ?: 0
+             val now = android.os.SystemClock.uptimeMillis()
+             when (
+                 CtrlInviteGate.decide(
+                     nowMillis = now,
+                     waitStartedAtMillis = startedAt,
+-                    lastInviteAtMillis = if (receiverHasInvited(observation)) ctrlInviteEvidence?.receivedAtMillis ?: 0L else 0L,
++                    lastInviteAtMillis = if (receiverHasInvited(observation)) ctrlInviteEvidence.get()?.receivedAtMillis ?: 0L else 0L,
+                     mdnsEndpointFound = endpointBrowser?.awaitEndpoint(0) != null,
+                     advertisedAtMillis = advertiser?.advertisedAtMillis ?: 0L,
+                     reannouncedAtMillis = reannouncedAt,
+@@ -3969,17 +3972,31 @@
+      * - 推流阶段：已登记的车机（[ReceiverCompatibility.Policy.reconnectOnStreamingInvite]）
+      *   退役当前会话并按邀请重连，带 [StreamingInviteReconnect.DEBOUNCE_MS] 防抖。
+      */
+-    private fun onCtrlInvite(localAddress: String? = null) {
++    private fun onCtrlInvite(localAddress: String?, receivedAtMillis: Long, generation: Long) {
++        if (connectCancelled || generation != ctrlAdvertiser?.inviteGeneration) return
+         val local = localAddress?.substringBefore('%')?.takeIf { it.isNotBlank() }
+         val observation = activeReceiverObservations.single()
+-        ctrlInviteEvidence =
++        val evidence =
+             CtrlInviteEvidence(
+-                receivedAtMillis = SystemClock.uptimeMillis(),
++                receivedAtMillis = receivedAtMillis,
+                 target = currentTargetBinding() ?: observation?.binding,
+                 localAddress = local,
+                 network = local?.let { wifiConnector?.wifiNetworkWithLocalAddress(it) },
+                 observation = observation,
++                inviteGeneration = generation,
+             )
++        // Do not let a slower callback replace a later invitation from this or a newer epoch.
++        while (true) {
++            if (connectCancelled || generation != ctrlAdvertiser?.inviteGeneration) return
++            val previous = ctrlInviteEvidence.get()
++            if (previous != null && (previous.inviteGeneration ?: -1L) > generation) return
++            if (previous != null && previous.inviteGeneration == generation &&
++                previous.receivedAtMillis > receivedAtMillis
++            ) return
++            if (ctrlInviteEvidence.compareAndSet(previous, evidence)) break
++        }
++        if (generation != ctrlAdvertiser?.inviteGeneration || connectCancelled) return
++        ConnectionDiagnostics.milestoneCurrent(ConnectionMilestone.CTRL_INVITED)
+         val client = currentClient
+         if (client == null) {
+             val pending = pendingStartSessionEndpoint.get()
+@@ -3990,6 +4007,10 @@
+         }
+         val streaming = !connectCancelled && !sessionStarting.get() && videoSender?.isRunning == true
+         if (!streaming) return
++        if (!receiverHasInvited(client.currentEndpoint.observation)) {
++            appendLog("CTRL: 推流中邀请未通过本轮网络与会话校验——不触发重连")
++            return
++        }
+         val now = android.os.SystemClock.uptimeMillis()
+         val decision =
+             synchronized(inviteReconnectLock) {
+@@ -4054,20 +4075,23 @@
+             appendLog(">>> [$source] 已按车机邀请重连 $MAX_INVITE_RETRIES 次仍被拒——不再自动重试，请导出日志反馈")
+             return
+         }
++        val identity = bluetoothIdentityAtStart ?: return
+         val attempt = ++inviteRetryCount
+         val baseline = ctrlAdvertiser?.lastInviteAtMillis ?: 0L
++        fun currentAttempt(): Boolean = !connectCancelled && bluetoothIdentityAtStart === identity &&
++            ReceiverDetectionRuntime.isCurrent(endpoint.observation)
+         Bg.run("invite-retry") {
+             val deadline = android.os.SystemClock.uptimeMillis() + INVITE_RETRY_WAIT_MS
+-            while (!connectCancelled && android.os.SystemClock.uptimeMillis() < deadline) {
+-                val latest = ctrlAdvertiser?.lastInviteAtMillis ?: 0L
+-                if (latest > baseline && !sessionStarting.get()) {
++            while (currentAttempt() && android.os.SystemClock.uptimeMillis() < deadline) {
++                val latest = ctrlInviteEvidence.get()?.receivedAtMillis ?: 0L
++                if (latest > baseline && receiverHasInvited(endpoint.observation) && !sessionStarting.get()) {
+                     appendLog(">>> [$source] 收到车机新邀请——第 $attempt 次重连 AirPlay")
+                     onCarPlayEndpoint(endpoint, "$source/邀请重连")
+                     return@run
+                 }
+                 Thread.sleep(200)
+             }
+-            if (!connectCancelled) {
++            if (currentAttempt()) {
+                 appendLog(">>> [$source] ${INVITE_RETRY_WAIT_MS / 1000}s 内未收到车机新邀请——不再重试")
+             }
+         }
+@@ -4440,10 +4464,11 @@
+                         // 等 ctrl 邀请（catplay CarPlayCtrlServer：邀请=车机已发现手机且
+                         // AirPlay 窗口已开，收到即刻连接）。此前是「固定睡 1.6s 赌它已到」，
+                         // 快的时候白等、慢的时候不够；改为事件驱动。
+-                        ctrlReady = awaitCtrlInvite(endpoint.ssid, CTRL_INVITE_WAIT_MS, endpoint.observation)
++                        ctrlReady = awaitCtrlInvite(endpoint.ssid, CTRL_INVITE_WAIT_MS, endpoint.observation, ::handoffCancelled)
+                     }
+                     // 端点解析放在邀请之后：车机的 `_airplay._tcp` 常在受邀后才上线，
+                     // 且这一步最长 3s——必须在后台线程做，不能占住网络回调线程。
++                    if (handoffCancelled()) return@run
+                     var effectiveEndpoint = resolveEndpointHost(endpoint, source, allowGatewayFallback = !strictE2lb)
+                     if (strictE2lb && (!ctrlReady || effectiveEndpoint.airPlayPort <= 0 ||
+                             !EndpointHosts.hasUsable(effectiveEndpoint.ipAddresses))
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -355,7 +355,7 @@
+         //    ACK 挑战帧后**整段静默**（不回 ACK、不回应答，会话变僵尸）——本日多轮实测，
+         //    32B→20B 的会话全部卡死，20B→（记忆命中）的会话全部秒通。
+         //  - 测试台 DiPlay（Carlinkit AuthV3 EC 身份）：**只接受精确 32B**，长度不符直接断链。
+-        // 全部无应答也不中止——我们不校验签名（0xAA05 自报），由 0x5702 是否应答判定放行。
++        // 未收到应答或收到明确拒绝时中止；未验证的应答不等于认证或车机授权成功。
+         val pinnedLength = ReceiverCompatibility.resolve(receiverSignals).pinnedMfiChallengeLength
+         val mfiEvidence =
+             runMfiChallenge(
+@@ -478,7 +478,7 @@
+         val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
+         if (!legacyWifiExchange) {
+             log(
+-                "iap2 车机画像判 NEW（BMW iD9 形态）——跳过 0x5702，AP 信息由 0x4301 提供" +
++                "iap2 车机画像判 NEW（依据消息能力清单，非厂商身份）——跳过 0x5702，AP 信息由 0x4301 提供" +
+                     "（清单声明 收=${declaresReceiveWifi ?: "未知"} 发=${declaresSendWifi ?: "未知"}）",
+             )
+         } else if (declaresReceiveWifi == false || declaresSendWifi == false) {
+@@ -983,8 +983,7 @@
+      * 顺序**以按车机持久化的记忆为准**（[MfiLengthMemory]，基线只作冷启动与兜底）：
+      * 2026-10-19 奥迪 MMI 3315 实测 20B 静默 6 秒、32B 0.64 秒应答——只靠基线
+      * 「真车都 20B 优先」每次连接都白等 6 秒。记忆命中后直接把上次成功的长度排第一。
+-     * 全部无应答时不抛异常直接返回——我们跳过签名校验，由后续 0x5702 是否获得应答
+-     * 判定对端是否放行（真车实测无应答后 0xaa05 仍可推进）。
++     * 全部无应答时返回 TIMED_OUT，由状态机中止；不把未验证应答写入成功记忆。
+      */
+     private fun runMfiChallenge(
+         deadline: Long,
+--- a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
+@@ -61,6 +61,7 @@
+         private const val FORCE_COOLDOWN_MILLIS = 2_000L
+     }
+ 
++    @Volatile
+     private var serverSocket: ServerSocket? = null
+     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+ 
+@@ -78,9 +79,11 @@
+      * AirPlay 窗口」，收到后立即连 AirPlay，不做固定 sleep。主控据此替代
+      * 原先「交接端点后睡 1.6s」的时序猜测。
+      */
+-    @Volatile
+-    var inviteCount: Int = 0
+-        private set
++    private val inviteEpoch = CtrlInviteEpoch()
++
++    val inviteGeneration: Long get() = inviteEpoch.snapshot.generation
++
++    val inviteCount: Int get() = inviteEpoch.snapshot.count
+ 
+     /**
+      * 最近一次邀请的时刻（uptimeMillis；0 = 本轮尚无）。
+@@ -89,22 +92,17 @@
+      * 邀请后 7s/13s 连入成功，42s 前的旧邀请或邀请到达前抢先连入，初始 SETUP
+      * 一回就被关控制通道。只看计数无法区分新旧，故另记时刻。
+      */
+-    @Volatile
+-    var lastInviteAtMillis: Long = 0L
+-        private set
++    val lastInviteAtMillis: Long get() = inviteEpoch.snapshot.receivedAtMillis
+ 
+     /**
+      * 每次收到 ctrl 邀请时回调（诊断里程碑与推流中邀请重连用；在服务线程调用，回调方须自行转后台，不能阻塞）。
+      * 连接阶段的邀请仍由 [inviteCount] / [lastInviteAtMillis] 消费。
+      */
+     @Volatile
+-    var onInvite: ((localAddress: String?) -> Unit)? = null
++    var onInvite: ((localAddress: String?, receivedAtMillis: Long, generation: Long) -> Unit)? = null
+ 
+     /** 新一轮连接开始时清零（避免把上一轮的邀请当成本轮信号）。 */
+-    fun resetInviteCount() {
+-        inviteCount = 0
+-        lastInviteAtMillis = 0L
+-    }
++    fun resetInviteCount() = inviteEpoch.reset()
+ 
+     /** 注册时的 WiFi SSID：换网（2.4G→5G 或车机热点切换）后旧注册不可见，需重新注册。 */
+     private var registeredSsid: String? = null
+@@ -211,7 +209,7 @@
+                 serverSocket ?: ServerSocket(0).also { created ->
+                     serverSocket = created
+                     acceptRunning = true
+-                    Thread(::acceptLoop, "ctrl-accept").apply {
++                    Thread({ acceptLoop(created) }, "ctrl-accept").apply {
+                         isDaemon = true
+                         start()
+                     }
+@@ -250,25 +248,33 @@
+             )
+             true
+         } catch (error: Exception) {
++            registered = false
++            advertisedAtMillis = 0L
++            registeredWithMac = null
++            activeListener = null
+             log("$TAG: 启动失败 - ${error.message}")
+             false
+         }
+     }
+ 
+-    private fun acceptLoop() {
+-        val socket = serverSocket ?: return
+-        while (acceptRunning) {
++    private fun acceptLoop(socket: ServerSocket) {
++        while (acceptRunning && serverSocket === socket) {
+             val client =
+                 try {
+                     socket.accept()
+                 } catch (_: Exception) {
+                     break
+                 }
+-            Bg.run("ctrl-client") { handleClient(client) }
+-        }
+-    }
+-
+-    private fun handleClient(client: Socket) {
++            val generation = inviteGeneration
++            if (serverSocket !== socket || !acceptRunning) {
++                runCatching { client.close() }
++                break
++            }
++            Bg.run("ctrl-client") { handleClient(client, generation) }
++        }
++    }
++
++    private fun handleClient(client: Socket, generation: Long) {
+         val peer = client.inetAddress?.hostAddress ?: "?"
+         try {
+             client.soTimeout = 10_000
+@@ -294,7 +300,7 @@
+ 
+             // 车机 ctrl 邀请：这是「车机已发现手机、AirPlay 窗口已开」的权威信号
+             // （catplay CarPlayCtrlSession：收到即把邀请交给连接流程）。
+-            if (requestLine.split(' ').let { it.size == 3 && it[0] == "GET" && it[1].substringBefore('?') == "/ctrl-int/1/connect" && it[2].startsWith("HTTP/") }) {
++            if (CtrlRequest.isInvite(head)) {
+                 val receiverId =
+                     head
+                         .lineSequence()
+@@ -302,15 +308,19 @@
+                             it.substringBefore(':').trim().equals("AirPlay-Receiver-Device-ID", ignoreCase = true)
+                         }?.substringAfter(':')
+                         ?.trim()
+-                inviteCount++
+-                lastInviteAtMillis = android.os.SystemClock.uptimeMillis()
+-                log("$TAG: ✓ 收到 ctrl 邀请（第 $inviteCount 次，receiverIdPresent=${!receiverId.isNullOrBlank()}）——需继续验证 CarPlay 会话")
+-                runCatching { onInvite?.invoke(client.localAddress?.hostAddress) }
++                val stamp = inviteEpoch.record(generation, SystemClock.uptimeMillis())
++                if (stamp != null) {
++                    log("$TAG: ✓ 收到 ctrl 邀请（第 ${stamp.count} 次，receiverIdPresent=${!receiverId.isNullOrBlank()}）——需继续验证 CarPlay 会话")
++                    runCatching { onInvite?.invoke(client.localAddress?.hostAddress, stamp.receivedAtMillis, stamp.generation) }
++                } else {
++                    log("$TAG: 忽略过期连接代次的 ctrl 请求")
++                }
+             }
+ 
+             val output = client.getOutputStream()
+             val response =
+                 when {
++                    !CtrlRequest.isComplete(head) -> "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                     requestLine.startsWith("GET /ctrl-int/") -> {
+                         log("$TAG: ✓ 应答 ctrl-int 探测 200 OK")
+                         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+@@ -356,14 +366,15 @@
+         while (buffer.size() < MAX_HEAD_BYTES) {
+             val count =
+                 try {
+-                    input.read(chunk)
++                    input.read(chunk, 0, minOf(chunk.size, MAX_HEAD_BYTES - buffer.size()))
+                 } catch (_: IOException) {
+                     break
+                 }
+             if (count < 0) break
+             buffer.write(chunk, 0, count)
+             val text = buffer.toString("ISO-8859-1")
+-            if (text.contains("\r\n\r\n")) return text
++            val end = text.indexOf("\r\n\r\n")
++            if (end >= 0) return text.substring(0, end + 4)
+         }
+         return buffer.toString("ISO-8859-1")
+     }
+@@ -374,16 +385,18 @@
+         registered = false
+         advertisedAtMillis = 0L
+         registeredWithMac = null
+-        activeListener?.let { runCatching { nsdManager.unregisterService(it) } }
++        val previousListener = activeListener
+         activeListener = null
++        previousListener?.let { runCatching { nsdManager.unregisterService(it) } }
+     }
+ 
+     @Synchronized
+     fun stop() {
++        acceptRunning = false
++        resetInviteCount()
+         unregisterServiceOnly()
+         registeredSsid = null
+         registeredNetwork = null
+-        acceptRunning = false
+         runCatching { serverSocket?.close() }
+         serverSocket = null
+         log("$TAG: 已停止")
+--- a/app/src/main/java/com/mcarplay/app/net/CtrlInviteGate.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CtrlInviteGate.kt
+@@ -59,5 +59,5 @@
+     fun isFresh(
+         lastInviteAtMillis: Long,
+         referenceMillis: Long,
+-    ): Boolean = lastInviteAtMillis > 0L && lastInviteAtMillis >= referenceMillis - FRESH_INVITE_MS
++    ): Boolean = lastInviteAtMillis > 0L && referenceMillis - lastInviteAtMillis in 0..FRESH_INVITE_MS
+ }
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/net/CtrlRequest.kt
+@@ -0,0 +1,37 @@
++package com.mcarplay.app.net
++
++/** A complete bounded HTTP request, not proof of receiver identity. */
++internal object CtrlRequest {
++    fun isComplete(head: String): Boolean = head.endsWith("\r\n\r\n")
++
++    fun isInvite(head: String): Boolean {
++        if (!isComplete(head)) return false
++        val parts = head.substringBefore("\r\n").split(' ')
++        return parts.size == 3 && parts[0] == "GET" &&
++            parts[1].substringBefore('?') == "/ctrl-int/1/connect" &&
++            parts[2] in setOf("HTTP/1.0", "HTTP/1.1")
++    }
++}
++
++/** Atomic invitation observations; reset invalidates clients accepted in older epochs. */
++internal class CtrlInviteEpoch {
++    data class Snapshot(val generation: Long, val count: Int, val receivedAtMillis: Long)
++
++    @Volatile
++    var snapshot = Snapshot(0L, 0, 0L)
++        private set
++
++    @Synchronized
++    fun reset() {
++        snapshot = Snapshot(snapshot.generation + 1L, 0, 0L)
++    }
++
++    @Synchronized
++    fun record(generation: Long, receivedAtMillis: Long): Snapshot? {
++        val current = snapshot
++        if (generation != current.generation || receivedAtMillis <= 0L ||
++            receivedAtMillis < current.receivedAtMillis
++        ) return null
++        return current.copy(count = current.count + 1, receivedAtMillis = receivedAtMillis).also { snapshot = it }
++    }
++}
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/net/CtrlRequestTest.kt
+@@ -0,0 +1,43 @@
++package com.mcarplay.app.net
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class CtrlRequestTest {
++    @Test
++    fun incompleteHeaderCannotBecomeInvite() {
++        assertFalse(CtrlRequest.isInvite("GET /ctrl-int/1/connect HTTP/1.1\r\n"))
++        assertFalse(CtrlRequest.isInvite("GET /ctrl-int/1/connect HTTP/1.1\r\nHost: peer"))
++    }
++
++    @Test
++    fun exactRouteAndSupportedHttpVersion() {
++        assertTrue(CtrlRequest.isInvite("GET /ctrl-int/1/connect HTTP/1.1\r\nHost: peer\r\n\r\n"))
++        assertTrue(CtrlRequest.isInvite("GET /ctrl-int/1/connect?q=1 HTTP/1.0\r\n\r\n"))
++        assertFalse(CtrlRequest.isInvite("GET /ctrl-int/1/connect-extra HTTP/1.1\r\n\r\n"))
++        assertFalse(CtrlRequest.isInvite("GET /ctrl-int/1/connect HTTP/fake\r\n\r\n"))
++    }
++
++    @Test
++    fun resetRejectsOldWorkerAndKeepsAtomicSnapshot() {
++        val epoch = CtrlInviteEpoch()
++        val old = epoch.snapshot.generation
++        assertEquals(1, epoch.record(old, 100L)?.count)
++        epoch.reset()
++        assertEquals(null, epoch.record(old, 200L))
++        val current = epoch.snapshot.generation
++        assertEquals(0, epoch.snapshot.count)
++        assertEquals(1, epoch.record(current, 300L)?.count)
++        assertEquals(null, epoch.record(current, 299L))
++        assertEquals(300L, epoch.snapshot.receivedAtMillis)
++    }
++
++    @Test
++    fun futureAndExpiredInvitesAreNotFresh() {
++        assertFalse(CtrlInviteGate.isFresh(1001L, 1000L))
++        assertFalse(CtrlInviteGate.isFresh(1000L, 21001L))
++        assertTrue(CtrlInviteGate.isFresh(1000L, 21000L))
++    }
++}
+--- a/build-r23-signed.ps1
++++ b/build-r23-signed.ps1
+@@ -1,7 +1,7 @@
+ # R23 local release build. Requires Android SDK, JDK, and keystore.properties.
+-# Never sends a key or password to the network. The default refuses a non-R22 signer.
++# Never sends a key or password to the network. Requires the R23 long-term signer.
+ param(
+-    [string]$ExpectedCertSha256 = 'd6f09de0feb31413bef7c266cc8795b4c341a937f7e31d6c42d2f00594b330fd'
++    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
+ )
+ $ErrorActionPreference = 'Stop'
+ Set-Location $PSScriptRoot
+@@ -13,7 +13,7 @@
+ $signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
+ $aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
+ if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
+-& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true :app:assembleStandardRelease
++& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.10-test.1 :app:assembleStandardRelease
+ if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
+ $apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
+ if (!(Test-Path $apk)) { throw 'Release APK missing.' }
+@@ -23,9 +23,9 @@
+ $cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
+ if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
+ $meta = & $aapt dump badging $apk
+-if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1090000'")) { throw 'Unexpected package name or versionCode.' }
++if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1100000'")) { throw 'Unexpected package name or versionCode.' }
+ New-Item -ItemType Directory -Force dist | Out-Null
+-$out = 'dist\mcarplay-R23-signed.apk'
++$out = 'dist\mcarplay-0.1.10.apk'
+ Copy-Item $apk $out -Force
+ Get-FileHash $out -Algorithm SHA256
+ Write-Output 'Signed APK verified against expected certificate and package/version.'
