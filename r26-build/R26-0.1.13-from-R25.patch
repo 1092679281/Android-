@@ -1,0 +1,1173 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 65ae558..46a9cbc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,21 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.13-test.1] - 2026-11-25
++
++> Lifecycle hardening; experimental E2LB connection remains unverified.
++> 连接生命周期加固；E2LB 实车仍未验证。
++
++### English
++- Reject stale Wi-Fi prompt claims and late UI deliveries; use monotonic wait budgets.
++- Bind pending endpoint observation to the originating connection and live control link.
++- Stop interrupted bootstrap waits without training authentication parameters on cancellation.
++
++### 简体中文
++- 拒绝过期 Wi-Fi 弹窗请求和迟到的 UI 投递，采用单调时钟等待预算。
++- 空端点观察绑定原连接与存活的控制链路。
++- 中断启动等待时及时退出，不将取消写成认证参数试探失败。
++
+ ## [v0.1.12-test.1] - 2026-11-25
+ 
+ > Experimental receiver-specific transport hardening; no confirmed E2LB connection fix.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index a25ea0d..61c5cdb 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.12"
++val appVersionName = "0.1.13"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/SessionController.kt b/app/src/main/java/com/mcarplay/app/SessionController.kt
+index 302a182..9393308 100644
+--- a/app/src/main/java/com/mcarplay/app/SessionController.kt
++++ b/app/src/main/java/com/mcarplay/app/SessionController.kt
+@@ -736,8 +736,7 @@ object SessionController {
+     @Synchronized
+     fun cancelConnecting(context: Context) {
+         appendLog("SESSION: 用户取消连接——正在停止蓝牙/WiFi 链路")
+-        // 用户已明确中止：上一轮弹窗的答案不能留给下一次连接复用。
+-        wifiPromptBroker.clear()
++        // disconnect 会使上一轮弹窗作废并关闭交接入口。
+         // disconnect 第一步 blockNewHandoffs() 即强制释放互斥：配对流程线程可能阻塞在
+         // 不可中断的连接/mDNS 等待上（如手机不在热点网段时连热点 IP），finally 遥遥无期——
+         // 用户显式取消即解锁，否则英雄卡永久「正在连接」（旧流程产出已被 retireSession 清理，无冲突）
+@@ -1455,6 +1454,7 @@ object SessionController {
+         // “看到 disconnectCompletion=null” 后重新 begin 并清掉 connectCancelled。
+         handoffOwnership.blockNewHandoffs()
+         connectCancelled = true
++        wifiPromptBroker.clear()
+         ctrlAdvertiser?.resetInviteCount()
+         ctrlInviteEvidence.set(null)
+         bluetoothIdentityPreparation = null
+@@ -1895,6 +1895,9 @@ object SessionController {
+      * 因此这里必须：绑车机 WiFi → 广播 ctrl；晚于 0x4300 则双方互等死锁（Audi 实测）。
+      */
+     fun onWifiCredentials(wifi: Iap2SenderSession.WifiConfiguration) {
++        val identity = bluetoothIdentityAtStart ?: return
++        fun cancelled(): Boolean = connectCancelled || bluetoothIdentityAtStart !== identity || !isActiveObservation(wifi.observation)
++        if (cancelled()) return
+         // 会话推流中收到的 0x5703 是冗余凭据（DiPlay 控制器周期重连会重发一轮
+         // Phase 1，2026-10-15 实测「连上后自动断开」循环的推手之一）：此时再走绑定
+         // 流程会 release+重绑进程网络（扰动正在推流的 socket）、force 重注册 ctrl
+@@ -1924,7 +1927,7 @@ object SessionController {
+         // 绑定与切换统一走自动加入流程：bindCurrentWifi 是「任意 WiFi 即成功」的盲绑，
+         // 手机连着公司 WiFi 时会误判已在车机热点（ctrl 广播落在错误网络 → 双方互等死锁），
+         // 必须先核对真实 SSID 再决定绑定或切换
+-        autoJoinCarWifi(wifi)
++        autoJoinCarWifi(wifi, ::cancelled)
+     }
+ 
+     /**
+@@ -1939,21 +1942,25 @@ object SessionController {
+      * （`WifiNetworkSpecifier`，首次加入会弹一次系统确认框）。
+      * 全失败时回退「系统 WLAN 手动加入」指引（密码可经「去连接」复制）。
+      */
+-    private fun autoJoinCarWifi(wifi: Iap2SenderSession.WifiConfiguration) {
++    private fun autoJoinCarWifi(
++        wifi: Iap2SenderSession.WifiConfiguration,
++        isCancelled: () -> Boolean,
++    ) {
+         Bg.run("wifi-auto-join") {
++            if (isCancelled()) return@run
+             val shellReady =
+                 appContext?.let { ShizukuGate.state(it) == ShizukuGate.State.READY } == true
+             // 1) 首选静默路径：Shizuku 命令行连网（0 弹窗）
+             if (shellReady) {
+-                if (joinCarWifiSilently(wifi) is WifiCarPlayConnector.JoinResult.Joined) return@run
+-                if (connectCancelled) return@run
++                if (joinCarWifiSilently(wifi, isCancelled) is WifiCarPlayConnector.JoinResult.Joined) return@run
++                if (isCancelled()) return@run
+                 // 热点已连上、只是 Network 通道没绑成：绝不能退回 specifier——那会重新
+                 // 关联热点并弹系统确认框（用户看到「连上了又弹窗」）。
+                 // 有核验句柄就只绑它；拿不到句柄时转用户确认，绝不发起通配绑定。
+                 if (liveWifiSsid() == wifi.ssid) {
+                     var bound = false
+-                    bindVerifiedCarWifi(wifi.ssid, "静默入网") { bound = it }
+-                    if (bound) return@run
++                    bindVerifiedCarWifi(wifi.ssid, "静默入网", isCancelled) { bound = it }
++                    if (bound || isCancelled()) return@run
+                     phaseHint = t(R.string.sc_bind_failed)
+                     appendLog(
+                         "WIFI: 已连在 \"${wifi.ssid}\" 但未能绑定唯一的 Network 句柄——本轮中止" +
+@@ -1963,17 +1970,19 @@ object SessionController {
+                 }
+             }
+             // 2) 回退：应用专属网络（不影响 4G/5G、不会保存为系统网络）
+-            if (shellReady && shellWifiDisabled() && !waitForWifiEnabled()) return@run
+-            if (connectCancelled) return@run
+-            when (val result = joinCarWifiSpecifier(wifi)) {
++            if (shellReady && shellWifiDisabled() && !waitForWifiEnabled(isCancelled)) return@run
++            if (isCancelled()) return@run
++            val result = joinCarWifiSpecifier(wifi, isCancelled)
++            if (isCancelled()) return@run
++            when (result) {
+                 is WifiCarPlayConnector.JoinResult.Joined -> Unit
+ 
+                 WifiCarPlayConnector.JoinResult.Unsupported -> {
+                     appendLog("WIFI: 热点安全类型 ${wifi.securityType} 无法用应用专属网络表达——退回系统级加入")
+-                    legacyJoinCarWifi(wifi, shellReady)
++                    legacyJoinCarWifi(wifi, shellReady, isCancelled)
+                 }
+ 
+-                WifiCarPlayConnector.JoinResult.Unavailable -> promptSpecifierFailed(wifi, shellReady)
++                WifiCarPlayConnector.JoinResult.Unavailable -> promptSpecifierFailed(wifi, shellReady, isCancelled)
+             }
+         }
+     }
+@@ -1985,19 +1994,21 @@ object SessionController {
+     private fun joinCarWifi(
+         wifi: Iap2SenderSession.WifiConfiguration,
+         shellReady: Boolean,
++        isCancelled: () -> Boolean,
+     ): WifiCarPlayConnector.JoinResult {
+-        if (!shellReady) return joinCarWifiSpecifier(wifi)
+-        val silent = joinCarWifiSilently(wifi)
++        if (isCancelled()) return WifiCarPlayConnector.JoinResult.Unavailable
++        if (!shellReady) return joinCarWifiSpecifier(wifi, isCancelled)
++        val silent = joinCarWifiSilently(wifi, isCancelled)
+         if (silent is WifiCarPlayConnector.JoinResult.Joined) return silent
+         // 热点已连上但通道没绑成：不再走会弹窗的 specifier（见 autoJoinCarWifi 同款判断）；
+         // 只接受核验过的 Network 句柄，拿不到时请用户确认当前网络。
+-        if (!connectCancelled && liveWifiSsid() == wifi.ssid) {
++        if (!isCancelled() && liveWifiSsid() == wifi.ssid) {
+             var bound = false
+-            bindVerifiedCarWifi(wifi.ssid, "静默入网") { bound = it }
++            bindVerifiedCarWifi(wifi.ssid, "静默入网", isCancelled) { bound = it }
+             val boundNetwork = wifiConnector?.currentNetwork
+             return if (bound && boundNetwork != null) WifiCarPlayConnector.JoinResult.Joined(boundNetwork) else silent
+         }
+-        return joinCarWifiSpecifier(wifi)
++        return joinCarWifiSpecifier(wifi, isCancelled)
+     }
+ 
+     /**
+@@ -2019,23 +2030,29 @@ object SessionController {
+      *  - 绑定只作用于**本进程的 socket**：虚拟屏里的导航/音乐是独立进程，不受影响
+      *    （`bindProcessToNetwork` 不是全局/系统级操作）。
+      */
+-    private fun joinCarWifiSilently(wifi: Iap2SenderSession.WifiConfiguration): WifiCarPlayConnector.JoinResult {
++    private fun joinCarWifiSilently(
++        wifi: Iap2SenderSession.WifiConfiguration,
++        isCancelled: () -> Boolean,
++    ): WifiCarPlayConnector.JoinResult {
+         // 与 specifier 兜底路径共用同一把锁：两条路径都会 release + 重绑进程网络。
+         // 持锁实现见 [joinCarWifiSilentlyLocked]。
+-        return synchronized(wifiBindLock) { joinCarWifiSilentlyLocked(wifi) }
++        return synchronized(wifiBindLock) { joinCarWifiSilentlyLocked(wifi, isCancelled) }
+     }
+ 
+     /** [joinCarWifiSilently] 的持锁实现（调用方必须持有 [wifiBindLock]）。 */
+-    private fun joinCarWifiSilentlyLocked(wifi: Iap2SenderSession.WifiConfiguration): WifiCarPlayConnector.JoinResult {
++    private fun joinCarWifiSilentlyLocked(
++        wifi: Iap2SenderSession.WifiConfiguration,
++        isCancelled: () -> Boolean,
++    ): WifiCarPlayConnector.JoinResult {
+         val connector = wifiConnector ?: return WifiCarPlayConnector.JoinResult.Unavailable
+-        if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
++        if (isCancelled()) return WifiCarPlayConnector.JoinResult.Unavailable
+         val existing = connector.currentNetwork
+         if (boundCarSsid == wifi.ssid && existing != null) {
+             appendLog("WIFI: 车机热点已就绪且网络通道已绑定——跳过重复加入")
+             return WifiCarPlayConnector.JoinResult.Joined(existing)
+         }
+-        if (!ensureWifiEnabledSilently()) return WifiCarPlayConnector.JoinResult.Unavailable
+-        if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
++        if (!ensureWifiEnabledSilently(isCancelled)) return WifiCarPlayConnector.JoinResult.Unavailable
++        if (isCancelled()) return WifiCarPlayConnector.JoinResult.Unavailable
+         val current = liveWifiSsid()
+         if (current == wifi.ssid) {
+             appendLog("WIFI: 手机已连在车机热点 \"${wifi.ssid}\"——直接建立网络通道并绑定")
+@@ -2058,11 +2075,11 @@ object SessionController {
+                 )
+                 return WifiCarPlayConnector.JoinResult.Unavailable
+             }
+-            if (!waitForCarSsid(wifi.ssid, CAR_WIFI_JOIN_WAIT_MS)) {
++            if (!waitForCarSsid(wifi.ssid, CAR_WIFI_JOIN_WAIT_MS, isCancelled)) {
+                 return WifiCarPlayConnector.JoinResult.Unavailable
+             }
+         }
+-        if (connectCancelled) return WifiCarPlayConnector.JoinResult.Unavailable
++        if (isCancelled()) return WifiCarPlayConnector.JoinResult.Unavailable
+         // SSID 已核对，但必须拿到同一张 Wi-Fi 的 Network 句柄再绑：通配 requestNetwork
+         // 在两张 Wi-Fi 并存时可能先返回另一张（句柄交给用户确认路径去取）。
+         val verified = verifiedWifiNetworkFor(wifi.ssid)
+@@ -2070,7 +2087,7 @@ object SessionController {
+             appendLog("WIFI: 已连在车机热点但拿不到核验过的 Network 句柄——转用户确认，不发起通配绑定")
+             return WifiCarPlayConnector.JoinResult.Unavailable
+         }
+-        val bound = bindCarWifiAndRegister(wifi.ssid, verified)
++        val bound = bindCarWifiAndRegister(wifi.ssid, verified, isCancelled)
+         val network = connector.currentNetwork
+         return if (bound && network != null) {
+             WifiCarPlayConnector.JoinResult.Joined(network)
+@@ -2100,7 +2117,8 @@ object SessionController {
+     }
+ 
+     /** WLAN 关着时经 Shizuku 直接打开（`cmd wifi set-wifi-enabled`），返回是否已开启。 */
+-    private fun ensureWifiEnabledSilently(): Boolean {
++    private fun ensureWifiEnabledSilently(isCancelled: () -> Boolean): Boolean {
++        if (isCancelled()) return false
+         if (!shellWifiDisabled()) return true
+         appendLog("WIFI: WLAN 未开启——经 Shizuku 打开（cmd wifi set-wifi-enabled enabled，免手动）")
+         val result = Shell.exec("cmd wifi set-wifi-enabled enabled", 8_000L)
+@@ -2109,7 +2127,7 @@ object SessionController {
+             return false
+         }
+         val deadline = android.os.SystemClock.uptimeMillis() + WIFI_ENABLE_WAIT_MS
+-        while (android.os.SystemClock.uptimeMillis() < deadline && !connectCancelled) {
++        while (android.os.SystemClock.uptimeMillis() < deadline && !isCancelled()) {
+             if (!shellWifiDisabled()) return true
+             Thread.sleep(500)
+         }
+@@ -2117,19 +2135,20 @@ object SessionController {
+             appendLog("WIFI: 等待 WLAN 开启超时（${WIFI_ENABLE_WAIT_MS / 1000}s）")
+             return false
+         }
+-        return true
++        return !isCancelled()
+     }
+ 
+     /** 轮询 `cmd wifi status` 直到关联到 [ssid]（可取消）。 */
+     private fun waitForCarSsid(
+         ssid: String,
+         timeoutMs: Long,
++        isCancelled: () -> Boolean,
+     ): Boolean {
+         val deadline = android.os.SystemClock.uptimeMillis() + timeoutMs
+         var lastLogAt = 0L
+         var current: String? = null
+         while (android.os.SystemClock.uptimeMillis() < deadline) {
+-            if (connectCancelled) return false
++            if (isCancelled()) return false
+             current = liveWifiSsid()
+             if (current == ssid) {
+                 appendLog("WIFI: 已切到车机热点 \"$ssid\"")
+@@ -2155,17 +2174,21 @@ object SessionController {
+      * 也因此不再询问「清除系统里保存的同名热点」——静默路径本来就会把热点存进
+      * 系统配置（这是设计，不是旧版本残留）。
+      */
+-    private fun joinCarWifiSpecifier(wifi: Iap2SenderSession.WifiConfiguration): WifiCarPlayConnector.JoinResult {
+-        val connector = wifiConnector ?: return WifiCarPlayConnector.JoinResult.Unavailable
++    private fun joinCarWifiSpecifier(
++        wifi: Iap2SenderSession.WifiConfiguration,
++        isCancelled: () -> Boolean,
++    ): WifiCarPlayConnector.JoinResult = synchronized(wifiBindLock) {
++        if (isCancelled()) return@synchronized WifiCarPlayConnector.JoinResult.Unavailable
++        val connector = wifiConnector ?: return@synchronized WifiCarPlayConnector.JoinResult.Unavailable
+         if (liveWifiMatches(wifi.ssid) == true) {
+             appendLog("WIFI: 系统已连接同一局域网 \"${wifi.ssid}\"——直接绑定现有 Wi-Fi，跳过加入请求")
+-            val existing = bindExistingCarWifi(connector, wifi.ssid)
+-            if (existing != null) {
++            val existing = bindExistingCarWifi(connector, wifi.ssid, isCancelled = isCancelled)
++            if (existing != null && !isCancelled()) {
+                 boundCarSsid = wifi.ssid
+                 phaseHint = t(R.string.sc_bound_existing)
+                 ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = existing)
+                 appendLog(">>> 现有 Wi-Fi 已绑定，ctrl 广播已重新注册，等待车机邀请")
+-                return WifiCarPlayConnector.JoinResult.Joined(existing)
++                return@synchronized WifiCarPlayConnector.JoinResult.Joined(existing)
+             }
+             appendLog("WIFI: 检测到同一局域网，但现有 Wi-Fi 网络通道绑定失败——继续尝试专用网络")
+         }
+@@ -2173,34 +2196,32 @@ object SessionController {
+         appendLog(
+             ">>> 以应用专属网络加入 \"${wifi.ssid}\"（不保存为系统 WiFi，其它应用继续走 4G/5G）",
+         )
++        if (isCancelled()) return@synchronized WifiCarPlayConnector.JoinResult.Unavailable
++        val alreadyBound = connector.currentNetwork
++        if (boundCarSsid == wifi.ssid && alreadyBound != null) {
++            return@synchronized WifiCarPlayConnector.JoinResult.Joined(alreadyBound)
++        }
+         val result =
+-            synchronized(wifiBindLock) {
+-                val existing = connector.currentNetwork
+-                if (boundCarSsid == wifi.ssid && existing != null) {
+-                    appendLog("WIFI: 应用专属网络已在位——跳过重复加入")
+-                    WifiCarPlayConnector.JoinResult.Joined(existing)
+-                } else {
+-                    connector.joinCarPlayNetwork(
+-                        ssid = wifi.ssid,
+-                        passphrase = wifi.passphrase,
+-                        securityType = wifi.securityType,
+-                        timeoutMillis = SPECIFIER_JOIN_TIMEOUT_MS,
+-                        isCancelled = { connectCancelled },
+-                        quickFallback = { specifierQuickFallback(wifi) },
+-                        deepFallback = { specifierDeepFallback(wifi) },
+-                        userChoicePending = { requestedAt ->
+-                            WifiCarPlayConnector.isUserChoicePending(uiPausedAtMs, uiStopped, requestedAt)
+-                        },
+-                    )
+-                }
+-            }
++            connector.joinCarPlayNetwork(
++                ssid = wifi.ssid,
++                passphrase = wifi.passphrase,
++                securityType = wifi.securityType,
++                timeoutMillis = SPECIFIER_JOIN_TIMEOUT_MS,
++                isCancelled = isCancelled,
++                quickFallback = { specifierQuickFallback(wifi, isCancelled) },
++                deepFallback = { specifierDeepFallback(wifi, isCancelled) },
++                userChoicePending = { requestedAt ->
++                    WifiCarPlayConnector.isUserChoicePending(uiPausedAtMs, uiStopped, requestedAt)
++                },
++            )
++        if (isCancelled()) return@synchronized WifiCarPlayConnector.JoinResult.Unavailable
+         if (result is WifiCarPlayConnector.JoinResult.Joined) {
+             boundCarSsid = wifi.ssid
+             phaseHint = t(R.string.sc_joined)
+             // 关键时机：bindProcessToNetwork 完成后再注册，车机才能看到 ctrl 广播
+             ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
+             appendLog(">>> WiFi 已加入车机热点（应用专属网络），ctrl 广播已重新注册，等待车机 ctrl 邀请")
+-        } else if (!connectCancelled) {
++        } else if (!isCancelled()) {
+             appendLog("WIFI: 应用专属网络加入未成功（${result.javaClass.simpleName}）")
+             // 兜底：系统里保存过该热点时，系统可能已自动全局连上它——specifier 挂起
+             // 的形态下这条近路反而最稳（2026-10-22 真机：用户选「保留系统网络」+
+@@ -2208,18 +2229,18 @@ object SessionController {
+             val currentSsid = liveWifiSsid()
+             if (currentSsid == wifi.ssid) {
+                 appendLog("WIFI: 系统当前已连着 \"$currentSsid\"——直接绑定现有连接（保存网络自动连上的近路）")
+-                // bindCurrentWifi 异步回调：短等绑定完成（回调很快，系统已在网）
+-                if (bindExistingCarWifi(connector, wifi.ssid) != null) {
++                val existing = bindExistingCarWifi(connector, wifi.ssid, isCancelled = isCancelled)
++                if (existing != null && !isCancelled()) {
+                     boundCarSsid = wifi.ssid
+                     phaseHint = t(R.string.sc_joined)
+                     ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = connector.currentNetwork)
+                     appendLog(">>> WiFi 已绑定现有 \"$currentSsid\" 连接，ctrl 广播已重新注册")
+-                    return WifiCarPlayConnector.JoinResult.Joined(connector.currentNetwork!!)
++                    return@synchronized WifiCarPlayConnector.JoinResult.Joined(existing)
+                 }
+                 appendLog("WIFI: 绑定现有连接未成功——按失败处理")
+             }
+         }
+-        return result
++        result
+     }
+ 
+     /**
+@@ -2240,13 +2261,17 @@ object SessionController {
+      *
+      * @return 已绑定并可直接使用的网络；null = 未命中（调用方继续重发 specifier）。
+      */
+-    private fun specifierQuickFallback(wifi: Iap2SenderSession.WifiConfiguration): Network? {
++    private fun specifierQuickFallback(
++        wifi: Iap2SenderSession.WifiConfiguration,
++        isCancelled: () -> Boolean,
++    ): Network? {
++        if (isCancelled()) return null
+         if (!shellWifiReady()) return null
+         val connector = wifiConnector ?: return null
+         val current = liveWifiSsid()
+         if (current != wifi.ssid) return null
+         appendLog("WIFI: 系统已连着 \"$current\"——直接绑定（快速兜底）")
+-        val network = bindExistingCarWifi(connector, wifi.ssid)
++        val network = bindExistingCarWifi(connector, wifi.ssid, isCancelled = isCancelled)
+         if (network != null) boundCarSsid = wifi.ssid
+         return network
+     }
+@@ -2267,7 +2292,11 @@ object SessionController {
+      * ——connect-network 只是幂等复连，**不登记**清理，否则会话末会把用户决定保留
+      * 的网络删掉（违背「绝不擅自删除」）。
+      */
+-    private fun specifierDeepFallback(wifi: Iap2SenderSession.WifiConfiguration): Network? {
++    private fun specifierDeepFallback(
++        wifi: Iap2SenderSession.WifiConfiguration,
++        isCancelled: () -> Boolean,
++    ): Network? {
++        if (isCancelled()) return null
+         if (!shellWifiReady()) return null
+         val connector = wifiConnector ?: return null
+         appendLog(
+@@ -2290,10 +2319,10 @@ object SessionController {
+         }
+         // 轮询切网完成（断旧网/关联/DHCP，实测 2-10s）
+         repeat(30) {
+-            if (connectCancelled) return null
++            if (isCancelled()) return null
+             Thread.sleep(300)
+             if (liveWifiSsid() == wifi.ssid) {
+-                val network = bindExistingCarWifi(connector, wifi.ssid)
++                val network = bindExistingCarWifi(connector, wifi.ssid, isCancelled = isCancelled)
+                 if (network != null) {
+                     boundCarSsid = wifi.ssid
+                     appendLog("WIFI: connect-network 已连上 \"${wifi.ssid}\"")
+@@ -2309,27 +2338,21 @@ object SessionController {
+     private fun bindExistingCarWifi(
+         connector: WifiCarPlayConnector,
+         ssid: String,
+-        verifySsid: Boolean = true,
++        isCancelled: () -> Boolean,
+     ): Network? {
+-        val verifiedNetwork = if (verifySsid) verifiedWifiNetworkFor(ssid) else connector.currentWifiNetwork()
++        if (isCancelled()) return null
++        val verifiedNetwork = verifiedWifiNetworkFor(ssid)
+         if (verifiedNetwork != null) {
+-            return if (connector.bindVerifiedNetwork(verifiedNetwork, ssid)) verifiedNetwork else null
+-        }
+-        // 用户确认的是当前网络；拿不到当前句柄时不能请求并绑定任意 Wi-Fi。
+-        if (!verifySsid) return null
+-        var boundOk = false
+-        // ssidHint：绑定断开（熄火）时经 onNetworkLost 通知会话层——兜底入网是主路径，
+-        // 不通知的话英雄卡停在「已连接」、会话拖到心跳超时才死
+-        connector.bindCurrentWifi(ssid, expectedSsid = ssid.takeIf { verifySsid }) { boundOk = it }
+-        val waitUntil = SystemClock.uptimeMillis() + 3_000
+-        while (!boundOk &&
+-            connector.currentNetwork == null &&
+-            SystemClock.uptimeMillis() < waitUntil &&
+-            !connectCancelled
+-        ) {
+-            Thread.sleep(100)
++            return if (wifiHandoffGuard.bind(
++                    isCancelled = isCancelled,
++                    connect = { connector.bindVerifiedNetwork(verifiedNetwork, ssid) },
++                    release = { connector.release() },
++                    onBound = {},
++                )
++            ) verifiedNetwork else null
+         }
+-        return connector.currentNetwork
++        // 无唯一已核验句柄：由上层继续专用入网或请求用户确认。
++        return null
+     }
+ 
+     /** 会话终态清理 shell 兜底存的系统网络（[disconnect] 与推流 onEnded 共用）。 */
+@@ -2480,7 +2503,9 @@ object SessionController {
+         if (isCancelled()) return
+         when (choice) {
+             true -> {
+-                when (val retry = joinCarWifi(wifi, shellReady)) {
++                val retry = joinCarWifi(wifi, shellReady, isCancelled)
++                if (isCancelled()) return
++                when (retry) {
+                     is WifiCarPlayConnector.JoinResult.Joined -> Unit
+                     WifiCarPlayConnector.JoinResult.Unsupported -> legacyJoinCarWifi(wifi, shellReady, isCancelled)
+                     WifiCarPlayConnector.JoinResult.Unavailable -> {
+@@ -2504,6 +2529,7 @@ object SessionController {
+         wifi: Iap2SenderSession.WifiConfiguration,
+         isCancelled: () -> Boolean = { connectCancelled },
+     ) {
++        if (isCancelled()) return
+         val connector = wifiConnector
+         if (connector != null && connector.hasExistingWifi() && connector.currentWifiSsid() == null) {
+             val shown = currentNetworkToken()
+@@ -2527,19 +2553,20 @@ object SessionController {
+                     return
+                 }
+                 // The user explicitly confirmed Same-LAN; do not require location access to read the SSID.
+-                val network =
+-                    synchronized(wifiBindLock) {
+-                        bindExistingCarWifi(connector, wifi.ssid, verifySsid = false)
+-                    }
+-                if (network != null) {
+-                    boundCarSsid = wifi.ssid
++                val network = shown.network
++                if (network != null && bindCarWifiAndRegister(
++                        wifi.ssid,
++                        network,
++                        isCancelled = { isCancelled() || connector.currentWifiNetwork() != network },
++                    )
++                ) {
+                     phaseHint = t(R.string.sc_bound_current)
+-                    ctrlAdvertiser?.ensureForNetwork(wifi.ssid, force = true, network = network)
+-                    appendLog("WIFI: 用户确认同一局域网，已绑定当前 Wi-Fi（$network）")
++                    appendLog("WIFI: 用户确认同一局域网，已绑定其确认的 Wi-Fi（$network）")
+                     return
+                 }
+             }
+         }
++        if (isCancelled()) return
+         copyHotspotPsk(wifi.passphrase)
+         openWlanSettings()
+         phaseHint = t(R.string.sc_connect_in_settings, wifi.ssid)
+@@ -2574,6 +2601,7 @@ object SessionController {
+         shellReady: Boolean,
+         isCancelled: () -> Boolean = { connectCancelled },
+     ) {
++        if (isCancelled()) return
+         if (!shellReady) {
+             phaseHint = t(R.string.sc_not_on_hotspot, wifi.ssid)
+             appendLog(
+@@ -2583,6 +2611,7 @@ object SessionController {
+             return
+         }
+         val current = liveWifiSsid()
++        if (isCancelled()) return
+         if (current == wifi.ssid) {
+             appendLog("WIFI: 手机已在车机热点 \"$current\"——直接绑定")
+             bindVerifiedCarWifi(wifi.ssid, "旧安全类型入网", isCancelled) { }
+@@ -2758,8 +2787,8 @@ object SessionController {
+         // 当成用户拒绝（那会让一次本可完成的交接直接失败）。
+         repeat(CONFIRM_CURRENT_MAX_ATTEMPTS) {
+             if (expired()) return null
+-            when (val claim = wifiPromptBroker.claim(spec, shownNetwork)) {
+-                is WifiPromptBroker.Claim.Answered -> return claim.answer
++            when (val claim = wifiPromptBroker.claimForGeneration(round, spec, shownNetwork) ?: return null) {
++                is WifiPromptBroker.Claim.Answered -> return if (expired()) null else claim.answer
+ 
+                 is WifiPromptBroker.Claim.Follower -> {
+                     val answer = wifiPromptBroker.await(claim.future, JOIN_DIALOG_TIMEOUT_S * 1_000, ::expired)
+@@ -2778,6 +2807,10 @@ object SessionController {
+                         java.util.concurrent.atomic
+                             .AtomicBoolean(false)
+                     android.os.Handler(android.os.Looper.getMainLooper()).post {
++                        if (expired() || !wifiPromptBroker.isActive(claim)) {
++                            wifiPromptBroker.timeout(claim)
++                            return@post
++                        }
+                         val sink = dialogSink
+                         if (sink == null) {
+                             // 无 UI 宿主（Activity 销毁窗口）：宁可中止也不默认替用户决定加入
+@@ -2786,7 +2819,8 @@ object SessionController {
+                         }
+                         sink(request) { result ->
+                             answered.set(true)
+-                            wifiPromptBroker.finish(claim, result, cache = true)
++                            if (expired()) wifiPromptBroker.timeout(claim)
++                            else wifiPromptBroker.finish(claim, result, cache = true)
+                         }
+                     }
+                     try {
+@@ -2796,7 +2830,7 @@ object SessionController {
+                     } finally {
+                         // 提前退出（取消/跨轮/超时）时撤掉仍显示的弹窗；已应答时是无害 no-op
+                         // （UI 侧按 requestId 只关对应那一个）。
+-                        if (!answered.get()) runCatching { dialogDismissSink?.invoke(requestId) }
++                        if (!answered.get() || expired()) runCatching { dialogDismissSink?.invoke(requestId) }
+                     }
+                 }
+             }
+@@ -3582,14 +3616,20 @@ object SessionController {
+         endpoint: Iap2SenderSession.CarPlayEndpoint,
+         source: String,
+     ) {
++        val identity = bluetoothIdentityAtStart ?: return
+         Bg.run("pending-start-session-watch") {
+             var promptedSsid: String? = null
+             var triedInvites = 0
+             var tick = 0
+             val deadline = android.os.SystemClock.uptimeMillis() + PENDING_START_SESSION_WAIT_MS
+ 
+-            fun stillPending(): Boolean = pendingStartSessionEndpoint.get() === endpoint
+-            while (!connectCancelled && android.os.SystemClock.uptimeMillis() < deadline) {
++            fun stillPending(): Boolean =
++                !connectCancelled && bluetoothIdentityAtStart === identity &&
++                    pendingStartSessionEndpoint.get() === endpoint && isActiveObservation(endpoint.observation) &&
++                    (endpoint.originatingControlLink?.let { it.get()?.isAlive == true } ?: true)
++
++            fun expired(): Boolean = !stillPending() || SystemClock.uptimeMillis() >= deadline
++            while (!expired()) {
+                 // 晚到 0x4301 / 合成端点已接手本轮（或链路已断）——观察任务让位。
+                 if (!stillPending()) return@run
+                 // 交接临时占用（如 ctrl 邀请正在绑定当前网络）：暂停观察，失败释放后继续。
+@@ -3606,7 +3646,7 @@ object SessionController {
+                     if (continueOnInvitedWifi(endpoint, source)) return@run
+                 }
+                 Thread.sleep(1_000)
+-                if (connectCancelled) return@run
++                if (expired()) break
+                 if (++tick % 5 != 0) continue
+                 val ssid = liveWifiSsid()?.takeIf { it.isNotBlank() }
+                 val network = wifiConnector?.currentWifiNetwork() ?: continue
+@@ -3642,9 +3682,10 @@ object SessionController {
+                         ),
+                         // 同一张网络只问一次；答案也只能在这张网络上复用。
+                         shownNetwork = WifiNetworkToken(network, ssid),
++                        isCancelled = ::expired,
+                     )
+-                if (choice == true && !connectCancelled && !sessionStarting.get() && stillPending()) {
+-                    if (wifiConnector?.currentWifiNetwork() != network) {
++                if (choice == true && !expired() && !sessionStarting.get()) {
++                    if (wifiConnector?.currentWifiNetwork() != network || expired()) {
+                         promptedSsid = null
+                         appendLog(">>> [$source] 用户确认期间当前网络已变化——重新等待确认")
+                         continue
+@@ -3661,15 +3702,19 @@ object SessionController {
+                     return@run
+                 }
+             }
+-            if (!connectCancelled &&
+-                !sessionStarting.get() &&
+-                pendingStartSessionEndpoint.compareAndSet(endpoint, null)
+-            ) {
+-                appendLog(
+-                    ">>> [$source] 空端点等待 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟超时——" +
+-                        "车机未下发 0x4301。拆掉保活链路让重连循环接管，请导出日志反馈",
+-                )
+-                detachActiveBtSessions(eaStopReason = "空端点等待超时")
++            synchronized(this@SessionController) {
++                if (stillPending() && !sessionStarting.get() &&
++                    pendingStartSessionEndpoint.compareAndSet(endpoint, null)
++                ) {
++                    appendLog(
++                        ">>> [$source] 空端点等待 ${PENDING_START_SESSION_WAIT_MS / 60_000} 分钟超时——" +
++                            "车机未下发 0x4301，请导出日志反馈",
++                    )
++                    // Close only the channel that supplied this pending endpoint, never the current global transports.
++                    endpoint.originatingControlLink?.get()?.let { channel ->
++                        Bg.run("pending-start-timeout") { channel.close() }
++                    }
++                }
+             }
+         }
+     }
+@@ -5553,7 +5598,9 @@ object SessionController {
+             try {
+                 while (!isCancelled()) {
+                     val shellReady = shellWifiReady()
+-                    when (val result = joinCarWifi(wifi, shellReady)) {
++                    val result = joinCarWifi(wifi, shellReady, isCancelled)
++                    if (isCancelled()) return@run
++                    when (result) {
+                         is WifiCarPlayConnector.JoinResult.Joined -> {
+                             settled = true
+                             onResult(true)
+diff --git a/app/src/main/java/com/mcarplay/app/WifiPromptBroker.kt b/app/src/main/java/com/mcarplay/app/WifiPromptBroker.kt
+index 2bff014..9dc3915 100644
+--- a/app/src/main/java/com/mcarplay/app/WifiPromptBroker.kt
++++ b/app/src/main/java/com/mcarplay/app/WifiPromptBroker.kt
+@@ -97,6 +97,24 @@ internal class WifiPromptBroker<K : Any, T : Any>(
+         return Claim.Owner(key, null, generation, future)
+     }
+ 
++    /** Claim and generation validation are atomic; a retired caller cannot claim in the new round. */
++    @Synchronized
++    fun claimForGeneration(
++        expectedGeneration: Int,
++        key: K,
++        token: T?,
++    ): Claim<K, T>? = if (generation == expectedGeneration) claim(key, token) else null
++
++    /** Main-thread delivery may run after a clear/timeout; do not show the obsolete dialog. */
++    @Synchronized
++    fun isActive(owner: Claim.Owner<K, T>): Boolean =
++        owner.generation == generation &&
++            if (owner.token == null) {
++                owner.future in unkeyed
++            } else {
++                inFlight[owner.key]?.future === owner.future
++            }
++
+     /** 当前轮次编号：调用方重试前据此确认自己仍在同一轮。 */
+     @Synchronized
+     fun currentGeneration(): Int = generation
+@@ -110,13 +128,15 @@ internal class WifiPromptBroker<K : Any, T : Any>(
+         timeoutMs: Long,
+         isExpired: () -> Boolean = { false },
+     ): Boolean? {
+-        val deadline = System.currentTimeMillis() + timeoutMs
++        val started = System.nanoTime()
++        val budget = TimeUnit.MILLISECONDS.toNanos(timeoutMs.coerceAtLeast(0))
+         while (true) {
+             if (isExpired()) return null
+-            val remaining = deadline - System.currentTimeMillis()
++            val remaining = budget - (System.nanoTime() - started)
+             if (remaining <= 0) return null
+             try {
+-                return future.get(minOf(remaining, EXPIRY_POLL_MS), TimeUnit.MILLISECONDS)
++                val answer = future.get(minOf(remaining, TimeUnit.MILLISECONDS.toNanos(EXPIRY_POLL_MS)), TimeUnit.NANOSECONDS)
++                return if (isExpired()) null else answer
+             } catch (_: TimeoutException) {
+                 // 继续循环：既等答案，也等取消。
+             } catch (_: InterruptedException) {
+diff --git a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+index 5f5a9a3..de1b063 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+@@ -46,6 +46,7 @@ internal fun Iap2LinkChannel.runSenderSession(
+     onObservation: (ReceiverObservation?, Boolean) -> Unit = { _, _ -> },
+     unverifiedInvitePending: () -> Boolean = { false },
+ ) {
++    val originatingLink = java.lang.ref.WeakReference(this)
+     val session =
+         Iap2SenderSession(
+             this,
+@@ -55,7 +56,9 @@ internal fun Iap2LinkChannel.runSenderSession(
+             { wifi -> if (ReceiverDetectionRuntime.isCurrent(observation)) onWifiCredentials(wifi.copy(observation = observation)) },
+             { update ->
+                 if (ReceiverDetectionRuntime.isCurrent(observation)) {
+-                    onEndpointUpdate(update.copy(observation = observation, peerAddress = peerAddress))
++                    onEndpointUpdate(
++                        update.copy(observation = observation, peerAddress = peerAddress, originatingControlLink = originatingLink),
++                    )
+                 }
+             },
+             knownCarSsid,
+@@ -79,7 +82,7 @@ internal fun Iap2LinkChannel.runSenderSession(
+         onGeneration(session.linkGeneration)
+         if (!ReceiverDetectionRuntime.isCurrent(observation)) return
+         endpointDelivered = true
+-        onEndpoint(endpoint.copy(observation = observation, peerAddress = peerAddress))
++        onEndpoint(endpoint.copy(observation = observation, peerAddress = peerAddress, originatingControlLink = originatingLink))
+         // Phase 2 过渡：保持控制通道存活记录配件消息；AirPlay 配对由 onEndpoint 回调发起
+         session.pumpIncomingForever()
+     } catch (error: IOException) {
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index d23a61b..3619844 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -138,6 +138,8 @@ class Iap2SenderSession(
+          * 是否允许“加入网络”只能由本字段判定。
+          */
+         val wifiCredentialSource: WifiCredentialSource = WifiCredentialSource.NONE,
++        /** Process-local handle for retiring only the channel that delivered this endpoint. Never persisted. */
++        internal val originatingControlLink: java.lang.ref.WeakReference<Iap2LinkChannel>? = null,
+     ) {
+         /** 只有车机明确下发的完整配置才允许交给 WifiNetworkSpecifier / connect-network。 */
+         val hasCompleteWifiCredentials: Boolean
+@@ -322,7 +324,15 @@ class Iap2SenderSession(
+ 
+     fun run(timeoutMillis: Long = 60_000L): CarPlayEndpoint {
+         val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+-        if (!channel.awaitReady(remainingMillis(deadline))) {
++        checkBootstrapActive()
++        val ready =
++            try {
++                channel.awaitReady(remainingMillis(deadline))
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++                throw java.io.InterruptedIOException("iAP2 link negotiation cancelled")
++            }
++        if (!ready) {
+             throw IOException(
+                 if (channel.isAlive) "iAP2 链路协商超时"
+                 else "iAP2 链路协商期间结束: ${channel.terminationReason ?: "closed"}",
+@@ -1031,6 +1041,8 @@ class Iap2SenderSession(
+             )
+         }
+         for ((position, size) in order.withIndex()) {
++            checkBootstrapActive()
++            if (remainingMillis(deadline) <= 0L) break
+             // 成功过的档位等足（车机芯片可能卡住数十秒），静默过的档位缩短窗口
+             val baseWindow = windowOf[size] ?: MFI_ATTEMPTS.last().second
+             val windowMillis =
+@@ -1049,6 +1061,7 @@ class Iap2SenderSession(
+                 val remaining = (window - System.nanoTime()) / 1_000_000L
+                 if (remaining <= 0) break
+                 val frame = recvNewFrame(remaining)
++                checkBootstrapActive()
+                 if (frame == null) {
+                     if (!channel.isAlive) {
+                         log("iap2 MFi 挑战期间链路断开（${size}B）；原因未验证，不记为认证拒绝")
+@@ -1359,6 +1372,10 @@ class Iap2SenderSession(
+                 else "等待 0x${messageId.toString(16)} 时链路结束: ${channel.terminationReason ?: "closed"}",
+             )
+ 
++    private fun checkBootstrapActive() {
++        if (Thread.currentThread().isInterrupted) throw java.io.InterruptedIOException("iAP2 bootstrap cancelled")
++    }
++
+     /**
+      * 同 [expect]，但超时返回 null（用于可选消息）。非预期帧进暂存区供后续消费。
+      *
+@@ -1370,6 +1387,7 @@ class Iap2SenderSession(
+         messageId: Int,
+         deadlineNanos: Long,
+     ): Iap2Csm.Frame? {
++        checkBootstrapActive()
+         if (!channel.isAlive) return null
+         pendingFrames.firstOrNull { it.messageId == messageId }?.let {
+             pendingFrames.remove(it)
+@@ -1379,6 +1397,7 @@ class Iap2SenderSession(
+             val remaining = (deadlineNanos - System.nanoTime()) / 1_000_000L
+             if (remaining <= 0) return null
+             val frame = recvNewFrame(remaining)
++            checkBootstrapActive()
+             if (frame == null) {
+                 if (!channel.isAlive) return null
+                 continue
+@@ -1426,7 +1445,7 @@ class Iap2SenderSession(
+      * （保持到达顺序：暂存 > 新解析），再读新帧。
+      */
+     private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
+-        if (!channel.isAlive) return null
++        if (!channel.isAlive || Thread.currentThread().isInterrupted) return null
+         pendingFrames.firstOrNull()?.let {
+             pendingFrames.removeFirst()
+             return it
+@@ -1436,7 +1455,7 @@ class Iap2SenderSession(
+ 
+     /** 只取新帧（先已解析队列、再读 socket）；绝不返回暂存区的帧。 */
+     private fun recvNewFrame(timeoutMillis: Long): Iap2Csm.Frame? {
+-        if (!channel.isAlive) return null
++        if (!channel.isAlive || Thread.currentThread().isInterrupted) return null
+         receivedFrames.firstOrNull()?.let {
+             receivedFrames.removeFirst()
+             return it
+diff --git a/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt b/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt
+index ef57acc..e7d8135 100644
+--- a/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt
++++ b/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt
+@@ -20,6 +20,14 @@ internal class NetworkBinding<N : Any, R : Any>(
+         return previous
+     }
+ 
++    /** Cancel only this request. An obsolete callback cannot unbind its replacement. */
++    @Synchronized
++    fun releaseIfCurrent(owner: R): Boolean {
++        if (request !== owner) return false
++        replaceRequest(null)
++        return true
++    }
++
+     @Synchronized
+     fun isCurrent(owner: R): Boolean = request === owner
+ 
+@@ -27,10 +35,15 @@ internal class NetworkBinding<N : Any, R : Any>(
+     fun bind(
+         owner: R,
+         candidate: N,
++        isCancelled: () -> Boolean = { false },
+     ): Boolean {
+-        if (request !== owner || !bindProcess(candidate)) return false
++        if (request !== owner || isCancelled() || !bindProcess(candidate)) return false
+         network = candidate
+         invalidated = null
++        if (isCancelled()) {
++            clearNetwork()
++            return false
++        }
+         return true
+     }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt b/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt
+index 230beba..82bea11 100644
+--- a/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt
++++ b/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt
+@@ -310,6 +310,7 @@ class WifiCarPlayConnector(
+         /** 参数为请求发出时刻（uptimeMillis）；返回 true 表示系统选择框正等用户选择。 */
+         userChoicePending: ((Long) -> Boolean)? = null,
+     ): JoinResult {
++        if (isCancelled()) return JoinResult.Unavailable
+         val specifier =
+             buildSpecifier(ssid, passphrase, securityType)
+                 ?: return JoinResult.Unsupported
+@@ -351,7 +352,7 @@ class WifiCarPlayConnector(
+                 // SSID 正是挂起条件之一），短路是正确行为。
+                 quickFallback?.invoke()?.let { fallback ->
+                     log("WiFi: 快速兜底入网成功（$fallback）——跳过 specifier 重发")
+-                    return JoinResult.Joined(fallback)
++                    return if (isCancelled()) JoinResult.Unavailable else JoinResult.Joined(fallback)
+                 }
+             }
+             if (!isCancelled()) {
+@@ -363,11 +364,12 @@ class WifiCarPlayConnector(
+                 if (!isCancelled()) {
+                     deepFallback?.invoke()?.let { fallback ->
+                         log("WiFi: 深度兜底入网成功（$fallback）")
+-                        return JoinResult.Joined(fallback)
++                        return if (isCancelled()) JoinResult.Unavailable else JoinResult.Joined(fallback)
+                     }
+                 }
+             }
+         }
++        if (isCancelled()) return JoinResult.Unavailable
+         if (network == null) {
+             log("WiFi: 等待加入 \"$ssid\" 失败（首窗 ${firstWindowMs / 1000}s + 重发窗 ${secondWindowMs / 1000}s + 两级兜底）")
+             release()
+@@ -386,12 +388,13 @@ class WifiCarPlayConnector(
+         userChoicePending: ((Long) -> Boolean)? = null,
+         holdLimitMillis: Long = timeoutMillis,
+     ): Network? {
++        if (isCancelled()) return null
+         val latch = CountDownLatch(1)
+         val result = AtomicReference<Network?>(null)
+         val newCallback =
+             object : ConnectivityManager.NetworkCallback() {
+                 override fun onAvailable(network: Network) {
+-                    if (!binding.bind(this, network)) {
++                    if (!binding.bind(this, network, isCancelled)) {
+                         if (binding.isCurrent(this)) {
+                             log("WiFi: 应用专属网络绑定失败（$network），网络可能已失效")
+                             unavailable.set(true)
+@@ -436,7 +439,15 @@ class WifiCarPlayConnector(
+                 log("WiFi: 发起应用专属网络请求失败（${error.message}）——可能需要位置权限或系统不支持")
+                 false
+             }
+-        if (!accepted) return null
++        fun revokeRequest() {
++            if (binding.releaseIfCurrent(newCallback)) {
++                runCatching { connectivityManager.unregisterNetworkCallback(newCallback) }
++            }
++        }
++        if (!accepted) {
++            revokeRequest()
++            return null
++        }
+         val deadline = requestedAt + timeoutMillis
+         val holdDeadline = requestedAt + maxOf(timeoutMillis, holdLimitMillis)
+         var holdLogged = false
+@@ -448,14 +459,21 @@ class WifiCarPlayConnector(
+                 holdLogged = true
+                 log("WiFi: Activity 生命周期提示系统选择框可能正在等待用户——继续等待，不撤回重发（未确认弹窗实际可见）")
+             }
+-            if (isCancelled()) return null
++            if (isCancelled()) {
++                revokeRequest()
++                return null
++            }
+             try {
+                 if (latch.await(200, TimeUnit.MILLISECONDS)) break
+             } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++                revokeRequest()
+                 return null
+             }
+         }
+-        return result.get()?.takeIf { it == currentNetwork }
++        val joined = result.get()?.takeIf { it == currentNetwork && binding.isCurrent(newCallback) && !isCancelled() }
++        if (joined == null) revokeRequest()
++        return joined
+     }
+ 
+     /** 构造 specifier；WEP 或参数不合法返回 null（走旧路径）。 */
+diff --git a/app/src/test/java/com/mcarplay/app/WifiPromptBrokerTest.kt b/app/src/test/java/com/mcarplay/app/WifiPromptBrokerTest.kt
+index 9287299..ff97853 100644
+--- a/app/src/test/java/com/mcarplay/app/WifiPromptBrokerTest.kt
++++ b/app/src/test/java/com/mcarplay/app/WifiPromptBrokerTest.kt
+@@ -16,6 +16,44 @@ class WifiPromptBrokerTest {
+ 
+     private fun broker() = WifiPromptBroker<String, Token> { a, b -> a.ssid == b.ssid }
+ 
++    @Test
++    fun staleGenerationCannotClaimAfterClear() {
++        val broker = broker()
++        val generation = broker.currentGeneration()
++        broker.clear()
++        assertNull(broker.claimForGeneration(generation, "use-current", Token("CarAP")))
++        assertTrue(broker.claimForGeneration(broker.currentGeneration(), "use-current", Token("CarAP")) is WifiPromptBroker.Claim.Owner)
++    }
++
++    @Test
++    fun delayedUiDeliveryChecksOwnerAfterClearAndTimeout() {
++        val broker = broker()
++        val owner = broker.claim("use-current", Token("CarAP")) as WifiPromptBroker.Claim.Owner
++        assertTrue(broker.isActive(owner))
++        broker.clear()
++        assertFalse(broker.isActive(owner))
++        val next = broker.claim("use-current", Token("CarAP")) as WifiPromptBroker.Claim.Owner
++        assertTrue(broker.isActive(next))
++        broker.timeout(next)
++        assertFalse(broker.isActive(next))
++        val unkeyed = broker.claim("other", null) as WifiPromptBroker.Claim.Owner
++        assertTrue(broker.isActive(unkeyed))
++        broker.finish(unkeyed, true, cache = true)
++        assertFalse(broker.isActive(unkeyed))
++    }
++
++    @Test
++    fun answerArrivingAsTheAttemptExpiresIsDiscarded() {
++        var expired = false
++        val future = object : java.util.concurrent.CompletableFuture<Boolean?>() {
++            override fun get(timeout: Long, unit: TimeUnit): Boolean? {
++                expired = true
++                return true
++            }
++        }
++        assertNull(broker().await(future, 1_000) { expired })
++    }
++
+     @Test
+     fun concurrentIdenticalQuestionSharesTheOwnersAnswer() {
+         val broker = broker()
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+index 2eb69db..6241fe3 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+@@ -19,6 +19,33 @@ import java.util.concurrent.atomic.AtomicReference
+  * 验证 Phase 1 全序列（识别→MFi 跳过→HID→WiFi 配置→CarPlay 启动→通知）。
+  */
+ class Iap2SenderSessionTest {
++    @Test
++    fun interruptedIdentificationWaitEndsWithoutWaitingForTheDeadline() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA, name = "interrupt-bootstrap-phone")
++        val peer = Iap2LinkChannel(pair.sideB, name = "interrupt-bootstrap-peer")
++        val requestSent = CountDownLatch(1)
++        val failure = AtomicReference<Throwable?>()
++        val worker = Thread {
++            val session = Iap2SenderSession(phone, log = { line ->
++                if (line == "iap2 tx=0x1d00") requestSent.countDown()
++            }, bluetoothMac = "02:00:00:00:00:01")
++            failure.set(runCatching { session.run(60_000L) }.exceptionOrNull())
++        }.apply { isDaemon = true; start() }
++        try {
++            assertTrue(requestSent.await(5, TimeUnit.SECONDS))
++            worker.interrupt()
++            worker.join(2_000)
++            assertFalse(worker.isAlive)
++            assertTrue(failure.get() is java.io.InterruptedIOException)
++            assertTrue(phone.isAlive)
++        } finally {
++            phone.close()
++            peer.close()
++            worker.join(2_000)
++        }
++    }
++
+     @Test
+     fun startSessionArrivingDuringAuthenticationOrHidWaitIsPreserved() {
+         for (earlyAtChallenge in listOf(true, false)) {
+diff --git a/app/src/test/java/com/mcarplay/app/net/NetworkBindingTest.kt b/app/src/test/java/com/mcarplay/app/net/NetworkBindingTest.kt
+index 21b5db9..6c7a907 100644
+--- a/app/src/test/java/com/mcarplay/app/net/NetworkBindingTest.kt
++++ b/app/src/test/java/com/mcarplay/app/net/NetworkBindingTest.kt
+@@ -9,6 +9,49 @@ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+ class NetworkBindingTest {
++    @Test
++    fun cancellingOldRequestCannotReleaseReplacement() {
++        val environment = Environment()
++        val old = Any()
++        val next = Any()
++        environment.binding.replaceRequest(old)
++        environment.binding.replaceRequest(next)
++        val network = environment.liveNetwork(112)
++        assertTrue(environment.binding.bind(next, network))
++        assertFalse(environment.binding.releaseIfCurrent(old))
++        assertSame(network, environment.binding.current())
++        assertTrue(environment.binding.releaseIfCurrent(next))
++        assertNull(environment.binding.current())
++    }
++
++    @Test
++    fun cancelledCallbackNeverBinds() {
++        val environment = Environment()
++        val owner = Any()
++        environment.binding.replaceRequest(owner)
++        assertFalse(environment.binding.bind(owner, environment.liveNetwork(111)) { true })
++        assertTrue(environment.bindings.isEmpty())
++    }
++
++    @Test
++    fun cancellationDuringBindingRollsBackOnlyItsNetwork() {
++        var cancelled = false
++        val calls = mutableListOf<Int?>()
++        val owner = Any()
++        val binding = NetworkBinding<Int, Any>(
++            bindProcess = { value ->
++                calls.add(value)
++                if (value != null) cancelled = true
++                true
++            },
++            isUsable = { true },
++        )
++        binding.replaceRequest(owner)
++        assertFalse(binding.bind(owner, 111) { cancelled })
++        assertEquals(listOf(111, null), calls)
++        assertNull(binding.current())
++    }
++
+     @Test
+     fun lossWithRecreatedNetworkValueClearsProcessBinding() {
+         val environment = Environment()
+diff --git a/build-r25-signed.ps1 b/build-r25-signed.ps1
+deleted file mode 100644
+index 342d4e9..0000000
+--- a/build-r25-signed.ps1
++++ /dev/null
+@@ -1,31 +0,0 @@
+-# R25 local release build. Requires Android SDK, JDK, and keystore.properties.
+-# Never sends a key or password to the network. Requires the R23 long-term signer.
+-param(
+-    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
+-)
+-$ErrorActionPreference = 'Stop'
+-Set-Location $PSScriptRoot
+-if ($ExpectedCertSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected certificate SHA-256 must contain exactly 64 hex characters.' }
+-if (!(Test-Path 'keystore.properties')) { throw 'Missing private keystore.properties. Configure your existing signing key locally; never commit it.' }
+-$sdk = $env:ANDROID_HOME
+-if (!$sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+-if (!$sdk) { throw 'Set ANDROID_HOME to your Android SDK directory.' }
+-$signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
+-$aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
+-if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
+-& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.12-test.1 :app:assembleStandardRelease
+-if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
+-$apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
+-if (!(Test-Path $apk)) { throw 'Release APK missing.' }
+-$verify = & $signer verify --verbose --print-certs $apk
+-if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
+-$verify | Write-Output
+-$cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
+-if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
+-$meta = & $aapt dump badging $apk
+-if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1120000'")) { throw 'Unexpected package name or versionCode.' }
+-New-Item -ItemType Directory -Force dist | Out-Null
+-$out = 'dist\mcarplay-0.1.12.apk'
+-Copy-Item $apk $out -Force
+-Get-FileHash $out -Algorithm SHA256
+-Write-Output 'Signed APK verified against expected certificate and package/version.'
+diff --git a/build-r26-signed.ps1 b/build-r26-signed.ps1
+new file mode 100644
+index 0000000..7e5f11c
+--- /dev/null
++++ b/build-r26-signed.ps1
+@@ -0,0 +1,31 @@
++# R26 local release build. Requires Android SDK, JDK, and keystore.properties.
++# Never sends a key or password to the network. Requires the R23 long-term signer.
++param(
++    [string]$ExpectedCertSha256 = '44368f6b284b613c5e297d305dbe09f1fd684cf930fce3bebe809c4460b31512'
++)
++$ErrorActionPreference = 'Stop'
++Set-Location $PSScriptRoot
++if ($ExpectedCertSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw 'Expected certificate SHA-256 must contain exactly 64 hex characters.' }
++if (!(Test-Path 'keystore.properties')) { throw 'Missing private keystore.properties. Configure your existing signing key locally; never commit it.' }
++$sdk = $env:ANDROID_HOME
++if (!$sdk) { $sdk = $env:ANDROID_SDK_ROOT }
++if (!$sdk) { throw 'Set ANDROID_HOME to your Android SDK directory.' }
++$signer = Join-Path $sdk 'build-tools\35.0.0\apksigner.bat'
++$aapt = Join-Path $sdk 'build-tools\35.0.0\aapt.exe'
++if (!(Test-Path $signer) -or !(Test-Path $aapt)) { throw 'Install Android SDK Build Tools 35.0.0.' }
++& .\gradlew.bat --no-daemon spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:testRemoteDebugUnitTest :app:lintStandardDebug -Pmcarplay.requireReleaseSigning=true -Pmcarplay.releaseTag=v0.1.13-test.1 :app:assembleStandardRelease
++if ($LASTEXITCODE -ne 0) { throw 'Gradle verification/build failed.' }
++$apk = 'app\build\outputs\apk\standard\release\app-standard-release.apk'
++if (!(Test-Path $apk)) { throw 'Release APK missing.' }
++$verify = & $signer verify --verbose --print-certs $apk
++if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
++$verify | Write-Output
++$cert = @($verify | Select-String '^Signer #\d+ certificate SHA-256 digest:\s*([0-9a-fA-F]{64})\s*$')
++if ($cert.Count -ne 1 -or $cert[0].Matches[0].Groups[1].Value.ToLowerInvariant() -ne $ExpectedCertSha256.ToLowerInvariant()) { throw 'Certificate mismatch: cannot claim in-place upgrade. APK not copied to dist.' }
++$meta = & $aapt dump badging $apk
++if ($LASTEXITCODE -ne 0 -or !($meta | Select-String "^package: name='com\.mcarplay\.app' versionCode='1130000'")) { throw 'Unexpected package name or versionCode.' }
++New-Item -ItemType Directory -Force dist | Out-Null
++$out = 'dist\mcarplay-0.1.13.apk'
++Copy-Item $apk $out -Force
++Get-FileHash $out -Algorithm SHA256
++Write-Output 'Signed APK verified against expected certificate and package/version.'
+diff --git a/docs/ARCHITECTURE-REFACTOR.md b/docs/ARCHITECTURE-REFACTOR.md
+index 9c7f6ca..91f5b23 100644
+--- a/docs/ARCHITECTURE-REFACTOR.md
++++ b/docs/ARCHITECTURE-REFACTOR.md
+@@ -4,6 +4,10 @@
+ 状态：**Phase 0 的代码护栏已在 `refactor/session-phase0-guardrails` 完成（只加测试与工具，不改生产代码）；基线实车报告待采集；
+ Phase 1 起尚未开始。** 2026-11-10 对照代码复查后修订过一次，改动见文末「修订记录」。本文仍是讨论稿：第 9 节的问题确认后再定稿、拆 PR。
+ 
++> **R26 / 0.1.13（2026-11-25）局部加固**：Wi-Fi 入网取消条件沿调用链传递，旧弹窗请求按轮次原子拒绝，
++> 空端点等待持有原控制链路弱引用，超时仅结束该链路。仍未完成统一轮次对象、同 socket 重协商或完整 Android CI。
++> 此为行为修复候选，不代表本文后续重构阶段全部完成。
++
+ ## 1. 背景与目标
+ 
+ 协议层（`carlife/`、`iap2/`、`airplay/`、`bt/`、`net/`、`video/`、`audio/`）的分包和单测覆盖整体健康；问题集中在把它们串起来的
