@@ -156,7 +156,7 @@ jobs:
           for p in paths:
               h.update(p.as_posix().encode()+b'\0'+sha256(p.read_bytes()).digest())
           Path('r32-source-fingerprint.tsv').write_text(''.join(f'{sha256(p.read_bytes()).hexdigest()}\t{p.as_posix()}\n' for p in paths))
-          assert len(paths)==623 and h.hexdigest()=="78672a824bcf2d1a82e5513fbdf60f3fb934adf705bf5e099d670fe5cd0b8f0a", (len(paths),h.hexdigest())
+          assert len(paths)==623 and h.hexdigest()=="7a013206d67b6e4a7ddc613ec1163c184b26988de1fd63fe6418e1ed81ed15ee", (len(paths),h.hexdigest())
           print("Exact R32 source",len(paths),h.hexdigest())
           PY
           grep -F 'val appVersionName = "0.1.19"' app/build.gradle.kts
@@ -166,6 +166,7 @@ jobs:
           set -euo pipefail
           bash ./gradlew --no-daemon spotlessApply spotlessCheck
       - name: CarPlay synthetic receiver and connection fault simulation
+        id: carplay_sim
         working-directory: baseline/mcarplay-project
         run: |
           set -euo pipefail
@@ -186,7 +187,7 @@ jobs:
             --tests 'com.mcarplay.app.airplay.AirPlayRecordLifecycleTest' \
             --tests 'com.mcarplay.app.airplay.ReceiverCompatibilityIntegrationTest'
       - name: Verify simulation evidence and preserve focused JUnit results
-        if: always()
+        if: always() && (steps.carplay_sim.outcome == 'success' || steps.carplay_sim.outcome == 'failure')
         working-directory: baseline/mcarplay-project
         run: |
           set -euo pipefail
@@ -223,6 +224,7 @@ jobs:
           path: baseline/mcarplay-project/carplay-simulation-evidence/
           if-no-files-found: warn
       - name: Lacrosse display, recovery, and hotspot regression
+        id: lacrosse_sim
         working-directory: baseline/mcarplay-project
         run: |
           set -euo pipefail
@@ -237,7 +239,7 @@ jobs:
             --tests 'com.mcarplay.app.video.VideoScreenOwnershipTest' \
             --tests 'com.mcarplay.app.architecture.HotspotDialogDismissTest'
       - name: Preserve and verify Lacrosse regression evidence
-        if: always()
+        if: always() && (steps.lacrosse_sim.outcome == 'success' || steps.lacrosse_sim.outcome == 'failure')
         working-directory: baseline/mcarplay-project
         run: |
           set -euo pipefail
