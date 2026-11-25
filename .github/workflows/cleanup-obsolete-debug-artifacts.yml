@@ -1,0 +1,40 @@
+name: Remove superseded debug APK artifacts
+on:
+  push:
+    branches: [feature/r26-full-validation]
+    paths:
+      - '.github/workflows/cleanup-obsolete-debug-artifacts.yml'
+permissions:
+  actions: write
+  contents: read
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate and remove only explicitly selected obsolete debug artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          targets=(
+            '14745622378|44999999979|mcarplay-R20-audited-debug-apk'
+            '14751621899|45015332863|mcarplay-R22-E2LB-experimental-debug-apk'
+            '14751299882|45015329560|mcarplay-R22-E2LB-experimental-debug-apk'
+            '15011235143|45588297358|mcarplay-R37-debug-apks-NOT-FOR-RELEASE'
+            '15011140438|45589122469|mcarplay-R38-debug-apks-NOT-FOR-RELEASE'
+            '15011423216|45591166608|mcarplay-R40-debug-apks-NOT-FOR-RELEASE'
+          )
+          for target in "${targets[@]}"; do
+            IFS='|' read -r id run name <<< "$target"
+            metadata=$(gh api "repos/$repo/actions/artifacts/$id")
+            jq -e --arg name "$name" --argjson run "$run" --argjson id "$id" '.id == $id and .name == $name and .workflow_run.id == $run and .expired == false' <<< "$metadata" >/dev/null
+            test "$(gh api "repos/$repo/actions/runs/$run" --jq .status)" = completed
+          done
+          for target in "${targets[@]}"; do
+            IFS='|' read -r id run name <<< "$target"
+            gh api --method DELETE "repos/$repo/actions/artifacts/$id"
+            echo "Deleted $id ($name)"
+          done
