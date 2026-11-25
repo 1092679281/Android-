@@ -6,6 +6,7 @@ on:
       - feature/r26-full-validation
     paths:
       - 'r28-build/R28-from-R26.patch'
+      - '.github/workflows/build-r28-full-validation.yml'
   workflow_dispatch:
 
 permissions:
@@ -139,6 +140,68 @@ jobs:
           print("Exact R28 source",len(paths),h.hexdigest())
           PY
           grep -F 'val appVersionName = "0.1.15"' app/build.gradle.kts
+      - name: Normalize source formatting and enforce Spotless
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon spotlessApply spotlessCheck
+      - name: CarPlay synthetic receiver and connection fault simulation
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          bash ./gradlew --no-daemon :app:testStandardDebugUnitTest \
+            --tests 'com.mcarplay.app.iap2.Iap2SenderSessionTest' \
+            --tests 'com.mcarplay.app.iap2.Iap2LinkEngineTest' \
+            --tests 'com.mcarplay.app.iap2.CarPlayBringupStateTest' \
+            --tests 'com.mcarplay.app.iap2.WifiHandoffPolicyTest' \
+            --tests 'com.mcarplay.app.iap2.Iap2AvailabilityProgressTest' \
+            --tests 'com.mcarplay.app.iap2.R12WifiHandoffIsolationTest' \
+            --tests 'com.mcarplay.app.bt.BluetoothSessionArbiterTest' \
+            --tests 'com.mcarplay.app.bt.ReconnectCircuitBreakerTest' \
+            --tests 'com.mcarplay.app.transport.Iap2LinkChannelRestartTest' \
+            --tests 'com.mcarplay.app.net.CtrlInviteGateTest' \
+            --tests 'com.mcarplay.app.net.NetworkBindingTest' \
+            --tests 'com.mcarplay.app.airplay.VirtualIap2LinkTest' \
+            --tests 'com.mcarplay.app.airplay.AirPlayPairingTest' \
+            --tests 'com.mcarplay.app.airplay.AirPlayRecordLifecycleTest' \
+            --tests 'com.mcarplay.app.airplay.ReceiverCompatibilityIntegrationTest'
+      - name: Verify simulation evidence and preserve focused JUnit results
+        if: always()
+        working-directory: baseline/mcarplay-project
+        run: |
+          set -euo pipefail
+          mkdir -p carplay-simulation-evidence
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import xml.etree.ElementTree as ET
+          root = Path('app/build/test-results/testStandardDebugUnitTest')
+          output = Path('carplay-simulation-evidence')
+          expected = ["com.mcarplay.app.iap2.Iap2SenderSessionTest","com.mcarplay.app.iap2.Iap2LinkEngineTest","com.mcarplay.app.iap2.CarPlayBringupStateTest","com.mcarplay.app.iap2.WifiHandoffPolicyTest","com.mcarplay.app.iap2.Iap2AvailabilityProgressTest","com.mcarplay.app.iap2.R12WifiHandoffIsolationTest","com.mcarplay.app.bt.BluetoothSessionArbiterTest","com.mcarplay.app.bt.ReconnectCircuitBreakerTest","com.mcarplay.app.transport.Iap2LinkChannelRestartTest","com.mcarplay.app.net.CtrlInviteGateTest","com.mcarplay.app.net.NetworkBindingTest","com.mcarplay.app.airplay.VirtualIap2LinkTest","com.mcarplay.app.airplay.AirPlayPairingTest","com.mcarplay.app.airplay.AirPlayRecordLifecycleTest","com.mcarplay.app.airplay.ReceiverCompatibilityIntegrationTest"]
+          failures = []
+          total = 0
+          for cls in expected:
+              p = root / ('TEST-' + cls + '.xml')
+              if not p.is_file():
+                  failures.append(cls + ': missing')
+                  continue
+              shutil.copy2(p, output / p.name)
+              cases = ET.parse(p).getroot().findall('testcase')
+              bad = [t for t in cases if any(t.find(k) is not None for k in ('failure', 'error', 'skipped'))]
+              total += len(cases)
+              if not cases or bad:
+                  failures.append(f'{cls}: {len(cases)} cases, {len(bad)} failed/skipped')
+              print(cls, len(cases), 'PASS' if cases and not bad else 'FAIL')
+          print('Synthetic connection cases:', total)
+          assert not failures, failures
+          PY
+      - name: Archive focused CarPlay simulation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R28-carplay-simulation-evidence
+          path: baseline/mcarplay-project/carplay-simulation-evidence/
+          if-no-files-found: warn
       - name: Strict Android tests, lint and debug APK compilation
         working-directory: baseline/mcarplay-project
         run: |
