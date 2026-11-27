@@ -148,8 +148,37 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
+      - name: Apply verified R58.1 late-0x4301 drain and formatting correction
+        id: r58delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.1-late-4301-drain.patch.bz2"
+          echo "13e6a36f8eb782413239c9bc0eaf6b303c83837b107cb494c43319c508c3ea95  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.1-late-4301-drain.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "fbd73f19d4916802c4dc5a4b9ac3695857ded23deb3fa4fc880bda1bdb6b54a1  $patch" | sha256sum --check
+          cd "$R44_BASELINE"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.1 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 832 or actual != "4a3c8abacc5800c6d09059f1d4fde4ea99323c0eb105300cfa77e9d63d337501":
+              raise SystemExit("R58.1 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.1-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
       - name: Audit Kotlin formatting (non-blocking for preserved R56 snapshot)
-        if: ${{ steps.r58.outcome == 'success' }}
+        if: ${{ steps.r58delta.outcome == 'success' }}
         continue-on-error: true
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
@@ -159,7 +188,7 @@ jobs:
           ./gradlew --no-daemon --console=plain spotlessCheck
 
       - name: Run Android tests, lint and build debug APKs (all gates attempted)
-        if: ${{ steps.r58.outcome == 'success' }}
+        if: ${{ steps.r58delta.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -172,7 +201,7 @@ jobs:
             :app:assembleRemoteDebug
 
       - name: Verify both candidate APKs and record metadata
-        if: ${{ !cancelled() && steps.r58.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.r58delta.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -203,11 +232,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcarplay-R58-0.1.45-candidate-source-and-debug-apks
+          name: mcarplay-R58.1-0.1.45-candidate-source-and-debug-apks
           path: |
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
             ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.1-0.1.45-candidate-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
