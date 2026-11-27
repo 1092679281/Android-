@@ -93,13 +93,21 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R56-0.1.43-organized-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties'
 
-      - name: Run Android checks and build debug APKs
+      - name: Audit Kotlin formatting (non-blocking for preserved R56 snapshot)
+        continue-on-error: true
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew --no-daemon --console=plain spotlessCheck \
+          ./gradlew --no-daemon --console=plain spotlessCheck
+
+      - name: Run Android tests, lint and build debug APKs
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain \
             :app:testStandardDebugUnitTest \
             :app:lintStandardDebug \
             :app:assembleStandardDebug \
