@@ -6,6 +6,11 @@ Baseline: R44 / 0.1.31
 R44 baseline commit: 967caf7eeff3ed54c7e3f4f9c1452821e8161a28
 R44 source archive SHA-256: d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b
 
+R44 embedded fingerprint audit:
+- 647 structurally valid TSV entries
+- 578 file hashes match the extracted pinned archive; 69 do not
+- The archive itself matches the pinned SHA-256, so its exact bytes are known; the embedded per-file TSV is internally inconsistent and is recorded as non-gating evidence rather than misrepresented as a passing check
+
 Incremental patch replay:
 - R45 through R56: 12 patches
 - Every patch passed git apply --check on a clean R44 worktree

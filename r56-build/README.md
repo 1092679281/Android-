@@ -7,7 +7,8 @@
 - Repository: `1092679281/Android-` (patch/reconstruction repository; not an Android project at root).
 - Maintenance branch: `maintenance/r56-source-of-truth`.
 - Exact baseline: R44 / 0.1.31, source artifact from workflow run `45596424156`, artifact ID `15014496262`.
-- Baseline archive SHA-256: `d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b`.
+- Baseline archive SHA-256: `d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b` (authoritative exact-baseline pin).
+- The embedded R44 per-file TSV contains 647 valid entries; 578 match the files in that pinned archive and 69 do not. This pre-existing manifest inconsistency is reported but is not used as a gate; the archive SHA-256, ordered patch checks and final R56 tree fingerprint are the integrity gates.
 - R56 full candidate archive SHA-256: `686f1968b5846fe49e55f9b96032c21d77e5408f281d13434b79831d34afcbff`.
 - Organized R56 source archive SHA-256: `877a54f7af496ee4f82a2064fbabab7cccbf1b702d2672828f12620252ffebab`.
 - Verified organized tree: 827 files; deterministic tree SHA-256 `29bd33771f52538d918b8f9c2a66e6822b84d3e2c65a9817aff926dcde5fbec5`.
@@ -22,11 +23,12 @@ bash r56-build/rebuild-r56.sh ./baseline
 ```
 
 The rebuild script:
-1. Verifies every incremental patch against `SHA256SUMS`.
-2. Applies R45 through R56 in order, checking each patch before applying it.
-3. Applies the R56 source-hygiene patch.
-4. Moves historical fingerprints and legacy evidence into `docs/provenance/` and `archive/`.
-5. Verifies the final 827-file source tree against the pinned fingerprint.
+1. Confirms the R44 embedded TSV structure and reports its 69 stale entries; CI verifies the exact R44 ZIP SHA-256.
+2. Verifies every incremental patch against `SHA256SUMS`.
+3. Applies R45 through R56 in order, checking each patch before applying it.
+4. Applies the R56 source-hygiene patch.
+5. Moves historical fingerprints and legacy evidence into `docs/provenance/` and `archive/`.
+6. Verifies the final 827-file source tree against the pinned fingerprint.
 
 Patch order is mandatory; do not apply the R56 cumulative patch on top of incremental patches.
 

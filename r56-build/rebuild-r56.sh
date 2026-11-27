@@ -5,7 +5,27 @@ kit="$(cd "$(dirname "$0")/.." && pwd)"
 patch_dir="$kit/r56-build/patches"
 
 test -f "$root/app/build.gradle.kts"
-test -f "$root/r44-source-fingerprint.tsv"
+manifest="$root/r44-source-fingerprint.tsv"
+test -f "$manifest"
+manifest_count="$(awk -F '\t' 'NF == 2 && length($1) == 64 && $1 ~ /^[0-9a-fA-F]+$/ { count++ } END { print count+0 }' "$manifest")"
+if [[ "$manifest_count" -ne 647 ]]; then
+  echo "Unexpected R44 fingerprint manifest shape: $manifest_count valid rows (expected 647)" >&2
+  exit 1
+fi
+fingerprint_audit="$(mktemp)"
+(
+  cd "$root"
+  awk -F '\t' 'NF == 2 { print $1 "  " $2 }' r44-source-fingerprint.tsv | sha256sum --check -
+) >"$fingerprint_audit" 2>&1 || true
+fingerprint_ok="$(awk '/: OK$/ { count++ } END { print count+0 }' "$fingerprint_audit")"
+fingerprint_mismatch="$(awk '/: FAILED$/ { count++ } END { print count+0 }' "$fingerprint_audit")"
+if [[ "$((fingerprint_ok + fingerprint_mismatch))" -ne "$manifest_count" ]]; then
+  cat "$fingerprint_audit" >&2
+  echo "R44 fingerprint audit produced an incomplete result" >&2
+  exit 1
+fi
+echo "R44 embedded fingerprint audit: $fingerprint_ok/$manifest_count match; $fingerprint_mismatch stale entries are non-gating because the exact baseline ZIP SHA-256 is verified by CI."
+rm -f "$fingerprint_audit"
 
 (
   cd "$patch_dir"
