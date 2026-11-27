@@ -198,24 +198,6 @@ jobs:
           PY
           chmod +x ./gradlew
           ./gradlew --no-daemon --console=plain spotlessApply
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path("app/src/main/java/com/mcarplay/app/airplay/VirtualIap2Link.kt")
-          source = p.read_text()
-          compact = "if (!response.valid || response.value == null || certificate == null || receiverIdentification == null || challenge == null) {"
-          formatted = """if (!response.valid ||
-                              response.value == null ||
-                              certificate == null ||
-                              receiverIdentification == null ||
-                              challenge == null
-                          ) {"""
-          if source.count(compact) == 1:
-              p.write_text(source.replace(compact, formatted, 1))
-          elif source.count(formatted) == 1:
-              print("VirtualIap2Link.kt condition already formatted")
-          else:
-              raise SystemExit("Unexpected MFi response guard shape; refusing broad rewrite")
-          PY
           ./gradlew --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from pathlib import Path
@@ -225,7 +207,10 @@ jobs:
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
-          print(f"R58.2 candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
+          actual = digest.hexdigest()
+          print(f"R58.2 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 832 or actual != "2158c86e835dfa4a3c249554934374a2a6d399e4d7f5d0e3d1ca436afab799d9":
+              raise SystemExit("R58.2 source fingerprint mismatch after Spotless")
           PY
           zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
