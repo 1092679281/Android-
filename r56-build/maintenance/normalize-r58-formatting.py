@@ -40,3 +40,13 @@ replace_once(
             animating()
         ) {""",
 )
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt",
+    """        snapshot.stage == ConnectionStage.BLUETOOTH && snapshot.status == "failed" &&
+            snapshot.code == DiagnosticCode.BT_LINK_CLOSED && bluetoothWasEstablished(snapshot)""",
+    """        snapshot.stage == ConnectionStage.BLUETOOTH &&
+            snapshot.status == "failed" &&
+            snapshot.code == DiagnosticCode.BT_LINK_CLOSED &&
+            bluetoothWasEstablished(snapshot)""",
+)
