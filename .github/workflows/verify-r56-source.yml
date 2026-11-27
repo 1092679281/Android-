@@ -125,10 +125,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58-mfi-fail-closed-e2lb-reliability.patch.bz2"
-          echo "91d3b6ae5436dde82d768481d9881622d38aacfd6c7f02554440d8cf129a0ae8  $archive" | sha256sum --check
+          echo "38c4a8288e04b77954ccfa064a5d2151dd0185892b6f0c8e57b2eea753f6e77e  $archive" | sha256sum --check
           patch="$RUNNER_TEMP/R58-mfi-fail-closed-e2lb-reliability.patch"
           bzip2 -dc "$archive" > "$patch"
-          echo "c102471df3b028f1809a26358b5c322164e58b7d0f00f756e484ce6c49818882  $patch" | sha256sum --check
+          echo "b8117e253101ec6449c24a38c3a53526ffba509ce40a128246bc27636d14b9d8  $patch" | sha256sum --check
           cd "$R44_BASELINE"
           git apply --check "$patch"
           git apply "$patch"
@@ -142,7 +142,7 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0" + sha256(p.read_bytes()).digest() + b"\n")
           actual = digest.hexdigest()
           print(f"R58 candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 830 or actual != "5567e7c633be5e466b0f8ce3a09726caf9f79c0704e872eadd7a8e77a9f325a7":
+          if len(files) != 830 or actual != "125ec362a2b4766fe1db4c7a63adaf26fe48afe4e893a078850662e893051fcb":
               raise SystemExit("R58 candidate fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58-0.1.45-candidate-source.zip" . \
