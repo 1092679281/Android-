@@ -38,8 +38,8 @@ jobs:
           expected="d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b"
           zip="$RUNNER_TEMP/$asset"
 
-          if gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "$asset"; then
-            gh release download "$tag" --pattern "$asset" --dir "$RUNNER_TEMP"
+          if gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "$asset"; then
+            gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$RUNNER_TEMP"
           else
             curl --fail --location --retry 3 \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -47,10 +47,10 @@ jobs:
               "https://api.github.com/repos/$repo/actions/artifacts/15014496262/zip" \
               --output "$zip"
             echo "$expected  $zip" | sha256sum --check
-            if gh release view "$tag" >/dev/null 2>&1; then
-              gh release upload "$tag" "$zip" --clobber
+            if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+              gh release upload "$tag" "$zip" --clobber --repo "$repo"
             else
-              gh release create "$tag" "$zip" \
+              gh release create "$tag" "$zip" --repo "$repo" \
                 --target 9bc86ce53237b83c23e588e6fa2c7376cca99381 \
                 --title "R44 verified source baseline (source only)" \
                 --notes "Immutable R44 / 0.1.31 source baseline. SHA-256: $expected. This is a source archive, not an APK release."
