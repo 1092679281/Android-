@@ -1,4 +1,4 @@
-name: Reconstruct and validate R56 source
+name: Reconstruct and validate R56 plus maintenance candidates
 
 on:
   push:
@@ -119,7 +119,37 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R57-0.1.44-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties'
 
+      - name: Apply verified R58 fail-closed MFi and reliable E2LB candidate
+        id: r58
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58-mfi-fail-closed-e2lb-reliability.patch.bz2"
+          echo "91d3b6ae5436dde82d768481d9881622d38aacfd6c7f02554440d8cf129a0ae8  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58-mfi-fail-closed-e2lb-reliability.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "c102471df3b028f1809a26358b5c322164e58b7d0f00f756e484ce6c49818882  $patch" | sha256sum --check
+          cd "$R44_BASELINE"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\\0" + sha256(p.read_bytes()).digest() + b"\\n")
+          actual = digest.hexdigest()
+          print(f"R58 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 830 or actual != "5567e7c633be5e466b0f8ce3a09726caf9f79c0704e872eadd7a8e77a9f325a7":
+              raise SystemExit("R58 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
       - name: Audit Kotlin formatting (non-blocking for preserved R56 snapshot)
+        if: ${{ steps.r58.outcome == 'success' }}
         continue-on-error: true
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
@@ -129,6 +159,7 @@ jobs:
           ./gradlew --no-daemon --console=plain spotlessCheck
 
       - name: Run Android tests, lint and build debug APKs (all gates attempted)
+        if: ${{ steps.r58.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -141,7 +172,7 @@ jobs:
             :app:assembleRemoteDebug
 
       - name: Verify both candidate APKs and record metadata
-        if: ${{ !cancelled() && steps.candidate.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.r58.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -153,7 +184,7 @@ jobs:
           test "${#remote[@]}" -eq 1
           aapt="$ANDROID_HOME/build-tools/35.0.0/aapt"
           signer="$ANDROID_HOME/build-tools/35.0.0/apksigner"
-          report="$RUNNER_TEMP/r57-apk-verification.txt"
+          report="$RUNNER_TEMP/r58-apk-verification.txt"
           : > "$report"
           verify_apk() {
             local file="$1" pkg="$2" variant="$3"
@@ -161,7 +192,7 @@ jobs:
             badging="$("$aapt" dump badging "$file")"
             printf '\nVariant: %s\n%s\n' "$variant" "$file" >> "$report"
             printf '%s\n' "$badging" | grep "^package:" | tee -a "$report"
-            printf '%s\n' "$badging" | grep "^package: name='$pkg' versionCode='1440000' versionName='0\.1\.44[^']*-debug'"
+            printf '%s\n' "$badging" | grep "^package: name='$pkg' versionCode='1450000' versionName='0\.1\.45[^']*-debug'"
             "$signer" verify --verbose --print-certs "$file" >> "$report"
             sha256sum "$file" | tee -a "$report"
           }
@@ -172,10 +203,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcarplay-R57-0.1.44-candidate-source-and-debug-apks
+          name: mcarplay-R58-0.1.45-candidate-source-and-debug-apks
           path: |
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
             ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58-0.1.45-candidate-source.zip
             ${{ runner.temp }}/r57-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
