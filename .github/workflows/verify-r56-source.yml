@@ -245,7 +245,7 @@ jobs:
 
       - name: Apply R58.4 CBR-first encoder selection
         id: r584
-        if: ${{ steps.r584.outcome == 'success' }}
+        if: ${{ steps.r583.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
