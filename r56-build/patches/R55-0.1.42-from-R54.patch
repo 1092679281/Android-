@@ -1,0 +1,678 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5b07df0..f615065 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,29 @@
+ # Changelog
+ 
++## [v0.1.42-test.1] - 2026-11-27
++
++> R55 strict CSM TLV parsing for 0x4301 and 0x5703 endpoint data. This is parser hardening, not evidence of a vehicle connection fix.
++
++### English
++- Add a strict CSM TLV parser that rejects truncated headers, invalid lengths and truncated values instead of silently discarding malformed trailing bytes; preserve the existing permissive parser for unrelated compatibility paths.
++- Use strict parsing for 0x4301 and nested wireless endpoint data, and for 0x5703 Wi-Fi credentials.
++- Reject duplicate critical endpoint fields (wireless group, port, device identifier, public key, source version; SSID, passphrase, security type and channel). Preserve repeated wireless parameter 3 address entries used by existing fixtures.
++- Refuse malformed 0x4301 endpoint handoff; ignore malformed late 0x4301 updates without invoking the endpoint callback.
++- Replace raw 0x4301 hex dumps and wireless-value hex logs with ID/length-only summaries; fingerprint device identifiers and public keys so SSIDs, Wi-Fi passwords and raw identity values do not enter diagnostic logs.
++- Add regression tests for 1–3 byte trailing fragments, invalid/overrun lengths, duplicate critical fields, repeated address fields, malformed nested wireless groups, late endpoint handoff and credential-log redaction.
++- Focused exact-source parser tests and fuzz checks are recorded separately. Full Android Gradle build, APK packaging and real-vehicle behavior remain unverified.
++
++### 简体中文
++- 新增严格 CSM TLV 解析器：遇到不完整头部、非法长度或值越界时拒绝整组参数，不再静默丢弃尾部异常字节；旧宽松解析器保留给未迁移的兼容路径。
++- `0x4301` 及其嵌套无线端点参数、`0x5703` Wi-Fi 凭据改用严格解析。
++- 拒绝关键端点字段重复（无线组、端口、设备标识、公钥、版本；SSID、密码、安全类型、信道）；保留现有协议夹具中允许重复的无线参数 3 地址字段。
++- 畸形 `0x4301` 不得交付端点；保活期间晚到的畸形 `0x4301` 直接忽略，不触发端点更新回调。
++- 删除 `0x4301` 原始十六进制转储及无线组字段值日志，改为只记录参数 ID/长度；设备标识和公钥改为指纹，避免 SSID、Wi-Fi 密码及原始身份值进入诊断日志。
++- 新增尾部 1～3 字节、非法/越界长度、关键字段重复、重复地址字段、嵌套无线组异常、晚到端点交付及凭据日志脱敏回归测试。
++- 精确源码解析器测试及模糊输入结果另行记录。完整 Android Gradle 编译、APK 打包及实车行为仍未验证。
++
++Full changes / 完整变更: [v0.1.41-test.1...v0.1.42-test.1](https://github.com/1092679281/Android-/compare/v0.1.41-test.1...v0.1.42-test.1)
++
+ ## [v0.1.41-test.1] - 2026-11-26
+ 
+ > R54 strict iAP2 synchronization-table validation and MFi TLV structure checks. This does not implement MFi cryptographic verification or claim to fix E2LB vehicle startup.
+diff --git a/IMPLEMENTATION_PLAN.md b/IMPLEMENTATION_PLAN.md
+index 02f2496..bf21523 100644
+--- a/IMPLEMENTATION_PLAN.md
++++ b/IMPLEMENTATION_PLAN.md
+@@ -1,6 +1,6 @@
+ # mcarplay：CarWith 转无线 CarPlay 实施计划
+ 
+-更新：2026-11-26。目标是在小米手机上取得 CarWith 的真实画面、声音和触控，再由 mcarplay 充当 CarPlay 手机端，连接支持无线 CarPlay 的车机。
++更新：2026-11-27。目标是在小米手机上取得 CarWith 的真实画面、声音和触控，再由 mcarplay 充当 CarPlay 手机端，连接支持无线 CarPlay 的车机。
+ 
+ 首版完成范围为：手机内手动发起连接、CarWith 画面、车机扬声器声音、车机触控回传。自动重连、车机麦克风、通话和语音上行不作为首版承诺。未在真实车机验证前，不声明任何车型“已适配”。
+ 
+@@ -447,3 +447,6 @@ CarWith 硬按键，其余交手机媒体会话）；补 0xCD 播放/暂停、0x
+ 4. 阶段 3–4 通过：触控、音频、稳定性、合规和发布材料齐全。
+ 
+ 任何阶段失败时，先固定错误证据并更新本计划；不得跳过前序门槛、把端口连接当作媒体成功，或把未测车型写成已适配。
++
++
++- **11 月 27 日 R55 严格端点 TLV 解析（源码候选，未上车）：** R54 的 `Iap2Csm.parseParams()` 为兼容性保留了“遇到坏 TLV 就停止并返回已解析前缀”的行为，但 `0x4301`、嵌套无线组和 `0x5703` 仍使用它；因此末尾 1～3 字节、越界长度或重复关键字段可能让部分端点被采纳。R55 新增独立 `parseParamsStrict()`，仅将端点/凭据路径迁移到严格解析；拒绝关键字段重复，保留无线参数 3 的多地址语义；畸形晚到 `0x4301` 不再触发主控更新。另移除 `0x4301` 原始十六进制及无线组字段值日志，改为 ID/长度摘要，并对设备标识/公钥使用短 SHA-256 指纹，防止 SSID/口令随诊断报告泄露。该修复提升输入完整性和日志隐私，不证明 E2LB 0x4300/0x4301 实车连接成功。完整 Android Gradle 门禁、APK 和实车验收仍待完成。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 218ff32..2b39a1d 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.41"
++val appVersionName = "0.1.42"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2Csm.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2Csm.kt
+index a03d884..63737c8 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2Csm.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2Csm.kt
+@@ -88,6 +88,15 @@ object Iap2Csm {
+         override fun hashCode(): Int = id * 31 + value.contentHashCode()
+     }
+ 
++    /** Result of parsing a complete TLV stream without silently dropping a malformed tail. */
++    data class StrictParamParseResult(
++        val params: List<Param>?,
++        val error: String?,
++        val duplicateParameterId: Int? = null,
++    ) {
++        val isValid: Boolean get() = params != null && error == null
++    }
++
+     fun param(
+         id: Int,
+         value: ByteArray,
+@@ -166,6 +175,55 @@ object Iap2Csm {
+         return params
+     }
+ 
++    /**
++     * Strict counterpart to [parseParams]. Unlike the compatibility parser above, this method
++     * rejects any trailing fragment, invalid TLV length, or value that extends past the body.
++     * Callers handling endpoint credentials must use this before adopting parsed fields.
++     */
++    fun parseParamsStrict(
++        body: ByteArray,
++        uniqueParameterIds: Set<Int> = emptySet(),
++    ): StrictParamParseResult {
++        val params = ArrayList<Param>()
++        var offset = 0
++        while (offset < body.size) {
++            val remaining = body.size - offset
++            if (remaining < PARAM_HEADER_BYTES) {
++                return StrictParamParseResult(null, "truncated_parameter_header")
++            }
++            val length = readU16(body, offset)
++            if (length < PARAM_HEADER_BYTES) {
++                return StrictParamParseResult(null, "invalid_parameter_length")
++            }
++            if (length > remaining) {
++                return StrictParamParseResult(null, "truncated_parameter_value")
++            }
++            params += Param(readU16(body, offset + 2), body.copyOfRange(offset + PARAM_HEADER_BYTES, offset + length))
++            offset += length
++        }
++        val duplicateId =
++            params.asSequence()
++                .filter { it.id in uniqueParameterIds }
++                .groupingBy { it.id }
++                .eachCount()
++                .entries
++                .firstOrNull { it.value > 1 }
++                ?.key
++        if (duplicateId != null) {
++            return StrictParamParseResult(null, "duplicate_parameter_id", duplicateId)
++        }
++        return StrictParamParseResult(params, null)
++    }
++
++    /** Return parameter IDs and value lengths only; never include raw TLV values in diagnostics. */
++    fun redactedParamsSummary(body: ByteArray): String {
++        val parsed = parseParamsStrict(body)
++        return parsed.params?.joinToString(" ") { "#${it.id}(${it.value.size}B)" }
++            ?: "invalid:${parsed.error ?: "unknown"}"
++    }
++
++    private const val PARAM_HEADER_BYTES = 4
++
+     private fun readU16(
+         bytes: ByteArray,
+         offset: Int,
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index 4556cc0..9117d2b 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -8,6 +8,7 @@ import com.mcarplay.app.diagnostics.ConnectionMilestone
+ import com.mcarplay.app.net.EndpointHosts
+ import com.mcarplay.app.transport.Iap2LinkChannel
+ import java.io.IOException
++import java.security.MessageDigest
+ import java.security.SecureRandom
+ import java.util.concurrent.atomic.AtomicBoolean
+ 
+@@ -187,8 +188,8 @@ class Iap2SenderSession(
+     /** 只知道名称时不得合成凭据，但晚到的地址/端口仍需沿用这条链路的名称。 */
+     private var knownSessionSsid: String? = null
+ 
+-    /** 0x4301 原始体是否已记录（每轮会话一次，避免周期补发刷屏）。 */
+-    private var startSessionRawLogged = false
++    /** 0x4301 脱敏结构摘要是否已记录（每轮会话一次，避免周期补发刷屏）。 */
++    private var startSessionStructureLogged = false
+ 
+     /** 0x4300 本轮是否已发（车机可收时会在凭据窗口内提前发，Phase 1 末尾幂等）。 */
+     private var carPlayAvailabilitySent = false
+@@ -295,9 +296,6 @@ class Iap2SenderSession(
+          */
+         const val START_SESSION_WAIT_NEW_PROTOCOL_NANOS = 8_000_000_000L
+ 
+-        /** 0x4301 原始体日志上限（Audi 实测 261B，完整记录；异常大的只截前段）。 */
+-        const val START_SESSION_RAW_LOG_BYTES = 1_024
+-
+         /**
+          * 已知「静默过」的档位重试窗口。首次试探保留原窗口（可能是慢车机），
+          * 但已经失败过一次的档位没必要再等满 6 秒——真 iPhone 应答在 100ms 级。
+@@ -744,6 +742,7 @@ class Iap2SenderSession(
+         var endpoint =
+             if (startSession != null) {
+                 parseStartSession(startSession, wifiFromExchange)
++                    ?: throw IOException("Malformed 0x4301 TLV; refusing endpoint handoff")
+             } else {
+                 // 不能断言「该车机不发」：Audi MMI 9310 声明会发、也确实发，只是晚到
+                 // 2 分 35 秒（2026-10-18 日志）。措辞必须保留「稍后可能补发」的预期，
+@@ -842,10 +841,11 @@ class Iap2SenderSession(
+                 )
+         }
+         if (startSession != null) {
+-            logStartSessionRaw(startSession)
++            logStartSessionStructure(startSession)
+             log(
+                 "iap2 rx=0x4301 airPlayPort=${endpoint.airPlayPort} " +
+-                    "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKey?.take(16)}… " +
++                    "deviceFingerprint=${diagnosticFingerprint(endpoint.deviceIdentifier)} " +
++                    "publicKeyFingerprint=${diagnosticFingerprint(endpoint.publicKey)} " +
+                     "srcvers=${endpoint.sourceVersion} ips=${endpoint.ipAddresses}",
+             )
+         }
+@@ -1016,8 +1016,12 @@ class Iap2SenderSession(
+      * 无线组解析——这正是这类车机唯一的凭据来源，不能像旧代码那样「无 0x5703 就忽略」。
+      */
+     private fun handleLateStartSession(frame: Iap2Csm.Frame) {
+-        logStartSessionRaw(frame)
+-        var endpoint = parseStartSession(frame, wifi)
++        logStartSessionStructure(frame)
++        var endpoint =
++            parseStartSession(frame, wifi) ?: run {
++                log("iap2 rx=0x4301（晚到）TLV 不完整或关键参数重复——拒绝端点更新")
++                return
++            }
+         if (endpoint.ssid.isBlank()) {
+             knownSessionSsid?.let { known ->
+                 endpoint = endpoint.copy(ssid = known, wifiCredentialSource = WifiCredentialSource.KNOWN_SSID)
+@@ -1038,7 +1042,8 @@ class Iap2SenderSession(
+             lastLateStartSessionSignature = endpoint.hashCode()
+             log(
+                 "iap2 rx=0x4301（晚到，Phase 1 之后）airPlayPort=${endpoint.airPlayPort} " +
+-                    "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKey?.take(16)}… " +
++                    "deviceFingerprint=${diagnosticFingerprint(endpoint.deviceIdentifier)} " +
++                    "publicKeyFingerprint=${diagnosticFingerprint(endpoint.publicKey)} " +
+                     "srcvers=${endpoint.sourceVersion} ips=${endpoint.ipAddresses}" +
+                     "——交给主控热更新端点/重试配对",
+             )
+@@ -1057,14 +1062,28 @@ class Iap2SenderSession(
+         onEndpointUpdate?.invoke(endpoint)
+     }
+ 
+-    /** 0x4301 原始体只记一次：车机间端点字段差异（有无 IPv4/端口/公钥）只能靠它定谳。 */
+-    private fun logStartSessionRaw(frame: Iap2Csm.Frame) {
+-        if (startSessionRawLogged) return
+-        startSessionRawLogged = true
+-        val body = frame.body
+-        val shown = if (body.size <= START_SESSION_RAW_LOG_BYTES) body else body.copyOf(START_SESSION_RAW_LOG_BYTES)
+-        val truncated = if (body.size > shown.size) "（前 ${shown.size}/${body.size} 字节）" else ""
+-        log("iap2 0x4301 原始体$truncated=" + shown.joinToString("") { "%02x".format(it) })
++    /**
++     * 0x4301 只记录结构，不记录原始字节：无线组可能包含 SSID、口令和设备标识，
++     * 将整帧转十六进制仍然等于明文泄露，不能依赖后续诊断脱敏器识别二进制内容。
++     */
++    private fun logStartSessionStructure(frame: Iap2Csm.Frame) {
++        if (startSessionStructureLogged) return
++        startSessionStructureLogged = true
++        val parsed = Iap2Csm.parseParamsStrict(frame.body)
++        val topLevel = parsed.params
++        val topSummary = Iap2Csm.redactedParamsSummary(frame.body)
++        val wirelessSummary =
++            topLevel?.firstOrNull { it.id == 1 }?.value?.let(Iap2Csm::redactedParamsSummary) ?: "absent"
++        log(
++            "iap2 0x4301 结构摘要（敏感参数值已省略） body=${frame.body.size}B " +
++                "top=[$topSummary] wireless=[$wirelessSummary]",
++        )
++    }
++
++    private fun diagnosticFingerprint(value: String?): String {
++        if (value.isNullOrBlank()) return "none"
++        val digest = MessageDigest.getInstance("SHA-256").digest(value.encodeToByteArray())
++        return digest.take(6).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+     }
+ 
+     // ---- 帧收发 ----
+@@ -1603,8 +1622,25 @@ class Iap2SenderSession(
+         val configuration: WifiConfiguration?,
+     )
+ 
++    /** Strictly parse a complete TLV stream and reject ambiguous duplicate fields we consume. */
++    private fun parseStrictParameters(
++        body: ByteArray,
++        scope: String,
++        uniqueIds: Set<Int>,
++    ): List<Iap2Csm.Param>? {
++        val result = Iap2Csm.parseParamsStrict(body, uniqueParameterIds = uniqueIds)
++        val params = result.params
++        if (!result.isValid || params == null) {
++            val duplicate = result.duplicateParameterId?.let { " id=$it" }.orEmpty()
++            log("iap2 rx=$scope malformed TLV reason=${result.error ?: "invalid_parameter_stream"}$duplicate")
++            return null
++        }
++        return params
++    }
++
+     private fun parseWifiConfiguration(frame: Iap2Csm.Frame): ParsedWifiConfiguration? {
+-        val params = Iap2Csm.parseParams(frame.body).associateBy { it.id }
++        val parsed = parseStrictParameters(frame.body, "0x5703", uniqueIds = setOf(1, 2, 3, 4)) ?: return null
++        val params = parsed.associateBy { it.id }
+         val ssid = params[1]?.value?.asStringOrEmpty() ?: return null
+         if (ssid.isBlank()) return null
+         val security =
+@@ -1645,10 +1681,25 @@ class Iap2SenderSession(
+     private fun parseStartSession(
+         frame: Iap2Csm.Frame,
+         wifi: WifiConfiguration?,
+-    ): CarPlayEndpoint {
+-        val params = Iap2Csm.parseParams(frame.body).associateBy { it.id }
++    ): CarPlayEndpoint? {
++        val topLevel = parseStrictParameters(frame.body, "0x4301", uniqueIds = setOf(1, 2, 3, 4, 5)) ?: return null
++        if (topLevel.isEmpty()) {
++            log("iap2 rx=0x4301 malformed reason=empty_parameter_stream")
++            return null
++        }
++        val params = topLevel.associateBy { it.id }
+         val wirelessGroup = params[1]?.value
+-        val wireless = wirelessGroup?.let { Iap2Csm.parseParams(it) }
++        val wireless =
++            wirelessGroup?.let { group ->
++                val parsedGroup =
++                    parseStrictParameters(group, "0x4301 wireless group", uniqueIds = setOf(0, 1, 2, 4))
++                        ?: return null
++                if (parsedGroup.isEmpty()) {
++                    log("iap2 rx=0x4301 malformed reason=empty_wireless_group")
++                    return null
++                }
++                parsedGroup
++            }
+         val addresses =
+             wireless
+                 ?.filter { it.id == 3 }
+@@ -1660,10 +1711,8 @@ class Iap2SenderSession(
+         )
+         if (wireless != null) {
+             log(
+-                "iap2 0x4301 无线组参数: " +
+-                    wireless.joinToString(" ") { param ->
+-                        "#${param.id}=" + param.value.joinToString("") { "%02x".format(it) }
+-                    },
++                "iap2 0x4301 无线组参数（敏感值已省略）: " +
++                    wireless.joinToString(" ") { param -> "#${param.id}(${param.value.size}B)" },
+             )
+         }
+         val fromSession = wireless?.let { parseWirelessAp(it) }
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2CodecsTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2CodecsTest.kt
+index 76bf530..dbc82b6 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2CodecsTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2CodecsTest.kt
+@@ -2,6 +2,7 @@ package com.mcarplay.app.iap2
+ 
+ import org.junit.Assert.assertArrayEquals
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
+ import org.junit.Assert.assertNotNull
+ import org.junit.Assert.assertNull
+ import org.junit.Assert.assertTrue
+@@ -114,6 +115,79 @@ class Iap2CodecsTest {
+         assertArrayEquals(byteArrayOf(1, 2, 3, 4, 5, 6), children[2].value)
+     }
+ 
++    @Test
++    fun strictTlvParserAcceptsEmptyAndCompleteStreams() {
++        val empty = Iap2Csm.parseParamsStrict(byteArrayOf())
++        assertTrue(empty.isValid)
++        assertTrue(empty.params!!.isEmpty())
++
++        val body = Iap2Csm.string(1, "MockAP") + Iap2Csm.u32(2, 49_152L)
++        val parsed = Iap2Csm.parseParamsStrict(body)
++        assertTrue(parsed.isValid)
++        assertEquals(listOf(1, 2), parsed.params!!.map { it.id })
++    }
++
++    @Test
++    fun strictTlvParserRejectsEveryIncompleteHeaderTailLength() {
++        val valid = Iap2Csm.string(1, "MockAP")
++        for (tailSize in 1..3) {
++            val result = Iap2Csm.parseParamsStrict(valid + ByteArray(tailSize))
++            assertEquals("truncated_parameter_header", result.error)
++            assertFalse(result.isValid)
++        }
++    }
++
++    @Test
++    fun strictTlvParserRejectsInvalidLengthsAndTruncatedValues() {
++        assertEquals("invalid_parameter_length", Iap2Csm.parseParamsStrict(byteArrayOf(0, 3, 0, 1)).error)
++        assertEquals("truncated_parameter_value", Iap2Csm.parseParamsStrict(byteArrayOf(0, 8, 0, 1, 7)).error)
++    }
++
++    @Test
++    fun strictTlvParserDoesNotSilentlyDropValidPrefixBeforeMalformedTail() {
++        val body = Iap2Csm.string(1, "MockAP") + byteArrayOf(0, 4, 0)
++        val compatibility = Iap2Csm.parseParams(body)
++        assertEquals(1, compatibility.size)
++        val strict = Iap2Csm.parseParamsStrict(body)
++        assertFalse(strict.isValid)
++        assertEquals("truncated_parameter_header", strict.error)
++        assertNull(strict.params)
++    }
++
++    @Test
++    fun strictTlvParserRejectsDuplicateCriticalFieldsButAllowsRepeatedAddressFields() {
++        val duplicatePort = Iap2Csm.u32(2, 49_152L) + Iap2Csm.u32(2, 49_153L)
++        val rejected = Iap2Csm.parseParamsStrict(duplicatePort, uniqueParameterIds = setOf(1, 2, 3, 4, 5))
++        assertFalse(rejected.isValid)
++        assertEquals("duplicate_parameter_id", rejected.error)
++        assertEquals(2, rejected.duplicateParameterId ?: -1)
++
++        val addresses = Iap2Csm.string(3, "192.168.49.1") + Iap2Csm.string(3, "fd00::1")
++        val accepted = Iap2Csm.parseParamsStrict(addresses, uniqueParameterIds = setOf(0, 1, 2, 4))
++        assertTrue(accepted.isValid)
++        assertEquals(2, accepted.params!!.size)
++    }
++
++    @Test
++    fun redactedParameterSummaryNeverIncludesValues() {
++        val nested =
++            Iap2Csm.group(
++                1,
++                Iap2Csm.string(0, "MockAP"),
++                Iap2Csm.string(1, "secret-passphrase"),
++                Iap2Csm.string(3, "192.168.49.1"),
++            )
++        val body = nested + Iap2Csm.string(3, "mock-device-id") + Iap2Csm.string(4, "publickeyhex")
++        val summary = Iap2Csm.redactedParamsSummary(body)
++        val wireless = Iap2Csm.parseParamsStrict(body).params!!.single { it.id == 1 }.value
++        val wirelessSummary = Iap2Csm.redactedParamsSummary(wireless)
++        for (secret in listOf("MockAP", "secret-passphrase", "192.168.49.1", "mock-device-id", "publickeyhex")) {
++            assertFalse("redacted summary leaked $secret", summary.contains(secret) || wirelessSummary.contains(secret))
++        }
++        assertTrue(summary.contains("#1("))
++        assertTrue(wirelessSummary.contains("#0("))
++    }
++
+     @Test
+     fun stringParamRejectsEmbeddedNul() {
+         try {
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+index fff77a4..081e5b8 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+@@ -233,6 +233,7 @@ class Iap2SenderSessionTest {
+         val phoneChannel = Iap2LinkChannel(pair.sideA, name = "phone")
+         val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory")
+         val accessory = MockAccessory(accessoryChannel, shape = MockAccessory.Shape.AUDI_9310, lateStartSession = true)
++        val logs = java.util.Collections.synchronizedList(ArrayList<String>())
+ 
+         val accessoryThread = Thread({ accessory.run() }, "mock-accessory")
+         accessoryThread.isDaemon = true
+@@ -243,7 +244,7 @@ class Iap2SenderSessionTest {
+         val session =
+             Iap2SenderSession(
+                 phoneChannel,
+-                log = { line -> println("PHONE $line") },
++                log = { line -> logs += line },
+                 bluetoothMac = "34:86:DA:86:BB:96",
+                 deviceName = "test-device",
+                 onEndpointUpdate = {
+@@ -268,12 +269,149 @@ class Iap2SenderSessionTest {
+         assertEquals(listOf("192.168.49.1", "fd00::1"), late.ipAddresses)
+         assertEquals("mock-device-id", late.deviceIdentifier)
+         assertEquals(phaseOne.receiverSignals, late.receiverSignals)
++        val diagnosticText = logs.joinToString("\n")
++        assertFalse("late 0x4301 diagnostics leaked Wi-Fi password", diagnosticText.contains("secret-passphrase"))
++        assertFalse("late 0x4301 diagnostics leaked SSID", diagnosticText.contains("MockAP"))
++        assertFalse("late 0x4301 diagnostics leaked receiver identifier", diagnosticText.contains("mock-device-id"))
++        assertFalse("late 0x4301 diagnostics leaked public key suffix", diagnosticText.contains("publickeyhex"))
+ 
+         phoneChannel.close()
+         accessoryChannel.close()
+         pump.join(2_000)
+     }
+ 
++    @Test
++    fun startSessionDiagnosticsOmitWifiCredentialsAndRawIdentityValues() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA, name = "phone-redacted-4301")
++        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory-redacted-4301")
++        val accessory = MockAccessory(accessoryChannel, shape = MockAccessory.Shape.BMW_ID9)
++        val accessoryThread = Thread({ accessory.run() }, "mock-redacted-4301").apply {
++            isDaemon = true
++            start()
++        }
++        val logs = java.util.Collections.synchronizedList(ArrayList<String>())
++        try {
++            val endpoint =
++                Iap2SenderSession(
++                    phone,
++                    log = { logs += it },
++                    bluetoothMac = "02:00:00:00:00:01",
++                ).run(timeoutMillis = 10_000L)
++            assertEquals("MockAP", endpoint.ssid)
++            val combined = logs.joinToString("\n")
++            val secretHex = "secret-passphrase".encodeToByteArray().joinToString("") { "%02x".format(it) }
++            val ssidHex = "MockAP".encodeToByteArray().joinToString("") { "%02x".format(it) }
++            assertFalse("raw Wi-Fi password leaked to diagnostics", combined.contains("secret-passphrase"))
++            assertFalse("hex-encoded Wi-Fi password leaked to diagnostics", combined.contains(secretHex))
++            assertFalse("raw SSID leaked to diagnostics", combined.contains("MockAP"))
++            assertFalse("hex-encoded SSID leaked to diagnostics", combined.contains(ssidHex))
++            assertFalse("raw receiver identifier leaked to diagnostics", combined.contains("mock-device-id"))
++            assertFalse("raw public key suffix leaked to diagnostics", combined.contains("publickeyhex"))
++            assertTrue("redacted structural summary missing", combined.contains("敏感参数值已省略"))
++        } finally {
++            phone.close()
++            accessoryChannel.close()
++            accessoryThread.join(2_000)
++        }
++    }
++
++    @Test
++    fun malformedLateWifiConfigurationIsNotDelivered() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA, name = "phone-malformed-5703")
++        val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory-malformed-5703")
++        val accessory =
++            MockAccessory(
++                accessoryChannel,
++                shape = MockAccessory.Shape.SAIC_AH4EM,
++                lateWifiConfigurationAfterMs = 100L,
++                completeWirelessAp = false,
++                malformedLateWifiConfigurationTail = true,
++            )
++        val accessoryThread = Thread({ accessory.run() }, "mock-malformed-5703").apply {
++            isDaemon = true
++            start()
++        }
++        val delivered = java.util.Collections.synchronizedList(ArrayList<Iap2SenderSession.WifiConfiguration>())
++        val malformed = CountDownLatch(1)
++        val session =
++            Iap2SenderSession(
++                phone,
++                log = { if (it.contains("0x5703 malformed TLV")) malformed.countDown() },
++                bluetoothMac = "02:00:00:00:00:01",
++                onWifiCredentials = { delivered += it },
++            )
++        var pump: Thread? = null
++        try {
++            session.run(timeoutMillis = 15_000L)
++            pump = Thread({ session.pumpIncomingForever() }, "pump-malformed-5703").apply {
++                isDaemon = true
++                start()
++            }
++            assertTrue("mock did not send malformed late 0x5703", accessory.lateWifiConfigurationSent.await(5, TimeUnit.SECONDS))
++            assertTrue("malformed 0x5703 was not diagnosed", malformed.await(3, TimeUnit.SECONDS))
++            assertTrue("malformed 0x5703 must not reach Wi-Fi callback", delivered.isEmpty())
++        } finally {
++            phone.close()
++            accessoryChannel.close()
++            pump?.join(2_000)
++            accessoryThread.join(2_000)
++        }
++    }
++
++    @Test
++    fun malformedLateStartSessionIsIgnoredWithoutEndpointHandoff() {
++        val invalidCases = listOf(
++            Triple(true, false, false),
++            Triple(false, true, false),
++            Triple(false, false, true),
++        )
++        for ((badTopLevelTail, badWirelessTail, duplicatePort) in invalidCases) {
++            val pair = InMemoryStreamPair()
++            val phone = Iap2LinkChannel(pair.sideA, name = "phone-malformed-4301")
++            val accessoryChannel = Iap2LinkChannel(pair.sideB, name = "accessory-malformed-4301")
++            val accessory =
++                MockAccessory(
++                    accessoryChannel,
++                    shape = MockAccessory.Shape.AUDI_9310,
++                    lateStartSession = true,
++                    malformedStartSessionTail = badTopLevelTail,
++                    malformedWirelessGroupTail = badWirelessTail,
++                    duplicateStartSessionPort = duplicatePort,
++                )
++            val accessoryThread = Thread({ accessory.run() }, "mock-malformed-4301").apply {
++                isDaemon = true
++                start()
++            }
++            val rejected = CountDownLatch(1)
++            val updates = java.util.Collections.synchronizedList(ArrayList<Iap2SenderSession.CarPlayEndpoint>())
++            val session =
++                Iap2SenderSession(
++                    phone,
++                    log = { if (it.contains("拒绝端点更新")) rejected.countDown() },
++                    bluetoothMac = "02:00:00:00:00:01",
++                    onEndpointUpdate = { updates += it },
++                )
++            var pump: Thread? = null
++            try {
++                session.run(timeoutMillis = 10_000L)
++                pump = Thread({ session.pumpIncomingForever() }, "pump-malformed-4301").apply {
++                    isDaemon = true
++                    start()
++                }
++                assertTrue("mock did not send late 0x4301", accessory.startSessionSent.await(5, TimeUnit.SECONDS))
++                assertTrue("malformed 0x4301 rejection was not diagnosed", rejected.await(3, TimeUnit.SECONDS))
++                assertTrue("malformed 0x4301 must not reach endpoint callback", updates.isEmpty())
++            } finally {
++                phone.close()
++                accessoryChannel.close()
++                pump?.join(2_000)
++                accessoryThread.join(2_000)
++            }
++        }
++    }
++
+     @Test
+     fun addressOnlyLateEndpointKeepsKnownSsidWithoutInventingCredentials() {
+         for (ssidFromExchange in listOf(true, false)) {
+@@ -1233,7 +1371,13 @@ class Iap2SenderSessionTest {
+         private val lateWifiConfigurationAfterMs: Long = -1L,
+         private val earlyAtChallenge: Boolean = false,
+         private val earlyAtHid: Boolean = false,
++        private val malformedStartSessionTail: Boolean = false,
++        private val malformedWirelessGroupTail: Boolean = false,
++        private val duplicateStartSessionPort: Boolean = false,
++        private val malformedLateWifiConfigurationTail: Boolean = false,
+     ) {
++        val startSessionSent = CountDownLatch(1)
++        val lateWifiConfigurationSent = CountDownLatch(1)
+         private val parser = Iap2Csm.Parser()
+         private val pending = ArrayDeque<Iap2Csm.Frame>()
+ 
+@@ -1378,13 +1522,15 @@ class Iap2SenderSessionTest {
+                     // 车机在凭据窗口之后才回 0x5703（旧协议慢响应）。
+                     // 发送端必须解析并交付，不能只当 keep-alive 记长度丢掉。
+                     Thread.sleep(lateWifiConfigurationAfterMs)
+-                    send(
+-                        Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION,
++                    val lateWifiParams = arrayListOf(
+                         Iap2Csm.string(1, wifiConfiguration.ssid),
+                         Iap2Csm.string(2, wifiConfiguration.passphrase),
+                         Iap2Csm.u8(3, wifiConfiguration.securityType),
+                         Iap2Csm.u8(4, wifiConfiguration.channel),
+                     )
++                    if (malformedLateWifiConfigurationTail) lateWifiParams += byteArrayOf(0, 4, 0)
++                    send(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, *lateWifiParams.toTypedArray())
++                    lateWifiConfigurationSent.countDown()
+                 }
+                 return
+             }
+@@ -1536,14 +1682,20 @@ class Iap2SenderSessionTest {
+             wireless += addressParam(3, "192.168.49.1", padTo = 17)
+             wireless += addressParam(3, "fd00::1", padTo = 47)
+             if (completeWirelessAp) wireless += Iap2Csm.u8(4, 2)
+-            send(
+-                Iap2MessageIds.CARPLAY_START_SESSION,
+-                Iap2Csm.group(1, *wireless.toTypedArray()),
++            val wirelessBody =
++                (wireless + if (malformedWirelessGroupTail) listOf(byteArrayOf(0, 4, 0)) else emptyList())
++                    .toTypedArray()
++            val params = arrayListOf(
++                Iap2Csm.group(1, *wirelessBody),
+                 Iap2Csm.u32(2, airPlayPort.toLong()),
+                 Iap2Csm.string(3, "mock-device-id"),
+                 Iap2Csm.string(4, "a".repeat(64) + "publickeyhex"),
+                 Iap2Csm.string(5, "560.20"),
+             )
++            if (duplicateStartSessionPort) params += Iap2Csm.u32(2, (airPlayPort + 1).toLong())
++            if (malformedStartSessionTail) params += byteArrayOf(0, 4, 0)
++            send(Iap2MessageIds.CARPLAY_START_SESSION, *params.toTypedArray())
++            startSessionSent.countDown()
+         }
+ 
+         /** 地址参数：真实车机按定长 NUL 填充；默认（不填充）与之前行为一致。 */
+diff --git a/docs/R55-STRICT-ENDPOINT-TLV.md b/docs/R55-STRICT-ENDPOINT-TLV.md
+new file mode 100644
+index 0000000..d2b9063
+--- /dev/null
++++ b/docs/R55-STRICT-ENDPOINT-TLV.md
+@@ -0,0 +1,22 @@
++# R55 — Strict CSM TLV parsing for endpoint handoff
++
++## Finding
++
++The compatibility `Iap2Csm.parseParams()` parser stops at the first malformed parameter and returns the successfully parsed prefix. That behavior is retained for legacy paths, but R54 still used it for `0x4301` and `0x5703`. A valid prefix followed by a 1–3 byte fragment, an invalid length, or an overrun could therefore be treated as a complete endpoint/credential set. `associateBy` also hid duplicate critical IDs by selecting one value.
++
++## Change
++
++- Add `Iap2Csm.parseParamsStrict()`; it returns an error instead of a partial parameter list for malformed tails and invalid lengths.
++- Optional `uniqueParameterIds` rejects duplicate IDs only for fields whose semantics are singular.
++- Migrate `0x4301`, its nested wireless group, and `0x5703` to strict parsing.
++- Reject duplicate top-level IDs 1–5 and duplicate wireless IDs 0, 1, 2, 4. Wireless ID 3 remains repeatable because existing fixtures encode multiple IP addresses under it.
++- Reject empty `0x4301` parameter streams and explicitly empty nested wireless groups.
++- Initial malformed `0x4301` aborts endpoint handoff. Malformed late `0x4301` is ignored and does not invoke `onEndpointUpdate`.
++
++## Compatibility boundary
++
++The original permissive `parseParams()` remains unchanged for other message paths. This is deliberate: this patch does not silently redefine all existing iAP2 message parsing.
++
++## Verification limits
++
++Focused JVM parser tests and deterministic malformed-input tests are run against the exact production parser source. The Android Gradle suite and `Iap2SenderSessionTest` integration cases require the project Gradle distribution and Android dependencies; they must be run by CI. No MFi cryptographic verification, E2LB root-cause fix, APK build, or real vehicle result is claimed.
+diff --git a/gradlew b/gradlew
+old mode 100644
+new mode 100755

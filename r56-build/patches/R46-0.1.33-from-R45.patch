@@ -1,0 +1,453 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c4ce190..3cd5e7e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,13 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.33-test.1] - 2026-11-26
++
++> R46 candidate; no verified vehicle connection fix.
++
++- Distinguish RFCOMM, iAP2 and CarPlay startup; scope milestones to the originating attempt.
++- 区分蓝牙、iAP2 与 CarPlay 启动，连接里程碑绑定原轮次；不将未验证认证表述为成功。
++
+ ## [v0.1.32-test.1] - 2026-11-26
+ 
+ > R45 experimental candidate based on verified R44 source. No real-vehicle fix claimed.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 735944e..d0e32d7 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.32"
++val appVersionName = "0.1.33"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+index bc03f7c..693ad1f 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+@@ -5,6 +5,7 @@ import com.mcarplay.app.compat.CompatibilityPrefs
+ import com.mcarplay.app.compat.ReceiverDetectionRuntime
+ import com.mcarplay.app.compat.ReceiverObservation
+ import com.mcarplay.app.diagnostics.ConnectionDiagnostics
++import com.mcarplay.app.diagnostics.ConnectionMilestone
+ import com.mcarplay.app.iap2.Iap2SenderSession
+ import com.mcarplay.app.iap2.ReceiverProfile
+ import com.mcarplay.app.transport.Iap2LinkChannel
+@@ -45,8 +46,15 @@ internal fun Iap2LinkChannel.runSenderSession(
+     onSession: (Iap2SenderSession) -> Unit = {},
+     onObservation: (ReceiverObservation?, Boolean) -> Unit = { _, _ -> },
+     unverifiedInvitePending: () -> Boolean = { false },
++    isSessionCurrent: () -> Boolean = { true },
+ ) {
+     val originatingLink = java.lang.ref.WeakReference(this)
++    val attempt = ConnectionDiagnostics.timeline.snapshot()?.id
++    val recordMilestone: (ConnectionMilestone) -> Unit = { milestone ->
++        if (attempt != null && isSessionCurrent() && ReceiverDetectionRuntime.isCurrent(observation)) {
++            ConnectionDiagnostics.timeline.milestone(attempt, milestone)
++        }
++    }
+     val session =
+         Iap2SenderSession(
+             this,
+@@ -67,9 +75,7 @@ internal fun Iap2LinkChannel.runSenderSession(
+             context.applicationContext,
+             receiverBinding = observation?.binding,
+             rememberMfi = !ReceiverDetectionRuntime.collecting(observation),
+-            onMilestone = { milestone ->
+-                if (ReceiverDetectionRuntime.isCurrent(observation)) ConnectionDiagnostics.milestoneCurrent(milestone)
+-            },
++            onMilestone = recordMilestone,
+             unverifiedInvitePending = unverifiedInvitePending,
+             experimentalE2lbDualGroup = CompatibilityPrefs.e2lbDualGroup(context),
+         )
+@@ -78,6 +84,7 @@ internal fun Iap2LinkChannel.runSenderSession(
+     var endpointDelivered = false
+     var failureReason: String? = null
+     try {
++        recordMilestone(ConnectionMilestone.RFCOMM_CONNECTED)
+         val endpoint = session.run(timeoutMillis)
+         onGeneration(session.linkGeneration)
+         if (!ReceiverDetectionRuntime.isCurrent(observation)) return
+diff --git a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt
+index 5dcd38a..d84bbaa 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt
+@@ -825,6 +825,7 @@ class Iap2BluetoothClient(
+                 peerAddress = socket.remoteDevice?.address,
+                 onObservation = { observation, active -> lease.dispatchIfCurrent { onObservation(observation, active) } },
+                 unverifiedInvitePending = unverifiedInvitePending,
++                isSessionCurrent = { lease.isCurrent },
+                 onSession = { session ->
+                     lease.dispatchIfCurrent {
+                         if (activeChannel.get() ===
+diff --git a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt
+index f1269d0..5d7e64f 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt
+@@ -325,6 +325,7 @@ class Iap2BluetoothServer(
+                 observation = observation,
+                 onObservation = { activeObservation, active -> lease.dispatchIfCurrent { onObservation(activeObservation, active) } },
+                 unverifiedInvitePending = unverifiedInvitePending,
++                isSessionCurrent = { lease.isCurrent },
+                 onSession = { session ->
+                     lease.dispatchIfCurrent { synchronized(channelLock) { if (activeChannel === channel) activeSession = session } }
+                 },
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionMilestone.kt b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionMilestone.kt
+index dc531ab..533722d 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionMilestone.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionMilestone.kt
+@@ -11,6 +11,9 @@ package com.mcarplay.app.diagnostics
+ enum class ConnectionMilestone(
+     val stage: ConnectionStage,
+ ) {
++    /** RFCOMM socket 已建立，尚不代表 iAP2 协商完成。 */
++    RFCOMM_CONNECTED(ConnectionStage.BLUETOOTH),
++
+     /** iAP2 链路同步完成（RFCOMM 已通）；可近似对齐艾瑞泽 8 的 TimerThread begin，不是其精确起点。 */
+     BT_LINK(ConnectionStage.BLUETOOTH),
+ 
+@@ -23,6 +26,9 @@ enum class ConnectionMilestone(
+     /** Compatibility signal sent after an unverified response; never proof of authentication. */
+     IAP2_AUTH_SIGNAL_UNVERIFIED(ConnectionStage.BLUETOOTH),
+ 
++    /** 0x4300 已提交链路，不代表 ACK、认证或会话启动。 */
++    CARPLAY_AVAILABILITY_SUBMITTED(ConnectionStage.BLUETOOTH),
++
+     /** 拿到车机明确下发的完整热点配置（0x5703，或 0x4301 自带安全类型/密码）；仅已知 SSID 不算。 */
+     WIFI_CREDENTIALS(ConnectionStage.BLUETOOTH),
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt
+index 29e40db..727f0a9 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionProgress.kt
+@@ -39,7 +39,9 @@ object ConnectionProgress {
+     /** 当前层缺的那一步（只在进行中或失败时给出）。 */
+     enum class Blocker {
+         BT_LINK,
++        IAP2_LINK,
+         IAP2_AUTH,
++        CARPLAY_START,
+         WIFI_INFO,
+         WIFI_JOIN,
+         RECEIVER_DISCOVERY,
+@@ -104,9 +106,12 @@ object ConnectionProgress {
+         when (stage) {
+             ConnectionStage.BLUETOOTH ->
+                 when {
+-                    ConnectionMilestone.BT_LINK !in reached -> Blocker.BT_LINK
++                    ConnectionMilestone.BT_LINK !in reached ->
++                        if (ConnectionMilestone.RFCOMM_CONNECTED in reached) Blocker.IAP2_LINK else Blocker.BT_LINK
+                     ConnectionMilestone.IAP2_AUTHENTICATED !in reached &&
+                         ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED !in reached -> Blocker.IAP2_AUTH
++                    ConnectionMilestone.WIFI_CREDENTIALS !in reached &&
++                        ConnectionMilestone.CARPLAY_AVAILABILITY_SUBMITTED in reached -> Blocker.CARPLAY_START
+                     ConnectionMilestone.WIFI_CREDENTIALS !in reached -> Blocker.WIFI_INFO
+                     else -> null
+                 }
+@@ -134,6 +139,14 @@ object ConnectionProgress {
+             else -> null
+         }
+ 
++    /** Historical evidence, not a live socket check. Never claim that a failed connection is still online. */
++    fun bluetoothWasEstablished(snapshot: ConnectionTimeline.Snapshot): Boolean =
++        ConnectionMilestone.RFCOMM_CONNECTED in snapshot.milestones || ConnectionMilestone.BT_LINK in snapshot.milestones
++
++    fun bluetoothEndedDuringStartup(snapshot: ConnectionTimeline.Snapshot): Boolean =
++        snapshot.stage == ConnectionStage.BLUETOOTH && snapshot.status == "failed" &&
++            snapshot.code == DiagnosticCode.BT_LINK_CLOSED && bluetoothWasEstablished(snapshot)
++
+     /** 进度条各状态的标记字符；未到达的层不加标记。 */
+     fun mark(state: StepState): String =
+         when (state) {
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
+index 0f05dcf..4c04a07 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
+@@ -7,7 +7,7 @@ enum class ConnectionStage(
+     val label: String,
+ ) {
+     PRECHECK("连接准备"),
+-    BLUETOOTH("等待车机蓝牙"),
++    BLUETOOTH("蓝牙 / iAP2 启动"),
+     WIFI("连接车机网络"),
+     DISCOVERY("解析接收端"),
+     PAIRING("AirPlay 配对"),
+@@ -76,7 +76,7 @@ class ConnectionTimeline(
+     private val idFactory: () -> String = { UUID.randomUUID().toString().take(8) },
+     private val sink: (String) -> Unit,
+     private val track: String = "carplay",
+-    private val detailFilter: (String) -> String = DiagnosticRedactor::scrubAtSource,
++    private val detailFilter: (String) -> String = { DiagnosticRedactor.scrubAtSource(it) },
+ ) {
+     data class Snapshot(
+         val id: String,
+@@ -113,7 +113,14 @@ class ConnectionTimeline(
+         fun summary(): String =
+             "会话 $id · ${stage.label} · $statusLabel · ${elapsedMs / 1000}s\n" +
+                 (
+-                    code?.let { "${it.name}：${it.advice}" } ?: when {
++                    code?.let {
++                        val message = if (ConnectionProgress.bluetoothEndedDuringStartup(this)) {
++                            "蓝牙曾成功建立，但启动阶段控制链路已结束；CarPlay 会话尚未建立"
++                        } else {
++                            it.advice
++                        }
++                        "${it.name}：$message"
++                    } ?: when {
+                         screenSuspended ->
+                             "主屏由车机持有，屏幕视频已暂停；等待主屏归还并收到新的关键帧"
+                         status == "streaming" && (lastVideoMsAgo ?: 0) >= 5000 ->
+@@ -420,7 +427,7 @@ class ConnectionTimeline(
+                 .put("sourceVideoFrames", state.sourceFrames)
+                 .put("audioPacketsSent", state.audioPackets)
+         milestone?.let { record.put("milestone", it.name) }
+-        outbox.addLast(Pending(record, detail))
++        outbox.add(Pending(record, detail))
+     }
+ 
+     /** Drains queued records in order. Threads with nothing queued (most frames) never wait on the sink. */
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt b/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
+index af5921f..b792991 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/DiagnosticText.kt
+@@ -83,11 +83,13 @@ object DiagnosticText {
+     ): String =
+         context.getString(
+             when (milestone) {
++                ConnectionMilestone.RFCOMM_CONNECTED -> R.string.ms_rfcomm_connected
+                 ConnectionMilestone.BT_LINK -> R.string.ms_bt_link
+                 ConnectionMilestone.IAP2_IDENTIFIED -> R.string.ms_iap2_identified
+                 ConnectionMilestone.IAP2_AUTHENTICATED,
+                 ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED,
+                 -> R.string.ms_iap2_authenticated
++                ConnectionMilestone.CARPLAY_AVAILABILITY_SUBMITTED -> R.string.ms_carplay_availability_submitted
+                 ConnectionMilestone.WIFI_CREDENTIALS -> R.string.ms_wifi_credentials
+                 ConnectionMilestone.WIFI_JOINED -> R.string.ms_wifi_joined
+                 ConnectionMilestone.CTRL_INVITED -> R.string.ms_ctrl_invited
+@@ -111,6 +113,8 @@ object DiagnosticText {
+         context.getString(
+             when (blocker) {
+                 ConnectionProgress.Blocker.BT_LINK -> R.string.blocker_bt_link
++                ConnectionProgress.Blocker.IAP2_LINK -> R.string.blocker_iap2_link
++                ConnectionProgress.Blocker.CARPLAY_START -> R.string.blocker_carplay_start
+                 ConnectionProgress.Blocker.IAP2_AUTH -> R.string.blocker_iap2_auth
+                 ConnectionProgress.Blocker.WIFI_INFO -> R.string.blocker_wifi_info
+                 ConnectionProgress.Blocker.WIFI_JOIN -> R.string.blocker_wifi_join
+@@ -182,7 +186,14 @@ object DiagnosticText {
+                 else -> snapshot.status
+             }
+         val detail =
+-            snapshot.code?.let { "${it.name}: ${advice(context, it)}" } ?: when {
++            snapshot.code?.let {
++                val message = if (ConnectionProgress.bluetoothEndedDuringStartup(snapshot)) {
++                    context.getString(R.string.dc_bt_startup_ended)
++                } else {
++                    advice(context, it)
++                }
++                "${it.name}: $message"
++            } ?: when {
+                 snapshot.screenSuspended ->
+                     context.getString(R.string.summary_video_paused)
+                 snapshot.status == "streaming" && (snapshot.lastVideoMsAgo ?: 0) >= 5000 ->
+@@ -196,7 +207,11 @@ object DiagnosticText {
+         return context.getString(
+             R.string.summary_header,
+             snapshot.id,
+-            stage(context, snapshot.stage),
++            if (snapshot.stage == ConnectionStage.BLUETOOTH && ConnectionProgress.bluetoothWasEstablished(snapshot)) {
++                context.getString(R.string.stage_iap2_startup)
++            } else {
++                stage(context, snapshot.stage)
++            },
+             status,
+             (snapshot.elapsedMs / 1000).toInt(),
+         ) + "\n" + detail
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index c7b1925..d445105 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -1222,6 +1222,7 @@ class Iap2SenderSession(
+         }
+         log("iap2 0x4300 形态=$availabilityShape (E2LB 实验开关=$experimentalE2lbDualGroup；未证实车机已接受)")
+         carPlayAvailabilitySent = true
++        reached(ConnectionMilestone.CARPLAY_AVAILABILITY_SUBMITTED)
+         log("iap2 0x4300 已提交链路发送（awaitAck=false）；尚无证据证明车机应用层认可或已开启 CarPlay")
+     }
+ 
+diff --git a/app/src/main/res/values-en/strings_diag.xml b/app/src/main/res/values-en/strings_diag.xml
+index 36d3f75..3dd1efe 100644
+--- a/app/src/main/res/values-en/strings_diag.xml
++++ b/app/src/main/res/values-en/strings_diag.xml
+@@ -31,7 +31,7 @@
+     <string name="dc_user_stop">Stopped by the user, not a connection fault</string>
+     <string name="dc_superseded">A new connection attempt replaced the previous one</string>
+     <string name="stage_precheck">Preparing</string>
+-    <string name="stage_bluetooth">Waiting for head-unit Bluetooth</string>
++    <string name="stage_bluetooth">Bluetooth / iAP2 startup</string>
+     <string name="stage_wifi">Joining the car network</string>
+     <string name="stage_discovery">Resolving the receiver</string>
+     <string name="stage_pairing">AirPlay pairing</string>
+@@ -50,7 +50,7 @@
+     <string name="summary_source_only">CarWith video received, but no frame has been sent to the receiver yet</string>
+     <string name="summary_waiting_carwith">Still waiting for the first CarWith frame; check the factory permissions and export a report</string>
+     <string name="summary_default">If something goes wrong, export a diagnostic report and note what the receiver showed</string>
+-    <string name="step_bluetooth">Bluetooth</string>
++    <string name="step_bluetooth">Bluetooth/iAP2</string>
+     <string name="step_wifi">Wi-Fi</string>
+     <string name="step_discovery">Discover</string>
+     <string name="step_pairing">Pair</string>
+@@ -79,9 +79,9 @@
+     <string name="progress_blocker_failed">Stopped at: %1$s</string>
+     <string name="progress_head_unit_window">No session after 30 s: the receiver may have reset this attempt; wait a moment or reconnect</string>
+     <string name="progress_head_unit_window_arrizo8">No session after 30 s: the Arrizo 8 head unit resets and starts again at this point, so wait a moment</string>
+-    <string name="blocker_bt_link">Waiting for the head unit\'s Bluetooth link (iAP2 not up)</string>
++    <string name="blocker_bt_link">No RFCOMM connection observed</string>
+     <string name="blocker_iap2_auth">Bluetooth is up; iAP2 identification or authentication is not finished</string>
+-    <string name="blocker_wifi_info">iAP2 authenticated; waiting for the head unit\'s hotspot details</string>
++    <string name="blocker_wifi_info">Waiting for hotspot details (authentication not established by this evidence)</string>
+     <string name="blocker_wifi_join">Joining the head unit\'s hotspot</string>
+     <string name="blocker_receiver_discovery">On the car network; waiting for the head unit\'s invite or AirPlay announcement</string>
+     <string name="blocker_receiver_address">Invite received; resolving the AirPlay address</string>
+@@ -92,4 +92,10 @@
+     <string name="blocker_carwith_frame">Session active; waiting for the first CarWith frame</string>
+     <string name="language_note">Logs and diagnostic reports stay in Chinese so developers can compare them.</string>
+     <string name="dc_bt_identity_required">Tap Connect and enter the phone Bluetooth address once, or read it with Shizuku</string>
++    <string name="dc_bt_startup_ended">Bluetooth was established, but the startup control link ended before the CarPlay session started</string>
++    <string name="stage_iap2_startup">iAP2 / CarPlay startup</string>
++    <string name="ms_rfcomm_connected">RFCOMM connection established earlier</string>
++    <string name="ms_carplay_availability_submitted">0x4300 submitted (receiver acceptance unconfirmed)</string>
++    <string name="blocker_iap2_link">RFCOMM was established; iAP2 negotiation unfinished</string>
++    <string name="blocker_carplay_start">0x4300 submitted; CarPlay startup or endpoint delivery unfinished</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings_diag.xml b/app/src/main/res/values/strings_diag.xml
+index bcc777b..845eb05 100644
+--- a/app/src/main/res/values/strings_diag.xml
++++ b/app/src/main/res/values/strings_diag.xml
+@@ -31,7 +31,7 @@
+     <string name="dc_user_stop">用户主动停止，非连接故障</string>
+     <string name="dc_superseded">新的连接尝试替代了上一轮</string>
+     <string name="stage_precheck">连接准备</string>
+-    <string name="stage_bluetooth">等待车机蓝牙</string>
++    <string name="stage_bluetooth">蓝牙 / iAP2 启动</string>
+     <string name="stage_wifi">连接车机网络</string>
+     <string name="stage_discovery">解析接收端</string>
+     <string name="stage_pairing">AirPlay 配对</string>
+@@ -50,7 +50,7 @@
+     <string name="summary_source_only">已收到 CarWith 视频，尚未向接收端发出视频帧</string>
+     <string name="summary_waiting_carwith">仍在等待 CarWith 首帧，请检查原厂授权并导出报告</string>
+     <string name="summary_default">遇到问题请导出诊断报告，并补充接收端当时的提示</string>
+-    <string name="step_bluetooth">蓝牙</string>
++    <string name="step_bluetooth">蓝牙/iAP2</string>
+     <string name="step_wifi">入网</string>
+     <string name="step_discovery">发现</string>
+     <string name="step_pairing">配对</string>
+@@ -79,9 +79,9 @@
+     <string name="progress_blocker_failed">停在：%1$s</string>
+     <string name="progress_head_unit_window">已超过 30 s 仍未建立会话：接收端可能已重置本次尝试，可稍候或重新连接</string>
+     <string name="progress_head_unit_window_arrizo8">已超过 30 s 仍未建立会话：艾瑞泽 8 车机此时会自行重置并重新发起，可稍候</string>
+-    <string name="blocker_bt_link">等待车机蓝牙连入（iAP2 链路未建立）</string>
++    <string name="blocker_bt_link">尚未观察到 RFCOMM 蓝牙连接</string>
+     <string name="blocker_iap2_auth">蓝牙已连，iAP2 识别/认证未完成</string>
+-    <string name="blocker_wifi_info">iAP2 已认证，等待车机下发热点信息</string>
++    <string name="blocker_wifi_info">等待车机下发热点信息（认证状态未由此确认）</string>
+     <string name="blocker_wifi_join">正在加入车机热点</string>
+     <string name="blocker_receiver_discovery">已入网，等待车机 ctrl 邀请或 AirPlay 公告</string>
+     <string name="blocker_receiver_address">已收到车机邀请，正在确定 AirPlay 地址</string>
+@@ -92,4 +92,10 @@
+     <string name="blocker_carwith_frame">会话已激活，等待 CarWith 首帧</string>
+     <string name="language_note">日志和诊断报告保持中文，便于开发者对照。</string>
+     <string name="dc_bt_identity_required">点「启动连接」填写一次本机蓝牙地址，或启动 Shizuku 读取</string>
++    <string name="dc_bt_startup_ended">蓝牙曾成功建立，但启动阶段控制链路已结束；CarPlay 会话尚未建立</string>
++    <string name="stage_iap2_startup">iAP2 / CarPlay 启动</string>
++    <string name="ms_rfcomm_connected">RFCOMM 蓝牙曾建立</string>
++    <string name="ms_carplay_availability_submitted">0x4300 已提交（未确认车机接受）</string>
++    <string name="blocker_iap2_link">RFCOMM 曾建立，iAP2 协商未完成</string>
++    <string name="blocker_carplay_start">0x4300 已提交，CarPlay 启动或端点交付未完成</string>
+ </resources>
+diff --git a/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionProgressTest.kt b/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionProgressTest.kt
+index 37cee9c..ebf7c10 100644
+--- a/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionProgressTest.kt
++++ b/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionProgressTest.kt
+@@ -209,4 +209,56 @@ class ConnectionProgressTest {
+         timeline.begin("receiver")
+         assertEquals("STAGE_DURATIONS PRECHECK=0ms*\nMILESTONES none", ConnectionProgress.reportLines(timeline.snapshot()!!))
+     }
++    @Test
++    fun rfcommConnectedButIap2Failed() {
++        val id = timeline.begin("receiver")
++        timeline.stage(id, ConnectionStage.BLUETOOTH)
++        timeline.milestone(id, M.RFCOMM_CONNECTED)
++        timeline.finish(id, DiagnosticCode.BT_LINK_CLOSED, true)
++        assertEquals(Blocker.IAP2_LINK, progress()!!.blocker)
++        assertTrue(ConnectionProgress.bluetoothEndedDuringStartup(timeline.snapshot()!!))
++        assertTrue(timeline.snapshot()!!.summary().contains("蓝牙曾成功建立"))
++    }
++
++    @Test
++    fun threeStartupFailuresDoNotBecomeMissingBluetooth() {
++        repeat(3) {
++            val id = timeline.begin("receiver")
++            timeline.stage(id, ConnectionStage.BLUETOOTH)
++            assertEquals(Blocker.BT_LINK, progress()!!.blocker)
++            timeline.milestone(id, M.RFCOMM_CONNECTED)
++            timeline.milestone(id, M.BT_LINK)
++            timeline.milestone(id, M.IAP2_IDENTIFIED)
++            timeline.milestone(id, M.IAP2_AUTH_SIGNAL_UNVERIFIED)
++            assertEquals(Blocker.WIFI_INFO, progress()!!.blocker)
++            timeline.milestone(id, M.CARPLAY_AVAILABILITY_SUBMITTED)
++            timeline.finish(id, DiagnosticCode.BT_LINK_CLOSED, true)
++            val snapshot = timeline.snapshot()!!
++            assertEquals(Blocker.CARPLAY_START, progress()!!.blocker)
++            assertTrue(ConnectionProgress.bluetoothEndedDuringStartup(snapshot))
++            assertFalse(M.IAP2_AUTHENTICATED in snapshot.milestones)
++            assertFalse(M.WIFI_CREDENTIALS in snapshot.milestones)
++        }
++    }
++
++    @Test
++    fun lateMilestoneCannotMarkNewAttempt() {
++        val old = timeline.begin("old")
++        val fresh = timeline.begin("fresh")
++        timeline.stage(fresh, ConnectionStage.BLUETOOTH)
++        timeline.milestone(old, M.RFCOMM_CONNECTED)
++        timeline.milestone(old, M.CARPLAY_AVAILABILITY_SUBMITTED)
++        assertEquals(Blocker.BT_LINK, progress()!!.blocker)
++        assertFalse(ConnectionProgress.bluetoothWasEstablished(timeline.snapshot()!!))
++    }
++
++    @Test
++    fun wifiFailureRemainsWifiFailure() {
++        val id = timeline.begin("receiver")
++        timeline.milestone(id, M.BT_LINK)
++        timeline.stage(id, ConnectionStage.WIFI)
++        timeline.finish(id, DiagnosticCode.WIFI_JOIN_FAILED, true)
++        assertEquals(Blocker.WIFI_JOIN, progress()!!.blocker)
++        assertFalse(ConnectionProgress.bluetoothEndedDuringStartup(timeline.snapshot()!!))
++    }
+ }
+diff --git a/docs/R46-BLUETOOTH-STATUS.md b/docs/R46-BLUETOOTH-STATUS.md
+new file mode 100644
+index 0000000..ca572e9
+--- /dev/null
++++ b/docs/R46-BLUETOOTH-STATUS.md
+@@ -0,0 +1,12 @@
++# R46 / 0.1.33 — Bluetooth startup status and attempt isolation
++
++Baseline: R45 candidate based on R44 source artifact 15014496262 / commit 9bc86ce53237b83c23e588e6fa2c7376cca99381. The reported R44 log shows three RFCOMM connections, iAP2 link readiness and unverified MFi responses, then 0x4300 with no observed cumulative ACK, followed by fresh SYN and termination. It does not prove the receiver's reason for restarting.
++
++Changes:
++- Record RFCOMM establishment separately from iAP2 synchronization; record 0x4300 submission without implying local write, ACK or peer authorization.
++- Bluetooth milestone callbacks now carry the original timeline attempt ID and check the session lease. Late events cannot mark a replacement timeline as connected.
++- Localized progress and terminal status distinguish missing RFCOMM, unfinished iAP2 negotiation, and CarPlay startup/endpoint delivery. Historical evidence does not imply the socket remains online. Removed misleading authentication-success wording.
++- Use equivalent lambda and FIFO append syntax for the local Kotlin compiler.
++- No changes to authentication policy, on-wire messages, probe timings, or reconnect limits. No claim that E2LB now accepts 0x4300.
++
++Validation: 16 ConnectionProgressTest cases passed with standalone Kotlin/JVM, minimal JUnit-compatible harness and nonserializing JSONObject stub. This tests in-memory state, not Android resource packaging, Bluetooth callbacks on a device, or diagnostic JSON serialization. Chinese/English resource XML and referenced string IDs checked. Prior R45 51 transport tests are historical and not rerun in this round. Full Android build unavailable locally; no APK, no vehicle validation, no remote repository mutation.

@@ -1,0 +1,301 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f615065..748d60e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,28 @@
+ # Changelog
+ 
++## [v0.1.43-test.1] - 2026-11-27
++
++> R56 strict IP-literal validation for AirPlay endpoint candidates. This prevents hostnames and malformed numeric strings from being treated as receiver IP addresses; it does not claim to fix the E2LB vehicle startup failure.
++
++### English
++- Replace the permissive dotted-string IPv4 check with strict four-octet decimal validation (0..255); reject DNS names, malformed octets, ambiguous leading-zero forms and IPv4 strings with scopes.
++- Replace prefix-only IPv6 detection with strict IPv6 literal parsing, including single-compression validation, exact group counts, IPv4-embedded tails and validated ASCII interface scopes.
++- Classify IPv6 link-local addresses using the actual `fe80::/10` prefix after successful parsing.
++- Ensure endpoint candidate ordering, unspecified-address detection and `/64` network checks operate only on valid IP literals and never perform DNS lookups.
++- Add regressions for hostnames passing the previous IPv4 heuristic, out-of-range octets, malformed IPv6 compression, invalid scopes, IPv4-mapped IPv6, and the `fe80::/10` boundary.
++- Focused exact-source tests: 19 passed; deterministic property checks: 25,000 generated IPv4 literals, 25,000 generated IPv6 literals and 100,000 arbitrary strings without parser exceptions. Full Android Gradle build and real-vehicle behavior remain unverified.
++
++### 简体中文
++- 将宽松的点分字符串 IPv4 判断替换为严格四段十进制校验（每段 0..255）；拒绝 DNS 域名、非法数字段、有歧义的前导零形式及带 scope 的 IPv4。
++- 将仅检查冒号的 IPv6 判断替换为严格字面量解析，校验唯一压缩段、准确组数、IPv4 嵌入尾段及合法 ASCII 网卡 scope。
++- IPv6 链路本地判断改为在地址解析成功后按真实 `fe80::/10` 前缀判断。
++- 端点候选排序、未指定地址判断及 `/64` 网络校验只接受合法 IP 字面量，不执行 DNS 查询。
++- 新增域名误判、IPv4 越界、IPv6 多重压缩、非法 scope、IPv4-mapped IPv6 及 `fe80::/10` 边界回归测试。
++- 精确源码聚焦测试 19 项通过；确定性属性检查覆盖 25,000 个 IPv4、25,000 个 IPv6 和 100,000 个任意字符串，未出现解析异常。完整 Android Gradle 编译及实车行为仍未验证。
++
++Full changes / 完整变更: [v0.1.42-test.1...v0.1.43-test.1](https://github.com/1092679281/Android-/compare/v0.1.42-test.1...v0.1.43-test.1)
++
++
+ ## [v0.1.42-test.1] - 2026-11-27
+ 
+ > R55 strict CSM TLV parsing for 0x4301 and 0x5703 endpoint data. This is parser hardening, not evidence of a vehicle connection fix.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 2b39a1d..55e37e5 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.42"
++val appVersionName = "0.1.43"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/net/EndpointHosts.kt b/app/src/main/java/com/mcarplay/app/net/EndpointHosts.kt
+index 8221118..94b5e6d 100644
+--- a/app/src/main/java/com/mcarplay/app/net/EndpointHosts.kt
++++ b/app/src/main/java/com/mcarplay/app/net/EndpointHosts.kt
+@@ -15,18 +15,28 @@ package com.mcarplay.app.net
+  * 同一个地址的带/不带 scope 形式视为重复，只保留先出现的。
+  */
+ object EndpointHosts {
+-    fun isIpv4(host: String): Boolean = host.contains('.') && !host.contains(':')
++    /** Strict dotted-decimal IPv4 literal check. Never treats a DNS name as an IP address. */
++    fun isIpv4(host: String): Boolean {
++        if (host.isEmpty() || '%' in host || ':' in host) return false
++        val parts = host.split('.')
++        if (parts.size != 4) return false
++        return parts.all { part ->
++            part.isNotEmpty() &&
++                part.length <= 3 &&
++                part.all { it in '0'..'9' } &&
++                // Reject ambiguous octal-looking forms; endpoint addresses are canonical decimal.
++                (part.length == 1 || part[0] != '0') &&
++                (part.toIntOrNull() ?: 256) in 0..255
++        }
++    }
+ 
+-    fun isIpv6(host: String): Boolean = host.contains(':')
++    /** Strict IPv6 literal check, including an optional validated interface scope. */
++    fun isIpv6(host: String): Boolean = parseIpv6Groups(host) != null
+ 
+     fun isLinkLocalIpv6(host: String): Boolean {
+-        val normalized = host.substringBefore('%').lowercase()
+-        return normalized.startsWith("fe80:") ||
+-            normalized == "fe80" ||
+-            normalized.startsWith("fe8") ||
+-            normalized.startsWith("fe9") ||
+-            normalized.startsWith("fea") ||
+-            normalized.startsWith("feb")
++        val groups = parseIpv6Groups(host) ?: return false
++        val first = groups.first().toInt(16)
++        return first and 0xffc0 == 0xfe80
+     }
+ 
+     /** 去掉 `%wlan0` / `%3` 这类 scope 后缀。 */
+@@ -46,15 +56,15 @@ object EndpointHosts {
+         fun add(host: String) {
+             val trimmed = host.trim()
+             if (trimmed.isEmpty()) return
++            if (!isIpv4(trimmed) && !isIpv6(trimmed)) return
+             val base = stripScope(trimmed)
+-            if (base.isEmpty()) return
+-            if (!isIpv4(base) && !isIpv6(base)) return
+             val key = base.lowercase()
+             if (seen.add(key)) out += trimmed
+         }
+-        addresses.filter(::isIpv4).forEach(::add)
+-        addresses.filter { isIpv6(it) && !isLinkLocalIpv6(it) }.forEach(::add)
+-        addresses.filter(::isLinkLocalIpv6).forEach(::add)
++        val normalized = addresses.map(String::trim)
++        normalized.filter(::isIpv4).forEach(::add)
++        normalized.filter { isIpv6(it) && !isLinkLocalIpv6(it) }.forEach(::add)
++        normalized.filter(::isLinkLocalIpv6).forEach(::add)
+         return out
+     }
+ 
+@@ -70,9 +80,9 @@ object EndpointHosts {
+ 
+     /** `0.0.0.0` 或 `::`（任意写法、可带 scope）。 */
+     fun isUnspecified(host: String): Boolean {
+-        val base = stripScope(host.trim())
+-        if (isIpv4(base)) return base.split('.').let { parts -> parts.size == 4 && parts.all { it.toIntOrNull() == 0 } }
+-        return expandIpv6(base)?.all { it == "0000" } == true
++        val trimmed = host.trim()
++        if (isIpv4(trimmed)) return trimmed.split('.').all { it.toIntOrNull() == 0 }
++        return parseIpv6Groups(trimmed)?.all { it == "0000" } == true
+     }
+ 
+     /**
+@@ -100,31 +110,79 @@ object EndpointHosts {
+ 
+     /** IPv6 的前 64 位（前 4 组 hextet，展开后比较；解析失败返回 null）。 */
+     fun ipv6Prefix64(host: String): String? {
+-        val groups = expandIpv6(stripScope(host)) ?: return null
++        val groups = parseIpv6Groups(host) ?: return null
+         return groups.take(4).joinToString(":")
+     }
+ 
+-    /** 把 IPv6 文本展开为 8 组（处理 `::` 压缩），返回小写 hextet 列表。 */
+-    private fun expandIpv6(host: String): List<String>? {
+-        if (!host.contains(':')) return null
+-        val doubleColon = host.indexOf("::")
+-        val head: List<String>
+-        val tail: List<String>
+-        if (doubleColon >= 0) {
+-            head = host.substring(0, doubleColon).split(':').filter { it.isNotEmpty() }
+-            tail = host.substring(doubleColon + 2).split(':').filter { it.isNotEmpty() }
++    /**
++     * Parse an IPv6 literal into eight canonical hextets without DNS resolution.
++     * Supports one optional scope suffix and an IPv4-embedded tail.
++     */
++    private fun parseIpv6Groups(host: String): List<String>? {
++        if (host.isEmpty()) return null
++        val percent = host.indexOf('%')
++        val address: String
++        if (percent >= 0) {
++            if (percent == 0 || percent != host.lastIndexOf('%')) return null
++            val scope = host.substring(percent + 1)
++            val validScope =
++                scope.isNotEmpty() &&
++                    scope.all {
++                        it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' ||
++                            it == '_' || it == '-' || it == '.'
++                    }
++            if (!validScope) return null
++            address = host.substring(0, percent)
+         } else {
+-            head = host.split(':')
+-            tail = emptyList()
++            address = host
++        }
++        if (':' !in address) return null
++        if (
++            address.any {
++                !(it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' || it == ':' || it == '.')
++            }
++        ) {
++            return null
++        }
++        if (address.contains(":::")) return null
++
++        val compressedAt = address.indexOf("::")
++        if (compressedAt >= 0 && compressedAt != address.lastIndexOf("::")) return null
++        val hasIpv4Tail = '.' in address
++        if (hasIpv4Tail) {
++            val tail = address.substringAfterLast(':', missingDelimiterValue = address)
++            // IPv4-embedded IPv6 must place a valid dotted quad after the final colon.
++            if (!isIpv4(tail)) return null
++        }
++
++        fun parseSide(side: String): List<String>? {
++            if (side.isEmpty()) return emptyList()
++            val tokens = side.split(':')
++            if (tokens.any { it.isEmpty() }) return null
++            val out = ArrayList<String>(tokens.size + 1)
++            tokens.forEachIndexed { index, token ->
++                if ('.' in token) {
++                    if (index != tokens.lastIndex || !isIpv4(token)) return null
++                    val octets = token.split('.').map { it.toInt() }
++                    out += ((octets[0] shl 8) or octets[1]).toString(16).padStart(4, '0')
++                    out += ((octets[2] shl 8) or octets[3]).toString(16).padStart(4, '0')
++                } else {
++                    if (token.length !in 1..4 || token.any { it.digitToIntOrNull(16) == null }) return null
++                    out += token.lowercase().padStart(4, '0')
++                }
++            }
++            return out
+         }
+-        if (head.size + tail.size > 8) return null
+-        val fill = 8 - head.size - tail.size
+-        val groups = ArrayList<String>(8)
+-        groups += head
+-        repeat(fill) { groups += "0" }
+-        groups += tail
+-        if (groups.size != 8) return null
+-        if (groups.any { it.length > 4 || it.any { c -> c.digitToIntOrNull(16) == null } }) return null
+-        return groups.map { it.lowercase().padStart(4, '0') }
++
++        if (compressedAt >= 0) {
++            val left = parseSide(address.substring(0, compressedAt)) ?: return null
++            val right = parseSide(address.substring(compressedAt + 2)) ?: return null
++            val missing = 8 - left.size - right.size
++            if (missing < 1) return null
++            return left + List(missing) { "0000" } + right
++        }
++
++        val groups = parseSide(address) ?: return null
++        return groups.takeIf { it.size == 8 }
+     }
+ }
+diff --git a/app/src/test/java/com/mcarplay/app/net/EndpointHostsTest.kt b/app/src/test/java/com/mcarplay/app/net/EndpointHostsTest.kt
+index 782fed7..8eb042c 100644
+--- a/app/src/test/java/com/mcarplay/app/net/EndpointHostsTest.kt
++++ b/app/src/test/java/com/mcarplay/app/net/EndpointHostsTest.kt
+@@ -107,6 +107,73 @@ class EndpointHostsTest {
+         assertFalse(EndpointHosts.isSameNetwork("2001:db8:1:2::5", "10.0.0.2"))
+     }
+ 
++    @Test
++    fun ipv4ValidationRejectsHostnamesAndOutOfRangeOctets() {
++        assertTrue(EndpointHosts.isIpv4("10.174.189.1"))
++        assertTrue(EndpointHosts.isIpv4("0.0.0.0"))
++        assertFalse(EndpointHosts.isIpv4("car.example.com"))
++        assertFalse(EndpointHosts.isIpv4("999.999.999.999"))
++        assertFalse(EndpointHosts.isIpv4("10.174.189"))
++        assertFalse(EndpointHosts.isIpv4("10.174.189.1.example"))
++        assertFalse(EndpointHosts.isIpv4("010.0.0.1"))
++        assertFalse(EndpointHosts.isIpv4("10.0.0.1%wlan0"))
++    }
++
++    @Test
++    fun candidatesRejectDnsNamesAndMalformedIpLiterals() {
++        assertEquals(
++            listOf("10.0.0.1", "2001:db8::1", "fe80::1%wlan0"),
++            EndpointHosts.candidates(
++                listOf(
++                    "car.example.com",
++                    "999.1.1.1",
++                    "10.0.0.1",
++                    "2001:db8::1",
++                    "fe80::1%wlan0",
++                    "2001:::1",
++                    "1::2::3",
++                ),
++            ),
++        )
++    }
++
++    @Test
++    fun ipv6ValidationRejectsMalformedCompressionAndScopes() {
++        assertTrue(EndpointHosts.isIpv6("::"))
++        assertTrue(EndpointHosts.isIpv6("2001:db8::1"))
++        assertTrue(EndpointHosts.isIpv6("::ffff:192.0.2.1"))
++        assertTrue(EndpointHosts.isIpv6("fe80::1%wlan0"))
++        assertFalse(EndpointHosts.isIpv6(":::"))
++        assertFalse(EndpointHosts.isIpv6("1::2::3"))
++        assertFalse(EndpointHosts.isIpv6("1:2:3:4:5:6:7:8:9"))
++        assertFalse(EndpointHosts.isIpv6("fe80::1%"))
++        assertFalse(EndpointHosts.isIpv6("fe80::1%wlan0%2"))
++        assertFalse(EndpointHosts.isIpv6("fe80::1%wlan0!"))
++        assertFalse(EndpointHosts.isIpv6("fe80::1%włan0"))
++    }
++
++    @Test
++    fun linkLocalDetectionUsesTheIpv6Fe80Slash10Prefix() {
++        assertTrue(EndpointHosts.isLinkLocalIpv6("fe80::1"))
++        assertTrue(EndpointHosts.isLinkLocalIpv6("fe9f::1"))
++        assertTrue(EndpointHosts.isLinkLocalIpv6("febf::1"))
++        assertFalse(EndpointHosts.isLinkLocalIpv6("fec0::1"))
++        assertFalse(EndpointHosts.isLinkLocalIpv6("fe80-not-an-ip"))
++    }
++
++    @Test
++    fun hostnameCannotPassSameNetworkFilterWithoutLocalIpv4() {
++        assertFalse(EndpointHosts.isSameNetwork("receiver.example.com", null))
++        assertFalse(EndpointHosts.isSameNetwork("999.999.999.999", null))
++        assertTrue(EndpointHosts.isSameNetwork("10.174.189.1", null))
++    }
++
++    @Test
++    fun ipv4MappedIpv6PrefixIsParsedWithoutDns() {
++        assertEquals("0000:0000:0000:0000", EndpointHosts.ipv6Prefix64("::ffff:192.0.2.1"))
++        assertNull(EndpointHosts.ipv6Prefix64("1::2::3"))
++    }
++
+     @Test
+     fun ipv6Prefix64ExpandsCompressedForms() {
+         assertEquals("2001:0db8:0001:0002", EndpointHosts.ipv6Prefix64("2001:db8:1:2::5"))

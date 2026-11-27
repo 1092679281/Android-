@@ -1,0 +1,521 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5cb94fc..717a241 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,15 @@
+ # Changelog
+ 
++## [v0.1.35-test.1] - 2026-11-26
++
++> R48 hardening candidate. AirPlay identity verification now fails closed without a verified receiver key; no E2LB vehicle fix claimed.
++
++- Require an authenticated receiver identity from pair-setup M6 before first pair-verify; reject unpinned 403 fallback and missing/invalid static keys.
++- Do not mark pair-setup complete when M6 lacks a valid encrypted receiver identity.
++- Ignore stale video-success callbacks when clearing per-receiver automatic reconnect failures.
++- pair-verify 首次验证必须取得并校验 M6 接收端身份；缺失/无效公钥或无本地信任的 403 降级一律失败关闭。
++- M6 未返回有效加密身份时不再报告配对完成；旧连接迟到的视频回调不得清除新一轮熔断计数。
++
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 3bfe124..11bb0d4 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.34"
++val appVersionName = "0.1.35"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt b/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
+index 90bc04c..e755dc4 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/AirPlayClient.kt
+@@ -407,11 +407,12 @@ class AirPlayClient(
+                             pairings.remove(pairingEndpoint, identity.pairingId)
+                         },
+                         onSetupComplete = { milestone(ConnectionMilestone.PAIR_SETUP) },
++                        onSetupIdentity = { receiver -> pairings.save(pairingEndpoint, identity.pairingId, receiver) },
+                     )
+                 val remembered = pairings.load(pairingEndpoint, identity.pairingId)
+                 val result = handshake.run(remembered, pairingEndpoint.publicKey?.let(::hexToBytes))
+                 if (cancelled) return null
+-                result.receiver?.let { pairings.save(pairingEndpoint, identity.pairingId, it) }
++                pairings.save(pairingEndpoint, identity.pairingId, result.receiver)
+                 val keys = result.keys
+                 // pair-verify 之后双方立即启用加密（接收端在 M4 应答后开启）
+                 cipher = ControlCipher(keys.phoneReadKey, keys.phoneWriteKey)
+@@ -424,6 +425,12 @@ class AirPlayClient(
+                     return null
+                 }
+                 val message = error.message.orEmpty()
++                if (error is UntrustedReceiverIdentityException) {
++                    pairingForbidden = true
++                    log("AIRPLAY: 接收端身份无法建立可信验证链——停止配对重试，不降级明文：$message")
++                    close()
++                    return null
++                }
+                 // verify/认证段的 403 与 pair-setup 403 同源（车机信任已建立），
+                 // 见 pairingForbidden 注释：标记后主控不再断 BT / 不降级明文
+                 if (message.contains("403")) pairingForbidden = true
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt b/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt
+index 1279c87..1875d10 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt
+@@ -27,8 +27,8 @@ class PairSetupClient(
+     private val transport: TlvTransport,
+     private val log: (String) -> Unit,
+ ) {
+-    /** 完成后接收端已保存我们的长期公钥；返回接收端静态身份（来自 M6，可选用）。 */
+-    fun run(): ReceiverIdentity? {
++    /** 完成后接收端已保存我们的长期公钥；M6 必须返回并验证接收端静态身份。 */
++    fun run(): ReceiverIdentity {
+         // M1: 请求 SRP 参数（Method=None + State=1，对照 catplay PairSetup::start）。
+         // B 首字节为 0 时补零/去零两种编码不同，接收端用哪种无从得知（见 Srp6aClient）：
+         // 尚未提交证明，重发 M1 换一个 B 不消耗接收端的失败计数。
+@@ -125,17 +125,28 @@ class PairSetupClient(
+                     ),
+                 ),
+             )
+-        log("pair-setup: ✓ M6 完成，接收端已保存我们的长期公钥")
++        log("pair-setup: M6 已收到；正在验证接收端加密身份信封")
+ 
+         // 解析 M6 加密信封里的接收端身份（完整性校验）
+-        val encrypted = m6[Tlv8.TYPE_ENCRYPTED_DATA] ?: return null
++        val encrypted = m6[Tlv8.TYPE_ENCRYPTED_DATA]
++            ?: throw UntrustedReceiverIdentityException("pair-setup M6 缺少加密身份信封；拒绝把配对标记为完成")
+         val inner =
+-            Tlv8.decode(
+-                AirPlayCrypto.chachaOpen(encryptionKey, AirPlayCrypto.nonceLabel("PS-Msg06"), encrypted),
+-            )
+-        val receiverId = inner[Tlv8.TYPE_IDENTIFIER] ?: return null
+-        val receiverKey = inner[Tlv8.TYPE_PUBLIC_KEY] ?: return null
+-        val receiverSignature = inner[Tlv8.TYPE_SIGNATURE] ?: return null
++            try {
++                Tlv8.decode(
++                    AirPlayCrypto.chachaOpen(encryptionKey, AirPlayCrypto.nonceLabel("PS-Msg06"), encrypted),
++                )
++            } catch (error: Exception) {
++                throw UntrustedReceiverIdentityException("pair-setup M6 接收端身份信封认证失败：${error.javaClass.simpleName}")
++            }
++        val receiverId = inner[Tlv8.TYPE_IDENTIFIER]
++            ?.takeIf { it.isNotEmpty() }
++            ?: throw UntrustedReceiverIdentityException("pair-setup M6 缺少接收端 identifier")
++        val receiverKey = inner[Tlv8.TYPE_PUBLIC_KEY]
++            ?.takeIf { it.size == 32 }
++            ?: throw UntrustedReceiverIdentityException("pair-setup M6 接收端 Ed25519 公钥长度无效")
++        val receiverSignature = inner[Tlv8.TYPE_SIGNATURE]
++            ?.takeIf { it.size == 64 }
++            ?: throw UntrustedReceiverIdentityException("pair-setup M6 接收端签名长度无效")
+         val accessorySignKey =
+             AirPlayCrypto.hkdfSha512(
+                 sessionKey,
+@@ -148,7 +159,8 @@ class PairSetupClient(
+                 accessorySignKey + receiverId + receiverKey,
+                 receiverSignature,
+             )
+-        if (!valid) throw IOException("pair-setup: 接收端签名校验失败")
++        if (!valid) throw UntrustedReceiverIdentityException("pair-setup: 接收端签名校验失败")
++        log("pair-setup: ✓ M6 接收端身份与签名已验证")
+         log(
+             "pair-setup: 接收端身份 id=${receiverId.toString(Charsets.UTF_8)} " +
+                 "pub=${receiverKey.toHexString().take(16)}… 签名校验=$valid",
+@@ -183,9 +195,11 @@ class PairVerifyClient(
+     )
+ 
+     fun run(
+-        receiverStaticPublicKey: ByteArray? = null,
++        receiverStaticPublicKey: ByteArray?,
+         expectedReceiverId: String? = null,
+     ): ControlKeys {
++        // 在发送任何网络请求前要求可信静态身份；缺失时不能降级成“只解密临时信封”。
++        val trustedReceiverKey = requireTrustedReceiverStaticPublicKey(receiverStaticPublicKey)
+         // M1: 临时 X25519 公钥
+         val ephemeral = AirPlayCrypto.x25519Generate()
+         val m2 =
+@@ -213,26 +227,28 @@ class PairVerifyClient(
+                 "Pair-Verify-Encrypt-Info".toByteArray(),
+             )
+         val inner =
+-            Tlv8.decode(
+-                AirPlayCrypto.chachaOpen(encryptionKey, AirPlayCrypto.nonceLabel("PV-Msg02"), encrypted),
+-            )
++            try {
++                Tlv8.decode(
++                    AirPlayCrypto.chachaOpen(encryptionKey, AirPlayCrypto.nonceLabel("PV-Msg02"), encrypted),
++                )
++            } catch (error: Exception) {
++                throw UntrustedReceiverIdentityException("pair-verify M2 接收端身份信封认证失败：${error.javaClass.simpleName}")
++            }
+         val receiverId = inner[Tlv8.TYPE_IDENTIFIER] ?: throw IOException("pair-verify M2 信封缺少 identifier")
+         val receiverSignature = inner[Tlv8.TYPE_SIGNATURE] ?: throw IOException("pair-verify M2 信封缺少 signature")
+         if (expectedReceiverId != null && receiverId.toString(Charsets.UTF_8) != expectedReceiverId) {
+             throw IOException("pair-verify: 接收端身份与已保存配对不符")
+         }
+ 
+-        // 用 mDNS/0x4301 提供的接收端静态公钥验证（有则验，无则跳过）
+-        if (receiverStaticPublicKey != null) {
+-            val valid =
+-                AirPlayCrypto.ed25519Verify(
+-                    receiverStaticPublicKey,
+-                    receiverEphemeral + receiverId + ephemeral.publicKey,
+-                    receiverSignature,
+-                )
+-            log("pair-verify: 接收端签名校验（对照 pk）=$valid")
+-            if (!valid) throw IOException("pair-verify: 接收端签名校验失败")
+-        }
++        // 必须验证接收端静态身份签名；不能因 mDNS/0x4301 未提供公钥而跳过。
++        val valid =
++            AirPlayCrypto.ed25519Verify(
++                trustedReceiverKey,
++                receiverEphemeral + receiverId + ephemeral.publicKey,
++                receiverSignature,
++            )
++        log("pair-verify: 接收端静态身份签名校验=$valid")
++        if (!valid) throw UntrustedReceiverIdentityException("pair-verify: 接收端签名校验失败")
+ 
+         // M3: 我们的长期签名
+         val identifierBytes = identity.pairingId.toByteArray(Charsets.UTF_8)
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/PairingHandshake.kt b/app/src/main/java/com/mcarplay/app/airplay/PairingHandshake.kt
+index d61e18d..172dba9 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/PairingHandshake.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/PairingHandshake.kt
+@@ -28,12 +28,14 @@ internal class PairingHandshake(
+     private val log: (String) -> Unit,
+     private val onSetupForbidden: () -> Unit = {},
+     private val onTrustInvalidated: () -> Unit = {},
+-    /** pair-setup 完成（M6 通过）；复用已保存信任或 403 后直接 verify 时不调用。 */
++    /** pair-setup M6 的接收端身份信封及签名均验证成功后调用；失败时不调用。 */
+     private val onSetupComplete: () -> Unit = {},
++    /** M6 身份验证后、pair-verify 前调用；确保 verify 暂时失败时本地仍保存已验证信任。 */
++    private val onSetupIdentity: (PairSetupClient.ReceiverIdentity) -> Unit = {},
+ ) {
+     data class Result(
+         val keys: PairVerifyClient.ControlKeys,
+-        val receiver: PairSetupClient.ReceiverIdentity?,
++        val receiver: PairSetupClient.ReceiverIdentity,
+     )
+ 
+     fun run(
+@@ -54,20 +56,26 @@ internal class PairingHandshake(
+         log("PAIRING: stage=SETUP reuse=false")
+         val receiver =
+             try {
+-                PairSetupClient(identity, transport(), log).run().also { onSetupComplete() }
++                PairSetupClient(identity, transport(), log).run()
+             } catch (error: IOException) {
+                 if (!error.message.orEmpty().contains("403")) throw error
+                 onSetupForbidden()
+-                log("PAIRING: pair-setup 被 403 拒绝——换新连接尝试 pair-verify")
+-                reconnect()
+-                return Result(verify(advertisedKey, null), null)
++                // pair-setup 403 只说明接收端拒绝注册；本地没有已保存的静态身份时，
++                // mDNS/0x4301 的广播公钥不是信任锚，不能拿它直接完成 pair-verify。
++                log("PAIRING: pair-setup 被 403 拒绝且本地无已保存接收端身份——拒绝使用未固定广播公钥降级验证")
++                throw UntrustedReceiverIdentityException("pair-setup 403：缺少已保存的接收端信任身份，拒绝未验证 pair-verify")
+             }
++        onSetupIdentity(receiver)
++        onSetupComplete()
++        if (advertisedKey != null && advertisedKey.size == 32 && !advertisedKey.contentEquals(receiver.publicKey)) {
++            log("PAIRING: 广播公钥与 pair-setup M6 已验证公钥不一致——忽略广播公钥，以 M6 身份为准")
++        }
+         log("PAIRING: stage=VERIFY reuse=false")
+-        return Result(verify(receiver?.publicKey ?: advertisedKey, receiver?.pairingId), receiver)
++        return Result(verify(receiver.publicKey, receiver.pairingId), receiver)
+     }
+ 
+     private fun verify(
+-        publicKey: ByteArray?,
++        publicKey: ByteArray,
+         receiverId: String?,
+     ): PairVerifyClient.ControlKeys = PairVerifyClient(identity, transport(), log).run(publicKey, receiverId)
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt b/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt
+new file mode 100644
+index 0000000..898c9ac
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt
+@@ -0,0 +1,17 @@
++package com.mcarplay.app.airplay
++
++import java.io.IOException
++
++/** 身份信任链不完整或验证失败：不能通过重试/明文降级绕过。 */
++internal class UntrustedReceiverIdentityException(message: String) : IOException(message)
++
++/** pair-verify 必须持有已配对或经 pair-setup M6 验证的接收端静态 Ed25519 公钥。 */
++internal fun requireTrustedReceiverStaticPublicKey(key: ByteArray?): ByteArray {
++    if (key == null) {
++        throw UntrustedReceiverIdentityException("pair-verify: 缺少可信接收端静态公钥；拒绝跳过身份签名验证")
++    }
++    if (key.size != 32) {
++        throw UntrustedReceiverIdentityException("pair-verify: 接收端静态 Ed25519 公钥长度无效")
++    }
++    return key.copyOf()
++}
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/Srp6aClient.kt b/app/src/main/java/com/mcarplay/app/airplay/Srp6aClient.kt
+index 6223e03..f4b7cd9 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/Srp6aClient.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/Srp6aClient.kt
+@@ -16,6 +16,20 @@ import java.security.SecureRandom
+  * 直到 A 与 S 都是满 [KEY_BYTES] 字节；B 由接收端决定，满长与否见 [isFullLength]，不满时调用方重新取 M2。
+  */
+ object Srp6aClient {
++    /** RFC 5054 3072-bit 素数（与参考实现一致）。 */
++    private const val N_HEX =
++        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74" +
++            "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437" +
++            "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
++            "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF05" +
++            "98DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB" +
++            "9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B" +
++            "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183" +
++            "995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A" +
++            "85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7AB" +
++            "F5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D8" +
++            "7602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208" +
++            "E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF"
+     private val random = SecureRandom()
+     internal val n = BigInteger(N_HEX, 16)
+     internal val g: BigInteger = BigInteger.valueOf(5)
+@@ -122,18 +136,4 @@ object Srp6aClient {
+     /** 每次重选私钥失败率约 2/256，16 次后仍不满长的概率可忽略；用尽时沿用最后一组。 */
+     private const val MAX_KEY_ATTEMPTS = 16
+ 
+-    /** RFC 5054 3072-bit 素数（与参考实现一致）。 */
+-    private const val N_HEX =
+-        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74" +
+-            "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437" +
+-            "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED" +
+-            "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF05" +
+-            "98DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB" +
+-            "9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B" +
+-            "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183" +
+-            "995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A" +
+-            "85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7AB" +
+-            "F5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D8" +
+-            "7602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208" +
+-            "E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF"
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/bt/AutoReconnectGuard.kt b/app/src/main/java/com/mcarplay/app/bt/AutoReconnectGuard.kt
+index 4e3dc39..8e23224 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/AutoReconnectGuard.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/AutoReconnectGuard.kt
+@@ -1,6 +1,7 @@
+ package com.mcarplay.app.bt
+ 
+ import android.content.Context
++import com.mcarplay.app.diagnostics.ConnectionDiagnostics
+ import com.mcarplay.app.diagnostics.DiagnosticCode
+ import org.json.JSONObject
+ import java.util.Locale
+@@ -332,6 +333,10 @@ internal object AutoReconnectGuard {
+     ) {
+         // 不知道是哪台车机出画时不能清空任何计数。
+         val peer = address?.takeIf { it.isNotBlank() } ?: return
++        // 编码器/网络线程可能在会话退役后迟到回调。旧轮次的首帧不能清除新轮次
++        // 已累计的失败，否则三轮快速失败的熔断会被过期成功事件意外重置。
++        val current = ConnectionDiagnostics.timeline.snapshot()
++        if (!isCurrentHealthyReconnectAttempt(attempt, current?.id, current?.videoFrames ?: 0L)) return
+         val states = read(context)
+         val next = store.recordHealthy(states, peer)
+         if (next != states) write(context, next)
+diff --git a/app/src/main/java/com/mcarplay/app/bt/ReconnectAttemptPolicy.kt b/app/src/main/java/com/mcarplay/app/bt/ReconnectAttemptPolicy.kt
+new file mode 100644
+index 0000000..de7bcd7
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/bt/ReconnectAttemptPolicy.kt
+@@ -0,0 +1,11 @@
++package com.mcarplay.app.bt
++
++/** 只有产生视频帧的当前诊断轮次才能清除该接收端的连续失败熔断。 */
++internal fun isCurrentHealthyReconnectAttempt(
++    attempt: String?,
++    currentAttempt: String?,
++    videoFrames: Long,
++): Boolean =
++    !attempt.isNullOrBlank() &&
++        attempt == currentAttempt &&
++        videoFrames > 0L
+diff --git a/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt b/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt
+index 63e9968..31c1346 100644
+--- a/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt
++++ b/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt
+@@ -202,7 +202,127 @@ class AirPlayPairingTest {
+     fun badSetupSignatureIsRejected() {
+         val receiver = MockReceiver(badSetupSignature = true)
+         val transport = TlvTransport { path, body -> receiver.handle(path, body) }
+-        assertThrows(IOException::class.java) { PairSetupClient(newIdentity(), transport) {}.run() }
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairSetupClient(newIdentity(), transport) {}.run()
++        }
++    }
++
++    @Test
++    fun pairVerifyRequiresTrustedStaticKeyBeforeAnyNetworkRequest() {
++        val requests = mutableListOf<String>()
++        val transport = TlvTransport { path, _ ->
++            requests += path
++            error("pair-verify must reject missing trust before network I/O")
++        }
++        val identity = newIdentity()
++        val client = PairVerifyClient(identity, transport) {}
++
++        assertThrows(UntrustedReceiverIdentityException::class.java) { client.run(null) }
++        assertThrows(UntrustedReceiverIdentityException::class.java) { client.run(ByteArray(31)) }
++        assertTrue("untrusted pair-verify must not send M1", requests.isEmpty())
++    }
++
++    @Test
++    fun pairSetupM6WithoutAuthenticatedReceiverIdentityIsNotComplete() {
++        val receiver = MockReceiver()
++        val transport = TlvTransport { path, body ->
++            val response = receiver.handle(path, body)
++            val state = Tlv8.decode(body)[Tlv8.TYPE_STATE]?.firstOrNull()?.toInt()?.and(0xFF)
++            if (path == "/pair-setup" && state == 5) {
++                val decoded = Tlv8.decode(response)
++                Tlv8.encode(listOf(Tlv8.Item(Tlv8.TYPE_STATE, decoded.getValue(Tlv8.TYPE_STATE))))
++            } else {
++                response
++            }
++        }
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairSetupClient(newIdentity(), transport) {}.run()
++        }
++    }
++
++    @Test
++    fun setupForbiddenCannotFallbackToUnpinnedAdvertisedKey() {
++        val requests = mutableListOf<String>()
++        var forbidden = 0
++        var reconnects = 0
++        val transport = TlvTransport { path, _ ->
++            requests += path
++            throw IOException("HTTP 403 Forbidden")
++        }
++        val handshake =
++            PairingHandshake(
++                newIdentity(),
++                { transport },
++                { reconnects++ },
++                {},
++                onSetupForbidden = { forbidden++ },
++            )
++        val advertisedKey = AirPlayCrypto.ed25519Generate().publicKey
++
++        assertThrows(UntrustedReceiverIdentityException::class.java) { handshake.run(null, advertisedKey) }
++        assertEquals(listOf("/pair-setup"), requests)
++        assertEquals(1, forbidden)
++        assertEquals(0, reconnects)
++    }
++
++    @Test
++    fun verifiedSetupIdentityIsPersistedBeforePairVerifyCanFail() {
++        val receiver = MockReceiver()
++        val requests = mutableListOf<String>()
++        val transport = TlvTransport { path, body ->
++            requests += path
++            if (path == "/pair-verify") throw IOException("temporary verify transport failure")
++            receiver.handle(path, body)
++        }
++        val saved = mutableListOf<PairSetupClient.ReceiverIdentity>()
++        val handshake =
++            PairingHandshake(
++                newIdentity(),
++                { transport },
++                {},
++                {},
++                onSetupIdentity = { saved += it },
++            )
++
++        assertThrows(IOException::class.java) { handshake.run(null, null) }
++        assertEquals("M6 identity must be saved before pair-verify", 1, saved.size)
++        assertEquals(receiver.pairingId, saved.single().pairingId)
++        assertArrayEquals(receiver.staticKey.publicKey, saved.single().publicKey)
++        assertEquals("/pair-verify", requests.last())
++    }
++
++    @Test
++    fun setupCompletionCallbackWaitsForAuthenticatedM6Identity() {
++        val receiver = MockReceiver()
++        val transport = TlvTransport { path, body ->
++            val response = receiver.handle(path, body)
++            val state = Tlv8.decode(body)[Tlv8.TYPE_STATE]?.firstOrNull()?.toInt()?.and(0xFF)
++            if (path == "/pair-setup" && state == 5) {
++                val decoded = Tlv8.decode(response)
++                Tlv8.encode(listOf(Tlv8.Item(Tlv8.TYPE_STATE, decoded.getValue(Tlv8.TYPE_STATE))))
++            } else {
++                response
++            }
++        }
++        var completed = 0
++        val handshake = PairingHandshake(newIdentity(), { transport }, {}, {}, onSetupComplete = { completed++ })
++
++        assertThrows(UntrustedReceiverIdentityException::class.java) { handshake.run(null, null) }
++        assertEquals("M6 without a verified receiver identity is not setup completion", 0, completed)
++    }
++
++    @Test
++    fun pairSetupM6IdentityRemainsAuthoritativeOverAdvertisedKey() {
++        val receiver = MockReceiver()
++        val transport = TlvTransport { path, body -> receiver.handle(path, body) }
++        val logs = mutableListOf<String>()
++        val handshake = PairingHandshake(newIdentity(), { transport }, {}, { logs += it })
++        val mismatchedAdvertisement = AirPlayCrypto.ed25519Generate().publicKey
++
++        val result = handshake.run(null, mismatchedAdvertisement)
++        assertEquals(receiver.pairingId, result.receiver.pairingId)
++        assertArrayEquals(receiver.staticKey.publicKey, result.receiver.publicKey)
++        assertTrue(logs.any { it.contains("广播公钥与 pair-setup M6") })
+     }
+ 
+     @Test
+@@ -211,7 +331,9 @@ class AirPlayPairingTest {
+         val transport = TlvTransport { path, body -> receiver.handle(path, body) }
+         val identity = newIdentity()
+         assertThrows(IOException::class.java) { PairVerifyClient(identity, transport) {}.run(receiver.staticKey.publicKey, "other-id") }
+-        assertThrows(IOException::class.java) { PairVerifyClient(identity, transport) {}.run(newIdentity().publicKey, receiver.pairingId) }
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(identity, transport) {}.run(newIdentity().publicKey, receiver.pairingId)
++        }
+     }
+ 
+     @Test
+diff --git a/app/src/test/java/com/mcarplay/app/bt/ReconnectAttemptPolicyTest.kt b/app/src/test/java/com/mcarplay/app/bt/ReconnectAttemptPolicyTest.kt
+new file mode 100644
+index 0000000..681e886
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/bt/ReconnectAttemptPolicyTest.kt
+@@ -0,0 +1,28 @@
++package com.mcarplay.app.bt
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ReconnectAttemptPolicyTest {
++    @Test
++    fun currentAttemptWithVideoFramesCanClearFailureHistory() {
++        assertTrue(isCurrentHealthyReconnectAttempt("attempt-2", "attempt-2", 1L))
++    }
++
++    @Test
++    fun lateVideoFromRetiredAttemptCannotClearNewAttemptFailures() {
++        assertFalse(isCurrentHealthyReconnectAttempt("attempt-1", "attempt-2", 1L))
++    }
++
++    @Test
++    fun noFramesCannotClearFailureHistory() {
++        assertFalse(isCurrentHealthyReconnectAttempt("attempt-2", "attempt-2", 0L))
++    }
++
++    @Test
++    fun missingAttemptCannotClearFailureHistory() {
++        assertFalse(isCurrentHealthyReconnectAttempt(null, "attempt-2", 1L))
++        assertFalse(isCurrentHealthyReconnectAttempt("", "attempt-2", 1L))
++    }
++}

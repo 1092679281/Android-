@@ -1,0 +1,362 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bf38142..048c258 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,24 @@
+ # Changelog
+ 
++## [v0.1.38-test.1] - 2026-11-26
++
++> R51 receiver-scoped E2LB fallback isolation. This prevents missing receiver bindings from sharing persistent A/B state; it does not claim to fix the E2LB vehicle connection.
++
++### English
++- Persist the E2LB 0x4300 SINGLE_GROUP fallback only when the receiver has a validated, stable app-private HMAC binding.
++- Do not read or write per-receiver fallback state when the receiver configuration store is not ready or the binding is missing/malformed; keep the explicitly selected wire shape for the current attempt.
++- Validate persisted E2LB fingerprint keys before using them as SharedPreferences keys.
++- Add regression tests for missing, malformed, and distinct receiver bindings.
++- Validation: 10 focused `ReceiverFingerprint` / E2LB fallback-policy test methods and 1 SharedPreferences persistence/reset harness check passed; `git diff --check` passed. The Gradle gate could not start because `services.gradle.org` DNS resolution failed; no Android SDK is configured.
++- Full Android build and real-vehicle behavior remain unverified.
++
++### 简体中文
++- 只有取得经过格式校验的本机 HMAC 接收端实例绑定，才持久化 E2LB 0x4300 的 SINGLE_GROUP 自动回退。
++- 接收端配置存储尚未就绪、绑定缺失或格式错误时，不读取或写入按车机隔离的回退状态；本轮仍遵循用户明确选择的报文形态。
++- 使用 SharedPreferences 前校验 E2LB 指纹键格式。
++- 新增接收端绑定缺失、畸形及不同实例隔离的回归测试。
++- 完整 Android 编译与实车行为仍未验证。
++
+ ## [v0.1.37-test.1] - 2026-11-26
+ 
+ > R50 E2LB 0x4300 A/B recovery candidate. The automatic fallback is triggered only by a written DUAL_GROUP request followed by a peer-initiated iAP2 restart before 0x4301; it does not prove causation or claim a vehicle fix.
+diff --git a/IMPLEMENTATION_PLAN.md b/IMPLEMENTATION_PLAN.md
+index dafc869..a01d23d 100644
+--- a/IMPLEMENTATION_PLAN.md
++++ b/IMPLEMENTATION_PLAN.md
+@@ -1,11 +1,13 @@
+ # mcarplay：CarWith 转无线 CarPlay 实施计划
+ 
+-更新：2026-11-10。目标是在小米手机上取得 CarWith 的真实画面、声音和触控，再由 mcarplay 充当 CarPlay 手机端，连接支持无线 CarPlay 的车机。
++更新：2026-11-26。目标是在小米手机上取得 CarWith 的真实画面、声音和触控，再由 mcarplay 充当 CarPlay 手机端，连接支持无线 CarPlay 的车机。
+ 
+ 首版完成范围为：手机内手动发起连接、CarWith 画面、车机扬声器声音、车机触控回传。自动重连、车机麦克风、通话和语音上行不作为首版承诺。未在真实车机验证前，不声明任何车型“已适配”。
+ 
+ ## 当前基线与结论
+ 
++- **11 月 26 日 R51 E2LB 回退隔离加固（离线候选，未上车）：** R50 在接收端私有配置存储尚未加载、或本轮没有有效 Bluetooth 实例绑定时，仍会把空 binding 与接收端能力摘要组合成持久化指纹；相同能力画像的不同 E2LB 实例可能共享 SINGLE_GROUP 回退状态。R51 改为仅接受 `ReceiverConfigurationStore` 生成的 64 位小写 HMAC binding，并校验持久化键格式；无稳定 binding 时遵循本轮用户选择，但不读写跨轮回退。新增绑定缺失/畸形/不同实例隔离测试。该修改不证明 DUAL_GROUP 是 SYN 重启根因，也未解决 MFi、0x4300/0x4301 实车启动；完整 Android 门禁、APK 与实车验收仍待完成。详见 `docs/R51-E2LB-FALLBACK-BINDING-ISOLATION.md`。
++
+ - **11 月 14 日 issue #62 诊断补充（仅离线验证，未上车，未改协议行为）：** 奔驰 MB_E-P-4（AirPlay 480.7.4，2025 款 GLC）报告链路全通、CarWith 透传 1392 帧 / 109 s，车机却无画面、点 CarPlay 图标无反应。报告里三条线索此前只能靠「缺席」推断：`/info` 的 `displays[0]`（1278 高）与 `displayPanels[0].initialVideoStreams`（1728 高）几何冲突、`modesChanged` 应答恒为 42B `{}`、MIB3 突发后车机零订阅。本次只新增三类诊断（显示表面对照、模式切换应答归类计数、MIB3 订阅观察），**未**按面板几何改协商、也**未**改 `modesChanged` 时序——两者都需实车对照。详见 `docs/CARWITH-ENTRY-FINDINGS.md`。已通过新增 JVM 单测与本地门禁；无设备或实车证据。
+ 
+ - **11 月 13 日 v0.1.7-test.1 测试预览（已建 tag，触发签名发布；仅门禁与离线验证）：** 汇总 11 月 12 日合入的 #45（重进 CarPlay 音频/输入、DiPlay 0.2.22 `/feedback` 500、自动播放改用 CarWith 硬按键、断链崩溃、Android 14+ Wi-Fi 低延迟）、#47 的重构 Phase 0 护栏测试与 `tools/compare_diagnostics.py`、#48（重连 Wi-Fi 交接与 iAP2 重新协商）、#52（自动重连断路器）、#53（通知使用权入口），以及 #57（奔驰 MB_D-PP 单次 RECORD、仅视频选择在自动回连时保留、音频拆链间隔归因）。四接收端 DiPlay、WinPlay、macplay、艾瑞泽 8 未在本构建上回归；#45 仅有 2026-11-06 一次 `0.1.6-debug` 观察，#57 的证据来自 #55 车主报告，其余改动无设备验证。已通过 1050 项 standard JVM 测试、25 项 remote 调试桥测试、87 项 Python 工具测试、20 项 Node debug-bridge 测试，以及 Spotless、standard lint/debug、`lintStandardRelease` 构建；未使用设备或实车。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index ec50bc7..d85391f 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.37"
++val appVersionName = "0.1.38"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt b/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
+index a48fda0..d83c018 100644
+--- a/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
++++ b/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
+@@ -84,7 +84,7 @@ object CompatibilityPrefs {
+         context: Context,
+         receiverFingerprint: String?,
+     ): Boolean {
+-        if (receiverFingerprint.isNullOrBlank()) return false
++        if (!ReceiverFingerprint.isE2lbAvailabilityFingerprint(receiverFingerprint)) return false
+         return context
+             .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+             .getBoolean(KEY_E2LB_DUAL_GROUP_FALLBACK_PREFIX + receiverFingerprint, false)
+@@ -95,6 +95,7 @@ object CompatibilityPrefs {
+         context: Context,
+         receiverFingerprint: String,
+     ): Boolean {
++        if (!ReceiverFingerprint.isE2lbAvailabilityFingerprint(receiverFingerprint)) return false
+         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+         if (!prefs.getBoolean(KEY_E2LB_DUAL_GROUP, false)) return false
+         prefs.edit().putBoolean(KEY_E2LB_DUAL_GROUP_FALLBACK_PREFIX + receiverFingerprint, true).apply()
+diff --git a/app/src/main/java/com/mcarplay/app/compat/ReceiverDetection.kt b/app/src/main/java/com/mcarplay/app/compat/ReceiverDetection.kt
+index 5f95e48..dee2b32 100644
+--- a/app/src/main/java/com/mcarplay/app/compat/ReceiverDetection.kt
++++ b/app/src/main/java/com/mcarplay/app/compat/ReceiverDetection.kt
+@@ -38,11 +38,30 @@ data class LocalReceiverConfiguration(
+ 
+ /** 只对稳定的协议事实取摘要；地址、动态端口、设备显示名不参与能力判定。 */
+ object ReceiverFingerprint {
++    private val STABLE_BINDING = Regex("[a-f0-9]{64}")
++    private val E2LB_AVAILABILITY_FINGERPRINT = Regex("e2lb4300_[a-f0-9]{64}")
++
+     fun digest(values: List<String>): String {
+         val input = values.joinToString("") { "${it.length}:$it" }.toByteArray(Charsets.UTF_8)
+         return MessageDigest.getInstance("SHA-256").digest(input).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+     }
+ 
++    /**
++     * Persistent E2LB experiment memory must be scoped to the app's HMAC-bound receiver instance.
++     * A missing binding (for example, before the private receiver store finishes loading) must
++     * never collapse unrelated receivers onto the same fingerprint derived from an empty string.
++     */
++    fun e2lbAvailabilityFingerprint(
++        binding: String?,
++        signals: ReceiverProfile.Signals,
++    ): String? {
++        val stableBinding = binding?.takeIf(STABLE_BINDING::matches) ?: return null
++        return "e2lb4300_" + digest(listOf(stableBinding) + identity(signals))
++    }
++
++    fun isE2lbAvailabilityFingerprint(value: String?): Boolean =
++        value != null && E2LB_AVAILABILITY_FINGERPRINT.matches(value)
++
+     fun identity(signals: ReceiverProfile.Signals): List<String> =
+         listOf(
+             signals.model.normalized(),
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt b/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+index a50cfa2..7cacabf 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+@@ -1,5 +1,6 @@
+ package com.mcarplay.app.iap2
+ 
++import com.mcarplay.app.compat.ReceiverFingerprint
+ import java.util.Locale
+ 
+ /**
+@@ -47,6 +48,19 @@ internal object E2lbAvailabilityBodyPolicy {
+  * the DUAL_GROUP body caused the peer restart.
+  */
+ internal object E2lbAvailabilityFallbackPolicy {
++    fun shouldUseRememberedSingleGroup(
++        isE2lb: Boolean,
++        experimentEnabled: Boolean,
++        contextAvailable: Boolean,
++        receiverFingerprint: String?,
++        remembered: Boolean,
++    ): Boolean =
++        isE2lb &&
++            experimentEnabled &&
++            contextAvailable &&
++            ReceiverFingerprint.isE2lbAvailabilityFingerprint(receiverFingerprint) &&
++            remembered
++
+     fun shouldFallbackToSingleGroup(
+         isE2lb: Boolean,
+         shape: E2lbAvailabilityBodyPolicy.Shape?,
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index a8e286f..3268121 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -1226,16 +1226,31 @@ class Iap2SenderSession(
+      */
+     private fun sendCarPlayAvailability() {
+         if (carPlayAvailabilitySent) return
+-        val receiverFingerprint =
+-            "e2lb4300_" + ReceiverFingerprint.digest(
+-                listOf(receiverBinding.orEmpty()) + ReceiverFingerprint.identity(receiverSignals),
+-            )
++        // Persistent fallback is only safe when the private receiver store supplied its stable
++        // HMAC binding. Never derive a persistent key from an empty/missing binding: two identical
++        // E2LB units could otherwise share one experiment result before the store is ready.
++        val receiverFingerprint = ReceiverFingerprint.e2lbAvailabilityFingerprint(receiverBinding, receiverSignals)
+         availabilityReceiverFingerprint = receiverFingerprint
+-        val autoFallback =
+-            isE2lb() &&
+-                experimentalE2lbDualGroup &&
+-                context != null &&
++        val rememberedFallback =
++            if (context != null && ReceiverFingerprint.isE2lbAvailabilityFingerprint(receiverFingerprint)) {
+                 CompatibilityPrefs.e2lbSingleGroupFallbackFor(context, receiverFingerprint)
++            } else {
++                false
++            }
++        val autoFallback =
++            E2lbAvailabilityFallbackPolicy.shouldUseRememberedSingleGroup(
++                isE2lb = isE2lb(),
++                experimentEnabled = experimentalE2lbDualGroup,
++                contextAvailable = context != null,
++                receiverFingerprint = receiverFingerprint,
++                remembered = rememberedFallback,
++            )
++        if (isE2lb() && experimentalE2lbDualGroup && receiverFingerprint == null) {
++            log(
++                "E2LB 0x4300：本机接收端实例绑定尚不可用，本轮保留用户选择的报文形态，" +
++                    "但不读取或持久化跨轮自动回退",
++            )
++        }
+         val useDualGroup = experimentalE2lbDualGroup && !autoFallback
+         val selectedShape =
+             E2lbAvailabilityBodyPolicy.select(
+diff --git a/app/src/test/java/com/mcarplay/app/compat/ReceiverFingerprintTest.kt b/app/src/test/java/com/mcarplay/app/compat/ReceiverFingerprintTest.kt
+new file mode 100644
+index 0000000..128a6de
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/compat/ReceiverFingerprintTest.kt
+@@ -0,0 +1,67 @@
++package com.mcarplay.app.compat
++
++import com.mcarplay.app.iap2.ReceiverProfile
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ReceiverFingerprintTest {
++    private val signals =
++        ReceiverProfile.Signals(
++            model = "E2LB",
++            manufacturer = "General Motors",
++            firmwareVersion = "1.2.3",
++            srcvers = "480.7.4",
++            features = 1L,
++            sendIds = setOf(0x4301, 0x5703),
++            receiveIds = setOf(0x4300, 0x5702),
++            externalAccessoryProtocols = setOf("com.apple.carplay"),
++        )
++
++    @Test
++    fun missingOrMalformedBindingCannotCreatePersistentFallbackFingerprint() {
++        assertNull(ReceiverFingerprint.e2lbAvailabilityFingerprint(null, signals))
++        assertNull(ReceiverFingerprint.e2lbAvailabilityFingerprint("", signals))
++        assertNull(ReceiverFingerprint.e2lbAvailabilityFingerprint("02:11:22:33:44:55", signals))
++        assertNull(ReceiverFingerprint.e2lbAvailabilityFingerprint("a".repeat(63), signals))
++        assertNull(ReceiverFingerprint.e2lbAvailabilityFingerprint("g".repeat(64), signals))
++    }
++
++    @Test
++    fun missingBindingDoesNotRecreateTheLegacySharedFingerprint() {
++        val legacyKey = "e2lb4300_" + ReceiverFingerprint.digest(listOf("") + ReceiverFingerprint.identity(signals))
++        assertTrue(ReceiverFingerprint.isE2lbAvailabilityFingerprint(legacyKey))
++        assertNull(ReceiverFingerprint.e2lbAvailabilityFingerprint(null, signals))
++    }
++
++    @Test
++    fun stablePrivateBindingProducesValidDeterministicFingerprint() {
++        val binding = "a".repeat(64)
++        val first = ReceiverFingerprint.e2lbAvailabilityFingerprint(binding, signals)
++        val second = ReceiverFingerprint.e2lbAvailabilityFingerprint(binding, signals)
++        assertNotNull(first)
++        assertEquals(first, second)
++        assertTrue(ReceiverFingerprint.isE2lbAvailabilityFingerprint(first))
++    }
++
++    @Test
++    fun differentReceiverBindingsNeverShareFallbackFingerprint() {
++        val first = ReceiverFingerprint.e2lbAvailabilityFingerprint("a".repeat(64), signals)
++        val second = ReceiverFingerprint.e2lbAvailabilityFingerprint("b".repeat(64), signals)
++        assertNotNull(first)
++        assertNotNull(second)
++        assertFalse(first == second)
++    }
++
++    @Test
++    fun fingerprintValidatorRejectsRawAddressAndMalformedKeys() {
++        assertFalse(ReceiverFingerprint.isE2lbAvailabilityFingerprint(null))
++        assertFalse(ReceiverFingerprint.isE2lbAvailabilityFingerprint(""))
++        assertFalse(ReceiverFingerprint.isE2lbAvailabilityFingerprint("e2lb4300_" + "a".repeat(63)))
++        assertFalse(ReceiverFingerprint.isE2lbAvailabilityFingerprint("e2lb4300_" + "g".repeat(64)))
++        assertFalse(ReceiverFingerprint.isE2lbAvailabilityFingerprint("e2lb4300_02:11:22:33:44:55"))
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt
+index 0ff001b..0afecbd 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt
+@@ -25,6 +25,60 @@ class E2lbAvailabilityFallbackPolicyTest {
+         start,
+     )
+ 
++    @Test
++    fun missingOrInvalidBindingCannotActivateRememberedFallback() {
++        assertFalse(
++            E2lbAvailabilityFallbackPolicy.shouldUseRememberedSingleGroup(
++                isE2lb = true,
++                experimentEnabled = true,
++                contextAvailable = true,
++                receiverFingerprint = null,
++                remembered = true,
++            ),
++        )
++        assertFalse(
++            E2lbAvailabilityFallbackPolicy.shouldUseRememberedSingleGroup(
++                isE2lb = true,
++                experimentEnabled = true,
++                contextAvailable = true,
++                receiverFingerprint = "e2lb4300_invalid",
++                remembered = true,
++            ),
++        )
++    }
++
++    @Test
++    fun rememberedFallbackRequiresE2lbOptInAndValidReceiverFingerprint() {
++        val fingerprint = "e2lb4300_" + "a".repeat(64)
++        assertTrue(
++            E2lbAvailabilityFallbackPolicy.shouldUseRememberedSingleGroup(
++                isE2lb = true,
++                experimentEnabled = true,
++                contextAvailable = true,
++                receiverFingerprint = fingerprint,
++                remembered = true,
++            ),
++        )
++        assertFalse(
++            E2lbAvailabilityFallbackPolicy.shouldUseRememberedSingleGroup(
++                isE2lb = false,
++                experimentEnabled = true,
++                contextAvailable = true,
++                receiverFingerprint = fingerprint,
++                remembered = true,
++            ),
++        )
++        assertFalse(
++            E2lbAvailabilityFallbackPolicy.shouldUseRememberedSingleGroup(
++                isE2lb = true,
++                experimentEnabled = false,
++                contextAvailable = true,
++                receiverFingerprint = fingerprint,
++                remembered = true,
++            ),
++        )
++    }
++
+     @Test
+     fun onlyWrittenDualGroupFollowedByPeerRestartTriggersFallback() {
+         assertTrue(shouldFallback())
+diff --git a/docs/R51-E2LB-FALLBACK-BINDING-ISOLATION.md b/docs/R51-E2LB-FALLBACK-BINDING-ISOLATION.md
+new file mode 100644
+index 0000000..00d797f
+--- /dev/null
++++ b/docs/R51-E2LB-FALLBACK-BINDING-ISOLATION.md
+@@ -0,0 +1,26 @@
++# R51 — E2LB fallback binding isolation
++
++## Finding
++
++R50 built the persistent fallback key from `receiverBinding.orEmpty()` plus receiver capability identity. `ReceiverDetectionRuntime.binding(address)` returns null until the private `ReceiverConfigurationStore` has loaded, and also returns null for an unavailable/invalid Bluetooth address. In that case, two receiver instances reporting the same normalized capabilities would derive the same persistent fingerprint from the empty binding. This violates the stated per-receiver isolation guarantee.
++
++## Change
++
++- `ReceiverFingerprint.e2lbAvailabilityFingerprint()` now requires the 64-character lowercase HMAC binding produced by `ReceiverConfigurationStore.binding()`.
++- `Iap2SenderSession` reads and stores fallback state only when that stable binding exists.
++- With no stable binding, R51 preserves the user's explicitly selected DUAL_GROUP/SINGLE_GROUP shape for the current attempt but does not read or persist cross-attempt automatic fallback state.
++- `CompatibilityPrefs` validates the exact `e2lb4300_<64 lowercase hex>` key shape on both read and write.
++- No raw Bluetooth address, display name, or untrusted string is used as a preference key.
++
++## Regression coverage
++
++- null, blank, raw MAC, short digest and non-hex binding are rejected;
++- a valid private binding yields a deterministic E2LB fingerprint;
++- two distinct bindings with identical receiver capabilities produce distinct fingerprints;
++- malformed fingerprint values are rejected by the key validator;
++- the pure fallback-selection policy refuses to activate a remembered fallback without E2LB opt-in, context, and a valid receiver fingerprint;
++- a fake SharedPreferences integration harness verifies malformed-key rejection, valid persistence, and manual-toggle reset.
++
++## Non-claims / remaining blockers
++
++This is an isolation and persistence-safety fix only. It does not prove that `DUAL_GROUP` caused the peer iAP2 restart, does not implement MFi certificate/signature verification, and does not establish that `SINGLE_GROUP` will produce 0x4301. Full Android Gradle gate, APK build, and E2LB real-vehicle validation remain required.

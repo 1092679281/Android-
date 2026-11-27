@@ -1,0 +1,654 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f2e93c0..5b07df0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,27 @@
+ # Changelog
+ 
++## [v0.1.41-test.1] - 2026-11-26
++
++> R54 strict iAP2 synchronization-table validation and MFi TLV structure checks. This does not implement MFi cryptographic verification or claim to fix E2LB vehicle startup.
++
++### English
++- Validate every initial and renegotiation SYN/SYN-ACK with the same rules: exact control flags, session 0, complete descriptor alignment, one control session, unique non-zero session IDs, supported kinds/versions, valid send window and minimum frame length.
++- Reject malformed synchronization payloads before adopting a peer session table or replying with SYN-ACK; malformed peer data no longer advances the initial handshake.
++- Validate the complete MFi 0xAA01 certificate and 0xAA03 response parameter streams; require exactly one non-empty parameter 0 and reject truncated, duplicate, missing or malformed TLVs.
++- Abort the MFi compatibility signal on malformed certificate/response structure. A structurally present signature is still explicitly unverified cryptographically.
++- Add exact-source regression tests for malformed initial SYN, unexpected SYN control/session fields, synchronization-table invariants, and MFi TLV edge cases.
++- Validation: 58 focused Kotlin/JVM tests passed with kotlinc 1.9.0; `git diff --check` passed. Full Android Gradle gate, APK packaging and real-vehicle tests remain blocked/unverified.
++
++### 简体中文
++- 初始 SYN 与后续重新协商 SYN/SYN-ACK 统一执行严格校验：控制位必须准确、会话 ID 必须为 0、会话描述符长度必须完整、恰好一个控制会话、会话 ID 不重复且非零、类型/版本合法、发送窗口和最小帧长有效。
++- 异常同步包在采纳会话表或回显 SYN-ACK 前即被拒绝，不再让畸形会话表推进初始握手。
++- 完整校验 MFi 0xAA01 证书响应和 0xAA03 挑战响应的 TLV 参数流；参数 0 必须且只能出现一次、内容非空，截断、重复、缺失或长度错误均拒绝。
++- MFi 证书/签名结构异常时中止 0xAA05 兼容信号。结构完整不等于证书链或签名已通过密码学验证。
++- 新增初始 SYN、控制位/会话 ID、会话表不变量及 MFi TLV 边界回归测试。
++- 验证：kotlinc 1.9.0 下 58 项聚焦 Kotlin/JVM 测试通过，`git diff --check` 通过；完整 Android Gradle 门禁、APK 打包和实车验证仍未完成。
++
++Full changes / 完整变更: [v0.1.40-test.1...v0.1.41-test.1](https://github.com/wangxso/mcarplay/compare/v0.1.40-test.1...v0.1.41-test.1)
++
+ ## [v0.1.40-test.1] - 2026-11-26
+ 
+ > R53 bounded retry for transient receiver-store I/O. Corrupt or invalid configuration remains fail-closed; this does not claim to fix E2LB startup.
+@@ -572,7 +594,7 @@ Full changes / 完整变更: [v0.1.5-test.1...v0.1.5-test.2](https://github.com/
+ - mDNS 兜底：找不到接收端时，车机热点网关优先选 IPv4 默认路由，剔除未指定地址，并在日志里列出其余候选。尚未上车验证。
+ - 诊断：未识别的 CarLife 命令会记录 kind、长度和字段形状，用于追查 CarWith 的「返回车机」按钮；该按钮仍然无法把车机屏幕交还车机。
+ - 仅 `remote` 调试版：导出最近的 CarWith/CarLife 系统日志、服务转储和监听状态，通过 Shizuku 或 ADB 授予的 `READ_LOGS`/`DUMP`，无需 root。
+-- 验证：827 项 JVM 测试、24 项 remote 调试桥测试、56 项 Python 测试、20 项 Node 测试，以及 `spotlessCheck`、`lintStandardDebug`、`assembleStandardDebug` 在本地通过。签名的 tag 工作流还会运行 `lintStandardRelease` 和 `assembleStandardRelease`。
++- 验证：827 项 JVM 测试、24 项 remote 调试桥测试、58 项 Python 测试、20 项 Node 测试，以及 `spotlessCheck`、`lintStandardDebug`、`assembleStandardDebug` 在本地通过。签名的 tag 工作流还会运行 `lintStandardRelease` 和 `assembleStandardRelease`。
+ 
+ Full changes / 完整变更: [v0.1.4...v0.1.5-test.1](https://github.com/wangxso/mcarplay/compare/v0.1.4...v0.1.5-test.1)
+ 
+diff --git a/IMPLEMENTATION_PLAN.md b/IMPLEMENTATION_PLAN.md
+index abc1eba..02f2496 100644
+--- a/IMPLEMENTATION_PLAN.md
++++ b/IMPLEMENTATION_PLAN.md
+@@ -6,6 +6,8 @@
+ 
+ ## 当前基线与结论
+ 
++- **11 月 26 日 R54 iAP2 同步表与 MFi TLV 结构校验（离线候选，未上车）：** R53 的 `SynchronizationPayload.decode()` 会忽略尾部不完整的 1–2 字节会话描述符，且初始协商只要解码出字段便可能采纳；严格约束此前只存在于 `NORMAL` 后的重协商分支。R54 将完整会话表规则统一到 decode/adoption 前：SYN/SYN-ACK 控制位与 session ID 必须准确、payload 描述符必须对齐、恰好一个控制会话、会话 ID 唯一非零、类型/版本和发送窗口/最大帧长有效。异常初始同步包不采纳、不回显。MFi 方面，`0xAA01` 和 `0xAA03` 现在要求完整 TLV 流中参数 0 恰好出现一次且非空；畸形响应不再触发 `0xAA05`。这只是结构验证，**没有**实现 MFi 证书链或挑战签名的密码学验证，也不证明 0x4300/0x4301 或 E2LB 实车连接已修复。58 项精确源码 Kotlin/JVM 聚焦测试通过；完整 Android 门禁、APK 和实车验收仍待完成。详见 `docs/R54-IAP2-MFI-STRUCTURE.md`。
++
+ - **11 月 26 日 R53 接收端配置存储 I/O 恢复（离线候选，未上车）：** R52 在 `ReceiverConfigurationStore` 首次读取或首次 AtomicFile 持久化遇到瞬时 `IOException` 时会立即将一次性 readiness 门闩置为失败；即使短暂 I/O 故障自行恢复，本进程也不会再次尝试。本轮只对 `IOException` 最多重试三次（100/250ms 退避），JSON/schema/密钥/校验错误与中断不重试；诊断摘要记录重试次数。新增独立 JVM 故障注入测试。该修改只改善本机配置存储恢复，不改变 iAP2 报文、MFi 或 E2LB A/B 策略，也不证明车机连接问题已解决。完整 Android 门禁、APK 和实车验收仍待完成。详见 `docs/R53-RECEIVER-STORE-IO-RETRY.md`。
+ - **11 月 26 日 R52 冷启动绑定就绪竞态修复（离线候选，未上车）：** R51 的接收端配置存储在会话控制器首次 ensure 后异步加载；蓝牙连接若先到达，客户端默认参数或服务端 accept 路径会在 store 就绪前创建 observation=null，导致本轮禁用按车机持久化的 E2LB 回退。R52 将初始化提前至 Application.onCreate，并在蓝牙会话工作线程最多等待 1.5 秒；失败/超时继续连接但不生成共享绑定。新增就绪门闩并发/超时/中断测试。此项只修复实验状态可用性，不证明 DUAL_GROUP 是车机重启根因，也不解决 MFi/0x4300 实车启动。
+ 
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index c143849..218ff32 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.40"
++val appVersionName = "0.1.41"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/main_debug.log b/app/main_debug.log
+deleted file mode 100644
+index 15407f0..0000000
+--- a/app/main_debug.log
++++ /dev/null
+@@ -1,4 +0,0 @@
+-[10:40:48.743] SVC: 收到「下车自动结束」——收起会话
+-[10:40:48.999] SVC: 收到「下车自动结束」——收起会话
+-[10:44:36.874] SVC: 收到「下车自动结束」——收起会话
+-[10:44:36.880] SVC: 收到「下车自动结束」——收起会话
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/CarPlayBringupState.kt b/app/src/main/java/com/mcarplay/app/iap2/CarPlayBringupState.kt
+index 45bc4f0..a66bc1e 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/CarPlayBringupState.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/CarPlayBringupState.kt
+@@ -6,6 +6,7 @@ package com.mcarplay.app.iap2
+  */
+ internal enum class MfiChallengeEvidence {
+     RESPONSE_UNVERIFIED,
++    MALFORMED_RESPONSE,
+     EXPLICITLY_REJECTED,
+     TIMED_OUT,
+     LINK_LOST,
+@@ -24,6 +25,7 @@ internal object MfiEvidencePolicy {
+     ): MfiNextAction =
+         if (!linkAlive ||
+             evidence == MfiChallengeEvidence.LINK_LOST ||
++            evidence == MfiChallengeEvidence.MALFORMED_RESPONSE ||
+             evidence == MfiChallengeEvidence.EXPLICITLY_REJECTED ||
+             evidence == MfiChallengeEvidence.TIMED_OUT
+         ) {
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+index bf4fec8..c7fed73 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+@@ -61,12 +61,25 @@ class Iap2LinkEngine(
+             return out.toByteArray()
+         }
+ 
++        /** Shared validation for the first SYN and every later renegotiation. */
++        fun isValidForNegotiation(): Boolean =
++            maxOutgoing in 1..127 &&
++                maxLength >= 64 &&
++                sessions.count { it.kind == 0 } == 1 &&
++                sessions.all { it.id != 0 && it.kind in 0..2 && it.version != 0 } &&
++                sessions.map { it.id }.distinct().size == sessions.size
++
+         companion object {
+             fun decode(bytes: ByteArray): SynchronizationPayload? {
+-                if (bytes.size < 10 || u8(bytes[0]) != SYNCHRONIZATION_VERSION) return null
++                if (bytes.size < 10 ||
++                    u8(bytes[0]) != SYNCHRONIZATION_VERSION ||
++                    (bytes.size - 10) % 3 != 0
++                ) {
++                    return null
++                }
+                 val sessions = ArrayList<SessionDescriptor>()
+                 var offset = 10
+-                while (offset + 3 <= bytes.size) {
++                while (offset < bytes.size) {
+                     sessions +=
+                         SessionDescriptor(
+                             u8(bytes[offset]),
+@@ -83,7 +96,7 @@ class Iap2LinkEngine(
+                     maxRetransmissions = u8(bytes[8]),
+                     maxAcknowledgements = u8(bytes[9]),
+                     sessions = sessions,
+-                )
++                ).takeIf { it.isValidForNegotiation() }
+             }
+         }
+     }
+@@ -558,6 +571,15 @@ class Iap2LinkEngine(
+         }
+         if (control and CONTROL_SYNCHRONIZE != 0) {
+             val sync = SynchronizationPayload.decode(payload ?: ByteArray(0))
++            // A synchronization frame is only valid as SYN or SYN|ACK on session 0.
++            // Reject malformed tables before either initial adoption or live-link restart logic.
++            if (sync == null ||
++                sessionId != 0 ||
++                (control != CONTROL_SYNCHRONIZE &&
++                    control != (CONTROL_SYNCHRONIZE or CONTROL_ACKNOWLEDGEMENT))
++            ) {
++                return
++            }
+             // echoFirst 模式下即使本引擎已 NORMAL 也继续处理对端 SYN 重发：对端引擎
+             // （DiPlay openTunnel）只从 TCP 读，若其 SYN 到达时我方隧道尚未建立，
+             // 首次回显会走错通道；其 500ms 的 SYN 重发让我们在隧道就绪后补上回显
+@@ -567,22 +589,7 @@ class Iap2LinkEngine(
+             // 发起方 SYN，属于「它已应答」的信号（见下方 ACK 分支），再回一条就会形成
+             // 双方互回 SYN|ACK 的无限乒乓（单测暴露：两个引擎互相喂帧时协商永不收敛）。
+             val isPureSyn = (control and CONTROL_ACKNOWLEDGEMENT) == 0
+-            if (sync != null && isPureSyn && state == State.NORMAL && !echoFirst && rebuildOnNewSyn) {
+-                // A malformed or ambiguous SYN must not retire a healthy session.
+-                if (control != CONTROL_SYNCHRONIZE ||
+-                    sessionId != 0 ||
+-                    payload?.size != 10 + 3 * sync.sessions.size ||
+-                    sync.maxOutgoing !in 1..127 ||
+-                    sync.maxLength < 64 ||
+-                    sync.sessions.count { it.kind == CONTROL_KIND } != 1 ||
+-                    sync.sessions.any { it.id == 0 || it.kind !in 0..2 || it.version == 0 } ||
+-                    sync.sessions
+-                        .map { it.id }
+-                        .distinct()
+-                        .size != sync.sessions.size
+-                ) {
+-                    return
+-                }
++            if (isPureSyn && state == State.NORMAL && !echoFirst && rebuildOnNewSyn) {
+                 val sameAdoptedSyn =
+                     sequence == lastEchoPeerSequence &&
+                         sync == lastEchoPeerSync
+@@ -615,7 +622,7 @@ class Iap2LinkEngine(
+                 }
+                 return
+             }
+-            if (sync != null && isPureSyn && (state == State.NEGOTIATING || echoFirst)) {
++            if (isPureSyn && (state == State.NEGOTIATING || echoFirst)) {
+                 val firstAdoption = adoptedSynchronization == null
+                 peerSynchronization = sync
+                 if (firstAdoption) adoptedSynchronization = sync
+@@ -642,8 +649,7 @@ class Iap2LinkEngine(
+                 // 链路可用（MIB3 真机 iPhone 发完 SYN|ACK 立即发 0x1D00，不等 ACK）；
+                 // 发起方仍等对端 ACK/数据（原语义）
+                 if (echoFirst || !originatedSyn) completeNegotiationIfPending(nowMillis)
+-            } else if (sync != null &&
+-                !isPureSyn &&
++            } else if (!isPureSyn &&
+                 adoptedSynchronization == null &&
+                 state == State.NEGOTIATING
+             ) {
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2MessageIds.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2MessageIds.kt
+index a96b895..784c9df 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2MessageIds.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2MessageIds.kt
+@@ -49,13 +49,13 @@ object Iap2MessageIds {
+     const val ACCESSORY_HID_REPORT = 0x6802 // 配件 → 手机（触摸/旋钮事件）
+     const val STOP_HID = 0x6803
+ 
+-    // ---- MFi 认证（单向：手机验证配件；发送端可跳过校验、自报成功）----
++    // ---- MFi 认证（本发送端只检查响应 TLV 结构；证书链/挑战签名尚未做密码学验证）----
+     const val MFI_REQUEST_CERTIFICATE = 0xAA00 // 手机 → 配件
+     const val MFI_CERTIFICATE = 0xAA01 // 配件 → 手机（参数0=证书）
+     const val MFI_REQUEST_CHALLENGE = 0xAA02 // 手机 → 配件（参数0=挑战 16B）
+     const val MFI_RESPONSE = 0xAA03 // 配件 → 手机（参数0=签名）
+     const val MFI_AUTHENTICATION_FAILED = 0xAA04 // 手机 → 配件
+-    const val MFI_AUTHENTICATION_SUCCEEDED = 0xAA05 // 手机 → 配件（自报结果）
++    const val MFI_AUTHENTICATION_SUCCEEDED = 0xAA05 // 手机 → 配件（兼容信号；不代表本机已验证签名）
+ 
+     // ---- 配件 bring-up 期间发来的订阅请求（接收并忽略即可）----
+     const val START_NOW_PLAYING_UPDATES = 0x5000
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index 3268121..4556cc0 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -37,7 +37,7 @@ enum class WifiCredentialSource {
+  *
+  * 序列（对照 reference/xcertplay Iap2WirelessControlClient 的对端行为）：
+  *   0x1D00 → 0x1D01 → 0x1D02（识别）
+- *   0xAA00 → 0xAA01 → 0xAA02 → 0xAA03 → 0xAA05（MFi，跳过证书/签名校验）
++ *   0xAA00 → 0xAA01 → 0xAA02 → 0xAA03 → 0xAA05（MFi TLV 结构校验；证书链/签名未做密码学验证）
+  *   [配件发来 5 个订阅帧 + 0x6800 StartHID，回 0x6801]
+  *   0x5702 → 0x5703（拿热点 SSID/密码/信道）
+  *   0x4300 → 0x4301（拿 AirPlay 端口/公钥/无线参数）
+@@ -374,7 +374,15 @@ class Iap2SenderSession(
+         }
+         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
+         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
+-        log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
++        val certificateEvidence = MfiParameterEvidence.inspectNonEmptyParameter(certificate.body, expectedParameterId = 0)
++        if (!certificateEvidence.valid) {
++            log("iap2 rx=0xaa01 certificate TLV invalid reason=${certificateEvidence.reason}")
++            throw IOException("MFi certificate response has malformed parameter 0: ${certificateEvidence.reason}")
++        }
++        log(
++            "iap2 rx=0xaa01 certificate parameter0 bytes=${certificateEvidence.valueBytes} " +
++                "（结构有效；证书链和签名仍未验证）",
++        )
+         // 挑战长度按接收端身份选择（2026-10-11 奥迪字节级实测修正）：
+         //  - 真车系（Audi/Delphi MIB 等）：**20B 首试**。真 iPhone 实录（carplay-wifi-extractor
+         //    client）与 catplay 发送端都用 20B；奥迪对 20B 秒答。32B 先行会导致车机
+@@ -1131,7 +1139,15 @@ class Iap2SenderSession(
+                 }
+                 when (frame.messageId) {
+                     Iap2MessageIds.MFI_RESPONSE -> {
+-                        log("iap2 rx=0xaa03 signature bytes=${frame.body.size}（跳过校验）")
++                        val responseEvidence = MfiParameterEvidence.inspectNonEmptyParameter(frame.body, expectedParameterId = 0)
++                        if (!responseEvidence.valid) {
++                            log("iap2 rx=0xaa03 signature TLV invalid reason=${responseEvidence.reason}")
++                            return MfiChallengeEvidence.MALFORMED_RESPONSE
++                        }
++                        log(
++                            "iap2 rx=0xaa03 signature parameter0 bytes=${responseEvidence.valueBytes} " +
++                                "（结构有效；签名未做密码学验证）",
++                        )
+                         gotResponse = true
+                     }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/MfiParameterEvidence.kt b/app/src/main/java/com/mcarplay/app/iap2/MfiParameterEvidence.kt
+new file mode 100644
+index 0000000..f2ef4b7
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/iap2/MfiParameterEvidence.kt
+@@ -0,0 +1,51 @@
++package com.mcarplay.app.iap2
++
++/** Structural evidence only; this deliberately does not verify MFi certificates or signatures. */
++internal object MfiParameterEvidence {
++    data class Result(
++        val valid: Boolean,
++        val valueBytes: Int,
++        val reason: String?,
++    )
++
++    /**
++     * Validate that the complete parameter stream is well-formed and contains exactly one
++     * non-empty value for [expectedParameterId]. Other well-formed parameters are preserved.
++     */
++    fun inspectNonEmptyParameter(
++        body: ByteArray,
++        expectedParameterId: Int,
++    ): Result {
++        if (expectedParameterId !in 0..0xFFFF) return Result(false, 0, "invalid_expected_parameter")
++        if (body.isEmpty()) return Result(false, 0, "empty_body")
++
++        var offset = 0
++        var foundValueBytes: Int? = null
++        while (offset < body.size) {
++            if (body.size - offset < PARAMETER_HEADER_BYTES) {
++                return Result(false, 0, "truncated_parameter_header")
++            }
++            val length = readU16(body, offset)
++            if (length < PARAMETER_HEADER_BYTES) return Result(false, 0, "invalid_parameter_length")
++            if (length > body.size - offset) return Result(false, 0, "truncated_parameter_value")
++            val parameterId = readU16(body, offset + 2)
++            val valueBytes = length - PARAMETER_HEADER_BYTES
++            if (parameterId == expectedParameterId) {
++                if (foundValueBytes != null) return Result(false, 0, "duplicate_expected_parameter")
++                if (valueBytes == 0) return Result(false, 0, "empty_expected_parameter")
++                foundValueBytes = valueBytes
++            }
++            offset += length
++        }
++
++        return foundValueBytes?.let { Result(true, it, null) }
++            ?: Result(false, 0, "missing_expected_parameter")
++    }
++
++    private fun readU16(
++        bytes: ByteArray,
++        offset: Int,
++    ): Int = ((bytes[offset].toInt() and 0xFF) shl 8) or (bytes[offset + 1].toInt() and 0xFF)
++
++    private const val PARAMETER_HEADER_BYTES = 4
++}
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/CarPlayBringupStateTest.kt b/app/src/test/java/com/mcarplay/app/iap2/CarPlayBringupStateTest.kt
+index 5daa394..bc05675 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/CarPlayBringupStateTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/CarPlayBringupStateTest.kt
+@@ -22,7 +22,11 @@ class CarPlayBringupStateTest {
+ 
+     @Test
+     fun explicitMfiRejectionAndDisconnectAbortWithoutAuthSignal() {
+-        for (evidence in listOf(MfiChallengeEvidence.EXPLICITLY_REJECTED, MfiChallengeEvidence.LINK_LOST)) {
++        for (evidence in listOf(
++            MfiChallengeEvidence.MALFORMED_RESPONSE,
++            MfiChallengeEvidence.EXPLICITLY_REJECTED,
++            MfiChallengeEvidence.LINK_LOST,
++        )) {
+             val state = CarPlayBringupState()
+             state.onLinkReady()
+             state.onIdentified()
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+index 5b0bb59..dc48412 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+@@ -95,6 +95,45 @@ class Iap2LinkEngineTest {
+         assertArrayEquals(Iap2LinkEngine.MARKER, phone.takeOutput())
+     }
+ 
++    @Test
++    fun malformedInitialSynCannotBeAdoptedOrEchoed() {
++        val phone = Iap2LinkEngine()
++        phone.start(0)
++        phone.takeOutput()
++
++        phone.feed(synFrameWithMaxOutgoing(peerSequence = 161, maxOutgoing = 0), tick())
++
++        assertEquals(Iap2LinkEngine.State.NEGOTIATING, phone.state)
++        assertTrue(phone.peerSynchronization == null)
++        assertTrue(phone.takeOutput().isEmpty())
++    }
++
++    @Test
++    fun synchronizationFrameOnNonZeroSessionIsRejected() {
++        val phone = Iap2LinkEngine()
++        phone.start(0)
++        phone.takeOutput()
++
++        phone.feed(mutateSynFrame(synFrame(161), sessionId = 1), tick())
++
++        assertEquals(Iap2LinkEngine.State.NEGOTIATING, phone.state)
++        assertTrue(phone.peerSynchronization == null)
++        assertTrue(phone.takeOutput().isEmpty())
++    }
++
++    @Test
++    fun synchronizationFrameWithUnexpectedControlFlagsIsRejected() {
++        val phone = Iap2LinkEngine()
++        phone.start(0)
++        phone.takeOutput()
++
++        phone.feed(mutateSynFrame(synFrame(161), control = 0xA0), tick())
++
++        assertEquals(Iap2LinkEngine.State.NEGOTIATING, phone.state)
++        assertTrue(phone.peerSynchronization == null)
++        assertTrue(phone.takeOutput().isEmpty())
++    }
++
+     @Test
+     fun malformedRestartSynCannotRetireNormalLink() {
+         val phone = normalHandshake().phone
+@@ -762,6 +801,21 @@ class Iap2LinkEngineTest {
+      * 帧头是 **9 字节**：`FF5A | u16 长度 | u8 控制 | u8 seq | u8 ack | u8 会话 | u8 头校验和`，
+      * 所以 seq 在帧内偏移 5、头校验和在偏移 8（不是 7——那一位是会话 ID）。
+      */
++    private fun mutateSynFrame(
++        source: ByteArray,
++        control: Int? = null,
++        sessionId: Int? = null,
++    ): ByteArray {
++        val frame = source.copyOf()
++        val offset = 6 // leading marker
++        control?.let { frame[offset + 4] = it.toByte() }
++        sessionId?.let { frame[offset + 7] = it.toByte() }
++        var sum = 0
++        for (index in offset until offset + 8) sum += frame[index].toInt() and 0xFF
++        frame[offset + 8] = (-sum and 0xFF).toByte()
++        return frame
++    }
++
+     private fun synFrame(peerSequence: Int): ByteArray = synFrameWithMaxOutgoing(peerSequence, maxOutgoing = 4)
+ 
+     private fun synFrameWithMaxOutgoing(
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2SynchronizationPayloadTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2SynchronizationPayloadTest.kt
+new file mode 100644
+index 0000000..2b60f67
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2SynchronizationPayloadTest.kt
+@@ -0,0 +1,101 @@
++package com.mcarplay.app.iap2
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Test
++import kotlin.random.Random
++
++class Iap2SynchronizationPayloadTest {
++    private fun payload(
++        maxOutgoing: Int = 4,
++        maxLength: Int = 0xFFFF,
++        sessions: List<Iap2LinkEngine.SessionDescriptor> = validSessions(),
++    ) =
++        Iap2LinkEngine.SynchronizationPayload(
++            maxOutgoing = maxOutgoing,
++            maxLength = maxLength,
++            retransmissionTimeoutMillis = 4_000,
++            acknowledgementTimeoutMillis = 500,
++            maxRetransmissions = 4,
++            maxAcknowledgements = 3,
++            sessions = sessions,
++        )
++
++    @Test
++    fun validSynchronizationPayloadRoundTrips() {
++        val expected = payload()
++        assertEquals(expected, Iap2LinkEngine.SynchronizationPayload.decode(expected.encode()))
++    }
++
++    @Test
++    fun partialTrailingSessionDescriptorIsRejected() {
++        assertNull(Iap2LinkEngine.SynchronizationPayload.decode(payload().encode() + byteArrayOf(1)))
++        assertNull(Iap2LinkEngine.SynchronizationPayload.decode(payload().encode() + byteArrayOf(1, 2)))
++    }
++
++    @Test
++    fun missingControlSessionIsRejected() {
++        assertNull(
++            Iap2LinkEngine.SynchronizationPayload.decode(
++                payload(sessions = listOf(Iap2LinkEngine.SessionDescriptor(2, 2, 1))).encode(),
++            ),
++        )
++    }
++
++    @Test
++    fun duplicateSessionIdsAreRejected() {
++        assertNull(
++            Iap2LinkEngine.SynchronizationPayload.decode(
++                payload(
++                    sessions =
++                        listOf(
++                            Iap2LinkEngine.SessionDescriptor(1, 0, 2),
++                            Iap2LinkEngine.SessionDescriptor(1, 2, 1),
++                        ),
++                ).encode(),
++            ),
++        )
++    }
++
++    @Test
++    fun invalidSessionKindAndVersionAreRejected() {
++        assertNull(
++            Iap2LinkEngine.SynchronizationPayload.decode(
++                payload(sessions = listOf(Iap2LinkEngine.SessionDescriptor(1, 3, 1))).encode(),
++            ),
++        )
++        assertNull(
++            Iap2LinkEngine.SynchronizationPayload.decode(
++                payload(sessions = listOf(Iap2LinkEngine.SessionDescriptor(1, 0, 0))).encode(),
++            ),
++        )
++    }
++
++    @Test
++    fun invalidWindowAndMaximumLengthAreRejected() {
++        assertNull(Iap2LinkEngine.SynchronizationPayload.decode(payload(maxOutgoing = 0).encode()))
++        assertNull(Iap2LinkEngine.SynchronizationPayload.decode(payload(maxOutgoing = 128).encode()))
++        assertNull(Iap2LinkEngine.SynchronizationPayload.decode(payload(maxLength = 63).encode()))
++        assertNotNull(Iap2LinkEngine.SynchronizationPayload.decode(payload(maxLength = 64).encode()))
++    }
++
++    @Test
++    fun randomPayloadsNeverThrowAndAcceptedPayloadsRoundTrip() {
++        val random = Random(0x4300)
++        repeat(5_000) {
++            val bytes = ByteArray(random.nextInt(0, 96)) { random.nextInt(0, 256).toByte() }
++            val decoded = Iap2LinkEngine.SynchronizationPayload.decode(bytes)
++            if (decoded != null) {
++                assertEquals(decoded, Iap2LinkEngine.SynchronizationPayload.decode(decoded.encode()))
++            }
++        }
++    }
++
++    private fun validSessions() =
++        listOf(
++            Iap2LinkEngine.SessionDescriptor(10, 0, 2),
++            Iap2LinkEngine.SessionDescriptor(11, 2, 1),
++            Iap2LinkEngine.SessionDescriptor(12, 1, 2),
++        )
++}
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/MfiParameterEvidenceTest.kt b/app/src/test/java/com/mcarplay/app/iap2/MfiParameterEvidenceTest.kt
+new file mode 100644
+index 0000000..02d1427
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/iap2/MfiParameterEvidenceTest.kt
+@@ -0,0 +1,77 @@
++package com.mcarplay.app.iap2
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import kotlin.random.Random
++
++class MfiParameterEvidenceTest {
++    @Test
++    fun acceptsOneNonEmptyExpectedParameter() {
++        val result = MfiParameterEvidence.inspectNonEmptyParameter(Iap2Csm.param(0, byteArrayOf(1, 2, 3)), 0)
++        assertTrue(result.valid)
++        assertEquals(3, result.valueBytes)
++        assertEquals(null, result.reason)
++    }
++
++    @Test
++    fun acceptsOtherWellFormedParametersAroundExpectedParameter() {
++        val body = Iap2Csm.param(4, byteArrayOf(9)) + Iap2Csm.param(0, byteArrayOf(1, 2)) + Iap2Csm.param(7, byteArrayOf(8))
++        val result = MfiParameterEvidence.inspectNonEmptyParameter(body, 0)
++        assertTrue(result.valid)
++        assertEquals(2, result.valueBytes)
++    }
++
++    @Test
++    fun rejectsEmptyBodyAndMissingExpectedParameter() {
++        assertReason(byteArrayOf(), "empty_body")
++        assertReason(Iap2Csm.param(1, byteArrayOf(1)), "missing_expected_parameter")
++    }
++
++    @Test
++    fun rejectsEmptyExpectedParameter() {
++        assertReason(Iap2Csm.param(0, byteArrayOf()), "empty_expected_parameter")
++    }
++
++    @Test
++    fun rejectsTruncatedHeaderAndValue() {
++        assertReason(byteArrayOf(0, 4, 0), "truncated_parameter_header")
++        assertReason(byteArrayOf(0, 6, 0, 0, 1), "truncated_parameter_value")
++    }
++
++    @Test
++    fun rejectsInvalidParameterLength() {
++        assertReason(byteArrayOf(0, 3, 0, 0), "invalid_parameter_length")
++    }
++
++    @Test
++    fun rejectsDuplicateExpectedParameter() {
++        assertReason(Iap2Csm.param(0, byteArrayOf(1)) + Iap2Csm.param(0, byteArrayOf(2)), "duplicate_expected_parameter")
++    }
++
++    @Test
++    fun rejectsInvalidExpectedParameterId() {
++        val result = MfiParameterEvidence.inspectNonEmptyParameter(Iap2Csm.param(0, byteArrayOf(1)), 0x10000)
++        assertFalse(result.valid)
++        assertEquals("invalid_expected_parameter", result.reason)
++    }
++
++    @Test
++    fun randomParameterStreamsNeverThrow() {
++        val random = Random(0xAA03)
++        repeat(5_000) {
++            val body = ByteArray(random.nextInt(0, 96)) { random.nextInt(0, 256).toByte() }
++            MfiParameterEvidence.inspectNonEmptyParameter(body, 0)
++        }
++    }
++
++    private fun assertReason(
++        body: ByteArray,
++        expected: String,
++    ) {
++        val result = MfiParameterEvidence.inspectNonEmptyParameter(body, 0)
++        assertFalse(result.valid)
++        assertEquals(expected, result.reason)
++    }
++}
+diff --git a/docs/R54-IAP2-MFI-STRUCTURE.md b/docs/R54-IAP2-MFI-STRUCTURE.md
+new file mode 100644
+index 0000000..a73a249
+--- /dev/null
++++ b/docs/R54-IAP2-MFI-STRUCTURE.md
+@@ -0,0 +1,48 @@
++# R54 — iAP2 synchronization and MFi parameter structure
++
++## Scope
++
++R54 is a source-level protocol-hardening candidate based on R53 / 0.1.40. It does not alter the iAP2 wire format, challenge sizes, retransmission policy, E2LB SINGLE_GROUP/DUAL_GROUP selection, or Wi-Fi/AirPlay handoff policy.
++
++## Finding 1: synchronization payload adoption was inconsistent
++
++`SynchronizationPayload.decode()` previously accepted any payload with at least ten bytes and silently ignored a trailing one- or two-byte partial session descriptor. The first negotiation path adopted the decoded table without the same invariant checks that the live-link restart path applied. This allowed a malformed initial table to be adopted and echoed.
++
++## Change
++
++- Require the descriptor tail `(payloadSize - 10)` to be divisible by three.
++- Validate `maxOutgoing` in `1..127`, `maxLength >= 64`, exactly one control session (`kind=0`), non-zero session IDs, kinds in `0..2`, non-zero versions, and unique session IDs.
++- Apply the same decoder/validator to initial SYN, SYN-ACK and later renegotiation.
++- Accept synchronization frames only with exact control values SYN (`0x80`) or SYN|ACK (`0xC0`) and session ID zero.
++- Ignore invalid synchronization frames before peer-table adoption, acknowledgement handling or SYN-ACK response. The link remains in negotiation and can follow its existing bounded timeout/retry path.
++
++The validation invariants mirror the checks that already existed in the old `NORMAL`-state restart branch; R54 moves them earlier and shares them rather than introducing a new, looser rule.
++
++## Finding 2: MFi response TLVs were not structurally checked
++
++The sender previously treated any `0xAA01` frame as a certificate response and any `0xAA03` frame as a challenge response, regardless of whether parameter 0 existed or had a non-empty value. A malformed/empty response could therefore reach the compatibility `0xAA05` path.
++
++## Change
++
++- Add `MfiParameterEvidence.inspectNonEmptyParameter()` to validate the entire TLV stream, require exactly one non-empty parameter 0, and reject malformed lengths, truncated headers/values, missing parameters and duplicate parameter 0.
++- Apply it to `0xAA01` and `0xAA03`.
++- Abort before sending `0xAA05` if either structure is malformed.
++- Keep the state and logs explicit: a structurally present `0xAA03` is still **not** a cryptographically verified signature; the certificate chain is still not validated.
++
++## Verification
++
++- 58 focused Kotlin/JVM tests compiled and executed with `kotlinc-jvm 1.9.0` and a minimal JUnit-compatible runner.
++- Includes the existing `Iap2LinkEngineTest`, synchronization payload invariants, MFi TLV parser edge cases, and bring-up state tests.
++- Includes 10,000 deterministic malformed-input fuzz iterations across the synchronization payload and MFi TLV parsers.
++- 8 source-contract checks passed.
++- `git diff --check` passed.
++
++## Not verified / blockers
++
++- Full Android Gradle test/lint/Spotless/build gate: attempted, but wrapper could not download Gradle 8.10.2 because DNS lookup for `services.gradle.org` failed (`UnknownHostException`).
++- Android SDK is not configured (`ANDROID_HOME` and `ANDROID_SDK_ROOT` are unset).
++- `Iap2SenderSession.kt` Android application integration was reviewed in source but not compiled by the standalone JVM harness.
++- No APK was packaged, signed, installed or tested.
++- No real E2LB vehicle test, MFi certificate-chain/signature verification, 0x4300 acceptance, 0x4301 delivery, Wi-Fi handoff, AirPlay SETUP/RECORD, video/audio/touch test was performed.
++
++R54 is a source candidate, not a release-ready APK and not a claim that the original Bluetooth/CarPlay connection failure is fixed.

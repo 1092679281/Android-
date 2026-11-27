@@ -1,0 +1,450 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bcbd7d7..c4ce190 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,20 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.32-test.1] - 2026-11-26
++
++> R45 experimental candidate based on verified R44 source. No real-vehicle fix claimed.
++
++### English
++- Preserve E2LB transport write, cumulative ACK and termination evidence separately.
++- Recheck live E2LB link before endpoint handoff and clarify reconnect logs.
++- Preserve wire format and authentication policy; vehicle compatibility remains unverified.
++
++### 简体中文
++- 分开记录 E2LB 启动的本地写入、累计 ACK 和链路终止证据。
++- E2LB 端点交付前复查链路存活，修正重连日志。
++- 保留报文格式及认证策略；实车连接尚未验证。
++
+ ## [v0.1.31-test.1] - 2026-11-25
+ 
+ > R44 — opt-in compact call notification status candidate.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index b39dbbc..735944e 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.31"
++val appVersionName = "0.1.32"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+index 9f6fa8a..bc03f7c 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+@@ -81,6 +81,7 @@ internal fun Iap2LinkChannel.runSenderSession(
+         val endpoint = session.run(timeoutMillis)
+         onGeneration(session.linkGeneration)
+         if (!ReceiverDetectionRuntime.isCurrent(observation)) return
++        session.ensureEndpointHandoffActive()
+         endpointDelivered = true
+         onEndpoint(endpoint.copy(observation = observation, peerAddress = peerAddress, originatingControlLink = originatingLink))
+         // Phase 2 过渡：保持控制通道存活记录配件消息；AirPlay 配对由 onEndpoint 回调发起
+diff --git a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt
+index 80a010f..5dcd38a 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothClient.kt
+@@ -640,7 +640,7 @@ class Iap2BluetoothClient(
+                 continue
+             }
+             try {
+-                val started = lease.dispatchIfCurrent { runSession(connected, lease) }
++                val started = lease.dispatchIfCurrent { runSession(connected, lease, myGeneration) }
+                 if (!started) {
+                     currentSocket.compareAndSet(connected, null)
+                     runCatching { connected.close() }
+@@ -793,6 +793,7 @@ class Iap2BluetoothClient(
+     private fun runSession(
+         socket: BluetoothSocket,
+         lease: BluetoothSessionArbiter.Lease,
++        myGeneration: Long,
+     ) {
+         var sessionChannel: Iap2LinkChannel? = null
+         try {
+@@ -844,7 +845,15 @@ class Iap2BluetoothClient(
+             }
+             currentSocket.compareAndSet(socket, null)
+             runCatching { socket.close() }
+-            runCatching { log("BT-C: 本轮会话结束（客户端仍在运行，将自动重连）") }
++            runCatching {
++                val message =
++                    if (running && generation.get() == myGeneration) {
++                        "BT-C: 本轮会话结束（当前客户端仍运行，后续由连接策略决定是否重试）"
++                    } else {
++                        "BT-C: 本轮会话结束（客户端已停止或本轮已退役）"
++                    }
++                log(message)
++            }
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+index 5ca3282..bf4fec8 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2LinkEngine.kt
+@@ -106,6 +106,25 @@ class Iap2LinkEngine(
+         var state: State = State.QUEUED
+             internal set
+ 
++        /** Progress before termination; ENDED alone cannot distinguish queued from generated. */
++        @Volatile
++        var endedFrom: State? = null
++            private set
++
++        internal fun markEnded() {
++            if (state == State.ENDED) return
++            endedFrom = state
++            state = State.ENDED
++        }
++
++        /** Local stream.write returned; not peer delivery. */
++        var localWriteCompleted: Boolean = false
++            private set
++
++        internal fun markLocalWriteCompleted() {
++            if (state == State.FRAME_GENERATED) localWriteCompleted = true
++        }
++
+         internal var sequence: Int? = null
+     }
+ 
+@@ -367,6 +386,9 @@ class Iap2LinkEngine(
+ 
+     fun feedEof() = die(null)
+ 
++    internal fun pendingLocalWriteReceipt(): ControlReceipt? =
++        observedControl?.takeIf { it.state == ControlReceipt.State.FRAME_GENERATED && !it.localWriteCompleted }
++
+     fun takeOutput(): ByteArray {
+         val bytes = output.toByteArray()
+         output.reset()
+@@ -905,7 +927,7 @@ class Iap2LinkEngine(
+         pendingEvents.clear()
+         sendBacklog.clear()
+         unacknowledged.clear()
+-        observedControl?.state = ControlReceipt.State.ENDED
++        observedControl?.markEnded()
+         observedControl = null
+         pendingEvents += Event.Dead(reason)
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index 2e813c0..c7b1925 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -672,7 +672,9 @@ class Iap2SenderSession(
+                     "noiseBytes=${after.parser.discardedNoiseBytes - before.parser.discardedNoiseBytes}",
+             )
+             log(
+-                "iap2 0x4300 observation: peerFrames=$delta receipt=${after.receiptState} result=$outcome; " +
++                "iap2 0x4300 observation: peerFrames=$delta receipt=${after.receiptState} " +
++                    "endedFrom=${after.receiptEndedFrom ?: "none"} " +
++                    "localWriteCompleted=${after.receiptLocalWriteCompleted} result=$outcome; " +
+                     "ACK is not CarPlay authorization",
+             )
+             // Never carry a detect-only, unacknowledged E2LB startup into Wi-Fi discovery.
+@@ -686,9 +688,14 @@ class Iap2SenderSession(
+                     accessoryWifi = wifiFromExchange != null,
+                 )
+             ) {
+-                throw IOException("E2LB startup stopped: $outcome; no verified CarPlay start")
++                val reason = when {
++                    after.terminationReason?.startsWith("peer restarted iAP2 negotiation") == true -> "PEER_RENEGOTIATED"
++                    else -> outcome.toString()
++                }
++                throw IOException("E2LB startup stopped: $reason; no verified CarPlay start")
+             }
+         }
++        ensureEndpointHandoffActive()
+         var endpoint =
+             if (startSession != null) {
+                 parseStartSession(startSession, wifiFromExchange)
+@@ -840,6 +847,7 @@ class Iap2SenderSession(
+                 result.airPlayPort,
+                 EndpointHosts.hasUsable(result.ipAddresses),
+             )
++        ensureEndpointHandoffActive()
+         bringup.observeEndpoint(result.ssid, route)
+         log(
+             "iap2 bring-up route=" + route + " MFi=" + mfiEvidence +
+@@ -848,6 +856,12 @@ class Iap2SenderSession(
+         return result
+     }
+ 
++    /** Recheck E2LB after the startup observation snapshot. */
++    internal fun ensureEndpointHandoffActive() {
++        checkBootstrapActive()
++        if (isE2lb()) channel.requireLiveForHandoff()
++    }
++
+     /**
+      * Phase 2 过渡：bring-up 完成后保持链路打开，持续记录配件发来的控制消息
+      * （如 0x4E0E 后重发的 0x5703、位置请求 0xFFFA 等），直到链路断开。
+@@ -1190,7 +1204,14 @@ class Iap2SenderSession(
+             if (submission != null) {
+                 availabilityBefore = submission.first
+                 availabilityReceipt = submission.second
+-                log("iap2 tx=0x4300 passive receipt=${submission.second.state}")
++                val snapshot = channel.snapshot(submission.second)
++                log(
++                    "iap2 tx=0x4300 passive receipt=${snapshot.receiptState} " +
++                        "endedFrom=${snapshot.receiptEndedFrom} localWriteCompleted=${snapshot.receiptLocalWriteCompleted}",
++                )
++                if (!snapshot.alive) {
++                    throw IOException("E2LB availability transport ended during submission; no startup authorization established")
++                }
+             } else {
+                 throw IOException("E2LB availability submission unavailable; no startup authorization established")
+             }
+diff --git a/app/src/main/java/com/mcarplay/app/transport/DuplexStream.kt b/app/src/main/java/com/mcarplay/app/transport/DuplexStream.kt
+index e9accaf..29cc3df 100644
+--- a/app/src/main/java/com/mcarplay/app/transport/DuplexStream.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/DuplexStream.kt
+@@ -90,7 +90,7 @@ class InMemoryStreamPair {
+      */
+     private class Pipe {
+         private val lock = Object()
+-        private val chunks = ArrayDeque<ByteArray>()
++        private val chunks = java.util.ArrayDeque<ByteArray>()
+         private var headOffset = 0
+         private var closed = false
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+index 475e466..3036789 100644
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -120,14 +120,30 @@ class Iap2LinkChannel(
+         val parser: Iap2LinkEngine.ParserStats,
+         val alive: Boolean,
+         val receiptState: Iap2LinkEngine.ControlReceipt.State?,
++        val receiptEndedFrom: Iap2LinkEngine.ControlReceipt.State? = null,
++        val terminationReason: String? = null,
++        val receiptLocalWriteCompleted: Boolean? = null,
+     )
+ 
+     /** Counters and receipt belong to the same reader/pacer lock acquisition. */
+     fun snapshot(receipt: Iap2LinkEngine.ControlReceipt? = null): LinkSnapshot =
+         synchronized(lock) {
+-            LinkSnapshot(receivedPeerFrameCount, engine.parserStats(), isAlive, receipt?.state)
++            LinkSnapshot(
++                receivedPeerFrameCount,
++                engine.parserStats(),
++                isAlive,
++                receipt?.state,
++                receipt?.endedFrom,
++                terminationReason,
++                receipt?.localWriteCompleted,
++            )
+         }
+ 
++    /** Recheck just before publishing an endpoint; never hold the monitor across external callbacks. */
++    internal fun requireLiveForHandoff() {
++        if (!isAlive) throw IOException("iAP2 endpoint handoff rejected: ${terminationReason ?: "closed"}")
++    }
++
+     /** Passive ACK attribution is not supported by an explicitly negotiated no-ACK link. */
+     fun supportsObservedControl(): Boolean =
+         synchronized(lock) {
+@@ -142,7 +158,8 @@ class Iap2LinkChannel(
+             val receipt = engine.sendObservedControl(bytes, nowMillis()) ?: return@synchronized null
+             processEventsLocked()
+             drainOutputLocked()
+-            if (!isAlive) null else before to receipt
++            // Preserve the receipt even if the synchronous write closed the channel.
++            before to receipt
+         }
+ 
+     /**
+@@ -298,11 +315,13 @@ class Iap2LinkChannel(
+ 
+     private fun drainOutputLocked() {
+         if (!isAlive) return
++        val pendingReceipt = engine.pendingLocalWriteReceipt()
+         val bytes = engine.takeOutput()
+         if (bytes.isEmpty()) return
+         dumpOutbound(bytes)
+         try {
+             stream.write(bytes)
++            pendingReceipt?.markLocalWriteCompleted()
+         } catch (error: IOException) {
+             finishLocked(error)
+         }
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+index 05e6060..5b0bb59 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2LinkEngineTest.kt
+@@ -119,6 +119,27 @@ class Iap2LinkEngineTest {
+         assertFalse(phone.sendControl(Iap2Csm.encode(0x5000), tick()))
+     }
+ 
++    @Test
++    fun threeR44DetectThenNewSynWindowsRetireWithoutFalseAck() {
++        // Synthetic replay of log ordering, not captured wire bytes.
++        for (peerSequence in listOf(118, 165, 187)) {
++            val phone = normalHandshake().phone
++            phone.rebuildOnNewSyn = true
++            phone.enableConservativeStartup()
++            phone.takeOutput()
++            val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), 100L)!!
++            assertEquals(1, parseFrames(phone.takeOutput()).size)
++            repeat(3) { phone.feed(Iap2LinkEngine.MARKER, 300L + it * 1_000L) }
++            assertArrayEquals(Iap2LinkEngine.MARKER, phone.takeOutput())
++            phone.feed(synFrame(peerSequence), 2_350L)
++            assertTrue(phone.isDead)
++            assertEquals(Iap2LinkEngine.ControlReceipt.State.ENDED, receipt.state)
++            assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.endedFrom)
++            assertTrue(phone.takeOutput().isEmpty())
++            assertFalse(phone.sendControl(Iap2Csm.encode(0x4300), 2_400L))
++        }
++    }
++
+     private fun ackFor(seq: Int): ByteArray =
+         ackFrame().apply {
+             this[6] = seq.toByte()
+@@ -209,6 +230,38 @@ class Iap2LinkEngineTest {
+         val outstanding = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
+         phone.feedEof()
+         assertEquals(Iap2LinkEngine.ControlReceipt.State.ENDED, outstanding.state)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, outstanding.endedFrom)
++    }
++
++    @Test
++    fun restartedStartupPreservesUnacknowledgedGeneratedEvidence() {
++        val phone = normalHandshake().phone
++        phone.rebuildOnNewSyn = true
++        phone.enableConservativeStartup()
++        phone.takeOutput()
++        val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        phone.takeOutput()
++        repeat(3) { phone.feed(Iap2LinkEngine.MARKER, 1000L * (it + 1)) }
++        assertArrayEquals(Iap2LinkEngine.MARKER, phone.takeOutput())
++        phone.feed(synFrame(187), 3100L)
++        assertTrue(phone.isDead)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.ENDED, receipt.state)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.endedFrom)
++        phone.feedEof()
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, receipt.endedFrom)
++    }
++
++    @Test
++    fun queuedReceiptEndDoesNotPretendFrameWasGenerated() {
++        val phone = normalHandshake().phone
++        phone.enableConservativeStartup()
++        phone.takeOutput()
++        repeat(4) { assertTrue(phone.sendControl(Iap2Csm.encode(0x5000), tick())) }
++        val receipt = phone.sendObservedControl(Iap2Csm.encode(0x4300), tick())!!
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.QUEUED, receipt.state)
++        phone.feedEof()
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.ENDED, receipt.state)
++        assertEquals(Iap2LinkEngine.ControlReceipt.State.QUEUED, receipt.endedFrom)
+     }
+ 
+     @Test
+diff --git a/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt b/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
+index 8c44ff4..a8c3fc8 100644
+--- a/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
++++ b/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
+@@ -138,6 +138,36 @@ class Iap2LinkChannelRestartTest {
+             val after = phone.snapshot(submission.second)
+             assertTrue(after.receiptState == Iap2LinkEngine.ControlReceipt.State.PEER_ACKED)
+             assertTrue(after.peerFrames > submission.first.peerFrames)
++            assertTrue(after.receiptLocalWriteCompleted == true)
++        } finally {
++            phone.close()
++            peer.close()
++        }
++    }
++
++    @Test
++    fun observedSubmissionPreservesEvidenceWhenWriteThrows() {
++        val pair = InMemoryStreamPair()
++        val failWrites = java.util.concurrent.atomic.AtomicBoolean(false)
++        val stream = object : DuplexStream by pair.sideA {
++            override fun write(bytes: ByteArray) {
++                if (failWrites.get()) throw java.io.IOException("injected observed write failure")
++                pair.sideA.write(bytes)
++            }
++        }
++        val phone = Iap2LinkChannel(stream)
++        val peer = Iap2LinkChannel(pair.sideB)
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            failWrites.set(true)
++            val submission = phone.submitObservedControl(byteArrayOf(9, 9, 9))!!
++            val after = phone.snapshot(submission.second)
++            assertFalse(after.alive)
++            assertTrue(after.receiptState == Iap2LinkEngine.ControlReceipt.State.ENDED)
++            assertTrue(after.receiptEndedFrom == Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED)
++            assertTrue(after.receiptLocalWriteCompleted == false)
++            assertTrue(after.terminationReason?.contains("injected observed write failure") == true)
+         } finally {
+             phone.close()
+             peer.close()
+@@ -173,6 +203,29 @@ class Iap2LinkChannelRestartTest {
+         }
+     }
+ 
++    @Test
++    fun retiredLinkCannotPublishEndpointEvenAfterEarlierLiveSnapshot() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA)
++        val peer = Iap2LinkChannel(pair.sideB)
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            phone.requireLiveForHandoff()
++            assertTrue(phone.sendControl(byteArrayOf(9, 9, 9)))
++            assertNotNull(peer.recvControl(2_000))
++            assertTrue(phone.snapshot().alive)
++            pair.sideB.write(synFrame(peerSequence = 161))
++            assertTrue(phone.awaitTerminated(2_000))
++            val error = runCatching { phone.requireLiveForHandoff() }.exceptionOrNull()
++            assertTrue(error is java.io.IOException)
++            assertTrue(error?.message?.contains("restarted iAP2 negotiation") == true)
++        } finally {
++            phone.close()
++            peer.close()
++        }
++    }
++
+     /** Construct a marker + SYN frame with a changed sequence and repaired header checksum. */
+     private fun synFrame(peerSequence: Int): ByteArray {
+         val template = Iap2LinkEngine()
+diff --git a/docs/R45-E2LB-repair.md b/docs/R45-E2LB-repair.md
+new file mode 100644
+index 0000000..1f74de1
+--- /dev/null
++++ b/docs/R45-E2LB-repair.md
+@@ -0,0 +1,24 @@
++# R45 / 0.1.32-test.1 — E2LB startup candidate
++
++## Exact baseline
++
++GitHub `1092679281/Android-`, commit `9bc86ce53237b83c23e588e6fa2c7376cca99381`, Actions run `45596424156`, complete-source artifact `15014496262`. Original ZIP SHA-256 `d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b`. Original uploaded APK SHA-256 `843d82355b271bb288adfcef19a21f0213897be13156307830adc2b459dc272a`. This is the actual R44 full-source artifact, not R26 or a decompiled replacement. Inherited fingerprint/evidence files refer to earlier builds and do not verify R45.
++
++## Evidence and scope
++
++The November 26 redacted report shows three sessions ending about 2.3 seconds after availability 0x4300, with no observed ACK for seq 110, three DETECT markers in each observation window and a new SYN. It does not include the raw wire frames or demonstrate why the receiver restarted. The unverified MFi response is not authentication success. No change to wire shape, DETECT response strategy, authentication or receiver identity is made here. No UI/media changes.
++
++## Changes
++
++- Preserve observed-control state at termination; separately record local stream write return and cumulative peer ACK. Synchronous I/O failure retains the receipt rather than discarding it.
++- Classify observed peer renegotiation separately from generic link end. A generated frame or successful local write is not proof of receiver acceptance.
++- Recheck startup cancellation and E2LB link liveness before deriving/returning the endpoint and immediately before publishing it in the shared BT session. This narrows a check-to-use race; does not make external callback delivery atomic with socket closure. Existing originating-link and observation ownership checks remain in force.
++- Make client completion logs conditional on the current generation; do not promise a retry after a circuit breaker or cancellation. Retry policy itself is unchanged.
++- Add explicit Java deque for standalone compiler compatibility and bump base version to 0.1.32.
++- Add synthetic log-order replay for the three new SYN sequence numbers, and a threaded regression for handoff on an already-retired link. These are not captures or a real receiver emulator.
++
++## Verification and limits
++
++51 targeted Kotlin/JVM test methods passed using kotlinc and a minimal JUnit-compatible assertion/reflection harness; no per-method timeout enforcement by that harness (external process timeout applied). Tests cover the engine, transport, receipt tracking and availability classification; Android-dependent callers were not compiled by this run. `git diff --check` and clean-baseline patch application verified. Full Gradle wrapper invocation failed before compilation: Gradle 8.10.2 not cached and services.gradle.org DNS unavailable; Android SDK not configured in this environment. No Android lint, APK, signing or vehicle verification. No repository modification or push. Successful real-vehicle connection requires a fresh, valid authenticated session and evidence of receiver session start/authorized handoff; this patch does not establish that result.
++
++Suggested CI gate from the patched full source: `bash gradlew spotlessApply spotlessCheck :app:testStandardDebugUnitTest :app:lintStandardDebug :app:assembleStandardDebug :app:assembleRemoteDebug` then `bash gradlew :app:testRemoteDebugUnitTest --tests 'com.mcarplay.app.bridge.*'`. Verify artifact package/version/signing before device installation. Do not assume an independently debug-signed APK can upgrade the old debug install.

@@ -1,0 +1,344 @@
+name: Reconstruct and validate R56 plus maintenance candidates
+
+on:
+  push:
+    branches: [maintenance/r56-source-of-truth]
+    paths:
+      - "r56-build/**"
+      - ".github/workflows/verify-r56-source.yml"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: r56-source-validation
+  cancel-in-progress: false
+
+jobs:
+  reconstruct-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout reconstruction kit
+        uses: actions/checkout@v4
+        with:
+          path: kit
+
+      - name: Restore and permanently archive exact R44 baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          tag="r44-source-baseline"
+          asset="mcarplay-R44-verified-complete-source.zip"
+          expected="d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b"
+          zip="$RUNNER_TEMP/$asset"
+
+          if gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "$asset"; then
+            gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$RUNNER_TEMP"
+          else
+            curl --fail --location --retry 3 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$repo/actions/artifacts/15014496262/zip" \
+              --output "$zip"
+            echo "$expected  $zip" | sha256sum --check
+            if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+              gh release upload "$tag" "$zip" --clobber --repo "$repo"
+            else
+              gh release create "$tag" "$zip" --repo "$repo" \
+                --target 9bc86ce53237b83c23e588e6fa2c7376cca99381 \
+                --title "R44 verified source baseline (source only)" \
+                --notes "Immutable R44 / 0.1.31 source baseline. SHA-256: $expected. This is a source archive, not an APK release."
+            fi
+          fi
+          echo "$expected  $zip" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/r44-baseline"
+          unzip -q "$zip" -d "$RUNNER_TEMP/r44-baseline"
+          cd "$RUNNER_TEMP/r44-baseline"
+          test -f r44-source-fingerprint.tsv
+          echo "R44 baseline archive SHA-256 verified; the embedded TSV audit is recorded by rebuild-r56.sh."
+          echo "R44_BASELINE=$RUNNER_TEMP/r44-baseline" >> "$GITHUB_ENV"
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          sdkmanager="$(find "$sdk/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          yes | "$sdkmanager" --sdk_root="$sdk" --licenses >/dev/null || true
+          "$sdkmanager" --sdk_root="$sdk" --install 'platforms;android-35' 'build-tools;35.0.0'
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Reconstruct exact R56 source and verify fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash kit/r56-build/rebuild-r56.sh "$R44_BASELINE"
+          cd "$R44_BASELINE"
+          zip -qr "$RUNNER_TEMP/mcarplay-R56-0.1.43-organized-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties'
+
+      - name: Apply verified R57 maintenance candidate after exact R56 verification
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R57-link-hardening-from-R56.patch"
+          echo "a49d62a32917da3aa33e53c11aa92116ad039175a714bdeb002973bb3967d270  $patch" | sha256sum --check
+          cd "$R44_BASELINE"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0" + sha256(p.read_bytes()).digest() + b"\n")
+          actual = digest.hexdigest()
+          print(f"R57 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 827 or actual != "c0a92358ca8a283ad73f041274ef7915b15f7a10e5c9c45640f0e5f82ed91318":
+              raise SystemExit("R57 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R57-0.1.44-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties'
+
+      - name: Apply verified R58 fail-closed MFi and reliable E2LB candidate
+        id: r58
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58-mfi-fail-closed-e2lb-reliability.patch.bz2"
+          echo "38c4a8288e04b77954ccfa064a5d2151dd0185892b6f0c8e57b2eea753f6e77e  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58-mfi-fail-closed-e2lb-reliability.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "b8117e253101ec6449c24a38c3a53526ffba509ce40a128246bc27636d14b9d8  $patch" | sha256sum --check
+          cd "$R44_BASELINE"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0" + sha256(p.read_bytes()).digest() + b"\n")
+          actual = digest.hexdigest()
+          print(f"R58 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 830 or actual != "125ec362a2b4766fe1db4c7a63adaf26fe48afe4e893a078850662e893051fcb":
+              raise SystemExit("R58 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
+      - name: Apply verified R58.1 late-0x4301 drain and formatting correction
+        id: r58delta
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.1-late-4301-drain.patch.bz2"
+          echo "13e6a36f8eb782413239c9bc0eaf6b303c83837b107cb494c43319c508c3ea95  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.1-late-4301-drain.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "fbd73f19d4916802c4dc5a4b9ac3695857ded23deb3fa4fc880bda1bdb6b54a1  $patch" | sha256sum --check
+          cd "$R44_BASELINE"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.1 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 832 or actual != "4a3c8abacc5800c6d09059f1d4fde4ea99323c0eb105300cfa77e9d63d337501":
+              raise SystemExit("R58.1 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.1-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
+      - name: Apply R58.2 compile fix and canonical Kotlin formatting
+        id: r582
+        if: ${{ steps.r58delta.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt")
+          source = p.read_text()
+          bad = "Iap2AvailabilityFramePump(initialStartSession, ::deferFrame, ::log)"
+          good = "Iap2AvailabilityFramePump(initialStartSession, ::deferFrame, log)"
+          count = source.count(bad)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one stale function reference; found {count}")
+          p.write_text(source.replace(bad, good, 1))
+          print("R58.2 compile fix applied: pass log function value, not invalid ::log reference")
+          PY
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --console=plain --rerun-tasks spotlessApply
+          python3 "$GITHUB_WORKSPACE/kit/r56-build/maintenance/normalize-r58-formatting.py"
+          ./gradlew --no-daemon --console=plain --rerun-tasks spotlessCheck
+          zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.2 candidate: files={len(files)} tree_sha256={actual}")
+          print("R58.2 fingerprint recorded after forced, non-incremental Spotless run")
+          PY
+      - name: Apply R58.3 E2LB startup probe suppression
+        id: r583
+        if: ${{ steps.r582.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.3-disable-speculative-detect-probe.patch.bz2"
+          echo "39d49444fb1371e16f7d14b6bcef46e05f292a77302bb5080d78a5b675b6e203  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.3-disable-speculative-detect-probe.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "37192a930a3b66d6bf2d359088263b9459ba141e0da6e4d7d5640f31aa8c5b9b  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.3 candidate: files={len(files)} tree_sha256={actual}")
+          print("R58.3 fingerprint recorded; pin after clean formatter run")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.3-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
+      - name: Apply R58.4 CBR-first encoder selection
+        id: r584
+        if: ${{ steps.r583.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.4-cbr-first-encoder.patch.bz2"
+          echo "ae1838d89e552fb2800dd94e3fb674d3841bd05428c58bbf4dbb10998a4d7012  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.4-cbr-first-encoder.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "9c13115f5867fd049e82df1c2c22641a0f2113b8affdd99a836a9afd48abb3d4  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+
+      - name: Audit Kotlin formatting (blocking verification after formatter)
+
+        if: ${{ steps.r584.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain spotlessApply
+          ./gradlew --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          print(f"R58.4 formatted candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.4-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
+      - name: Run Android tests, lint and build debug APKs (all gates attempted)
+        if: ${{ steps.r584.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain --continue \
+            :app:testStandardDebugUnitTest \
+            :app:lintStandardDebug \
+            :app:assembleStandardDebug \
+            :app:testRemoteDebugUnitTest \
+            :app:assembleRemoteDebug
+
+      - name: Verify both candidate APKs and record metadata
+        if: ${{ !cancelled() && steps.r584.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          standard=(app/build/outputs/apk/standard/debug/*.apk)
+          remote=(app/build/outputs/apk/remote/debug/*.apk)
+          test "${#standard[@]}" -eq 1
+          test "${#remote[@]}" -eq 1
+          aapt="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          signer="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          report="$RUNNER_TEMP/r58-apk-verification.txt"
+          : > "$report"
+          verify_apk() {
+            local file="$1" pkg="$2" variant="$3"
+            local badging
+            badging="$("$aapt" dump badging "$file")"
+            printf '\nVariant: %s\n%s\n' "$variant" "$file" >> "$report"
+            printf '%s\n' "$badging" | grep "^package:" | tee -a "$report"
+            printf '%s\n' "$badging" | grep "^package: name='$pkg' versionCode='1450000' versionName='0\.1\.45[^']*-debug'"
+            "$signer" verify --verbose --print-certs "$file" >> "$report"
+            sha256sum "$file" | tee -a "$report"
+          }
+          verify_apk "${standard[0]}" com.mcarplay.app StandardDebug
+          verify_apk "${remote[0]}" com.mcarplay.app.rd RemoteDebug
+
+      - name: Upload reconstructed source and debug APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-R58.4-0.1.45-candidate-source-and-debug-apks
+          path: |
+            ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
+            ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.1-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.2-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.3-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/r58-apk-verification.txt
+            ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
+            ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
+            ${{ runner.temp }}/r44-baseline/app/build/reports/tests/**
+            ${{ runner.temp }}/r44-baseline/app/build/test-results/**
+            ${{ runner.temp }}/r44-baseline/app/build/reports/lint-results-standardDebug.html
+          if-no-files-found: warn
+          retention-days: 90

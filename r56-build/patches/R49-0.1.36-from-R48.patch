@@ -1,0 +1,439 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 717a241..092bc1b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,16 @@
+ # Changelog
+ 
++## [v0.1.36-test.1] - 2026-11-26
++
++> R49 identity-boundary hardening candidate. No E2LB/iAP2 connection fix claimed.
++
++- Treat missing, malformed, or mismatched Pair-Verify receiver identity fields as untrusted identity failures; stop retry/fallback paths.
++- Validate receiver identifiers as bounded, strict UTF-8 without control characters; log only a stable SHA-256 fingerprint.
++- Add regression cases for malformed Pair-Verify M2 fields, identity mismatch, malformed UTF-8, and log injection.
++- 将 Pair-Verify 缺失、畸形或不匹配的接收端身份统一视为不可信身份，停止重试及降级路径。
++- 对接收端标识进行长度、严格 UTF-8 和控制字符校验；日志只输出 SHA-256 指纹，避免原始标识泄露及日志注入。
++- 增加 Pair-Verify M2 畸形字段、身份不匹配、非法 UTF-8 和日志注入回归测试。
++
+ ## [v0.1.35-test.1] - 2026-11-26
+ 
+ > R48 hardening candidate. AirPlay identity verification now fails closed without a verified receiver key; no E2LB vehicle fix claimed.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 11bb0d4..76753dc 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.35"
++val appVersionName = "0.1.36"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt b/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt
+index 1875d10..577372e 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/PairingClients.kt
+@@ -139,7 +139,6 @@ class PairSetupClient(
+                 throw UntrustedReceiverIdentityException("pair-setup M6 接收端身份信封认证失败：${error.javaClass.simpleName}")
+             }
+         val receiverId = inner[Tlv8.TYPE_IDENTIFIER]
+-            ?.takeIf { it.isNotEmpty() }
+             ?: throw UntrustedReceiverIdentityException("pair-setup M6 缺少接收端 identifier")
+         val receiverKey = inner[Tlv8.TYPE_PUBLIC_KEY]
+             ?.takeIf { it.size == 32 }
+@@ -160,12 +159,13 @@ class PairSetupClient(
+                 receiverSignature,
+             )
+         if (!valid) throw UntrustedReceiverIdentityException("pair-setup: 接收端签名校验失败")
++        val decodedReceiverId = decodeReceiverIdentifier(receiverId, "pair-setup M6")
+         log("pair-setup: ✓ M6 接收端身份与签名已验证")
+         log(
+-            "pair-setup: 接收端身份 id=${receiverId.toString(Charsets.UTF_8)} " +
++            "pair-setup: 接收端身份 fingerprint=${receiverIdentifierFingerprint(receiverId)} " +
+                 "pub=${receiverKey.toHexString().take(16)}… 签名校验=$valid",
+         )
+-        return ReceiverIdentity(receiverId.toString(Charsets.UTF_8), receiverKey)
++        return ReceiverIdentity(decodedReceiverId, receiverKey)
+     }
+ 
+     data class ReceiverIdentity(
+@@ -216,10 +216,22 @@ class PairVerifyClient(
+                     ),
+                 ),
+             )
+-        val receiverEphemeral = m2[Tlv8.TYPE_PUBLIC_KEY] ?: throw IOException("pair-verify M2 缺少 publicKey")
+-        val encrypted = m2[Tlv8.TYPE_ENCRYPTED_DATA] ?: throw IOException("pair-verify M2 缺少 encryptedData")
++        val receiverEphemeral = m2[Tlv8.TYPE_PUBLIC_KEY]
++            ?.takeIf { it.size == 32 }
++            ?: throw UntrustedReceiverIdentityException("pair-verify M2 接收端临时公钥缺失或长度无效")
++        val encrypted = m2[Tlv8.TYPE_ENCRYPTED_DATA]
++            ?.takeIf { it.isNotEmpty() }
++            ?: throw UntrustedReceiverIdentityException("pair-verify M2 缺少加密身份信封")
+ 
+-        val shared = AirPlayCrypto.x25519Shared(ephemeral.privateKey, receiverEphemeral)
++        val shared =
++            try {
++                AirPlayCrypto.x25519Shared(ephemeral.privateKey, receiverEphemeral)
++            } catch (error: Exception) {
++                throw UntrustedReceiverIdentityException("pair-verify M2 临时密钥协商无效：${error.javaClass.simpleName}")
++            }
++        if (shared.all { it == 0.toByte() }) {
++            throw UntrustedReceiverIdentityException("pair-verify M2 临时公钥产生全零共享密钥")
++        }
+         val encryptionKey =
+             AirPlayCrypto.hkdfSha512(
+                 shared,
+@@ -234,17 +246,21 @@ class PairVerifyClient(
+             } catch (error: Exception) {
+                 throw UntrustedReceiverIdentityException("pair-verify M2 接收端身份信封认证失败：${error.javaClass.simpleName}")
+             }
+-        val receiverId = inner[Tlv8.TYPE_IDENTIFIER] ?: throw IOException("pair-verify M2 信封缺少 identifier")
+-        val receiverSignature = inner[Tlv8.TYPE_SIGNATURE] ?: throw IOException("pair-verify M2 信封缺少 signature")
+-        if (expectedReceiverId != null && receiverId.toString(Charsets.UTF_8) != expectedReceiverId) {
+-            throw IOException("pair-verify: 接收端身份与已保存配对不符")
++        val receiverIdBytes = inner[Tlv8.TYPE_IDENTIFIER]
++            ?: throw UntrustedReceiverIdentityException("pair-verify M2 信封缺少 identifier")
++        val receiverId = decodeReceiverIdentifier(receiverIdBytes, "pair-verify M2")
++        val receiverSignature = inner[Tlv8.TYPE_SIGNATURE]
++            ?.takeIf { it.size == 64 }
++            ?: throw UntrustedReceiverIdentityException("pair-verify M2 接收端签名缺失或长度无效")
++        if (expectedReceiverId != null && receiverId != expectedReceiverId) {
++            throw UntrustedReceiverIdentityException("pair-verify: 接收端身份与已保存配对不符")
+         }
+ 
+         // 必须验证接收端静态身份签名；不能因 mDNS/0x4301 未提供公钥而跳过。
+         val valid =
+             AirPlayCrypto.ed25519Verify(
+                 trustedReceiverKey,
+-                receiverEphemeral + receiverId + ephemeral.publicKey,
++                receiverEphemeral + receiverIdBytes + ephemeral.publicKey,
+                 receiverSignature,
+             )
+         log("pair-verify: 接收端静态身份签名校验=$valid")
+diff --git a/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt b/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt
+index 898c9ac..f22f4bb 100644
+--- a/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/airplay/ReceiverTrustPolicy.kt
+@@ -1,6 +1,10 @@
+ package com.mcarplay.app.airplay
+ 
+ import java.io.IOException
++import java.nio.ByteBuffer
++import java.nio.charset.CharacterCodingException
++import java.nio.charset.CodingErrorAction
++import java.security.MessageDigest
+ 
+ /** 身份信任链不完整或验证失败：不能通过重试/明文降级绕过。 */
+ internal class UntrustedReceiverIdentityException(message: String) : IOException(message)
+@@ -15,3 +19,34 @@ internal fun requireTrustedReceiverStaticPublicKey(key: ByteArray?): ByteArray {
+     }
+     return key.copyOf()
+ }
++
++/** Decode an AirPlay receiver identifier without replacement characters or log-control bytes. */
++internal fun decodeReceiverIdentifier(bytes: ByteArray?, stage: String): String {
++    if (bytes == null || bytes.isEmpty() || bytes.size > MAX_RECEIVER_IDENTIFIER_BYTES) {
++        throw UntrustedReceiverIdentityException("$stage: 接收端 identifier 缺失或长度无效")
++    }
++    val decoded =
++        try {
++            Charsets.UTF_8
++                .newDecoder()
++                .onMalformedInput(CodingErrorAction.REPORT)
++                .onUnmappableCharacter(CodingErrorAction.REPORT)
++                .decode(ByteBuffer.wrap(bytes))
++                .toString()
++        } catch (_: CharacterCodingException) {
++            throw UntrustedReceiverIdentityException("$stage: 接收端 identifier 不是合法 UTF-8")
++        }
++    if (decoded.isBlank() || decoded.any { Character.isISOControl(it) }) {
++        throw UntrustedReceiverIdentityException("$stage: 接收端 identifier 为空或包含控制字符")
++    }
++    return decoded
++}
++
++/** Stable, non-reversible diagnostic label; never write the raw receiver identifier to logs. */
++internal fun receiverIdentifierFingerprint(bytes: ByteArray): String =
++    MessageDigest.getInstance("SHA-256")
++        .digest(bytes)
++        .take(6)
++        .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
++
++private const val MAX_RECEIVER_IDENTIFIER_BYTES = 255
+diff --git a/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt b/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt
+index 31c1346..c67781c 100644
+--- a/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt
++++ b/app/src/test/java/com/mcarplay/app/airplay/AirPlayPairingTest.kt
+@@ -330,12 +330,151 @@ class AirPlayPairingTest {
+         val receiver = MockReceiver()
+         val transport = TlvTransport { path, body -> receiver.handle(path, body) }
+         val identity = newIdentity()
+-        assertThrows(IOException::class.java) { PairVerifyClient(identity, transport) {}.run(receiver.staticKey.publicKey, "other-id") }
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(identity, transport) {}.run(receiver.staticKey.publicKey, "other-id")
++        }
+         assertThrows(UntrustedReceiverIdentityException::class.java) {
+             PairVerifyClient(identity, transport) {}.run(newIdentity().publicKey, receiver.pairingId)
+         }
+     }
+ 
++    @Test
++    fun pairVerifyMissingIdentityFieldsFailClosedBeforeRetryableIoClassification() {
++        val cases = listOf(
++            MockReceiver(omitVerifyIdentifier = true),
++            MockReceiver(omitVerifySignature = true),
++            MockReceiver(omitVerifyEphemeral = true),
++            MockReceiver(omitVerifyEncryptedData = true),
++        )
++        for (receiver in cases) {
++            val transport = TlvTransport { path, body -> receiver.handle(path, body) }
++            assertThrows(UntrustedReceiverIdentityException::class.java) {
++                PairVerifyClient(newIdentity(), transport) {}.run(receiver.staticKey.publicKey)
++            }
++        }
++    }
++
++    @Test
++    fun pairVerifyRejectsMalformedUtf8ReceiverIdentifier() {
++        val receiver = MockReceiver(verifyIdentityBytesOverride = byteArrayOf(0xC3.toByte(), 0x28))
++        val transport = TlvTransport { path, body -> receiver.handle(path, body) }
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(newIdentity(), transport) {}.run(receiver.staticKey.publicKey)
++        }
++    }
++
++    @Test
++    fun pairVerifyRejectsShortAndLowOrderEphemeralKeys() {
++        val shortKeyReceiver = MockReceiver(verifyEphemeralBytesOverride = ByteArray(31))
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(
++                newIdentity(),
++                TlvTransport { path, body -> shortKeyReceiver.handle(path, body) },
++            ) {}.run(shortKeyReceiver.staticKey.publicKey)
++        }
++
++        val lowOrderReceiver = MockReceiver(verifyEphemeralBytesOverride = ByteArray(32))
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(
++                newIdentity(),
++                TlvTransport { path, body -> lowOrderReceiver.handle(path, body) },
++            ) {}.run(lowOrderReceiver.staticKey.publicKey)
++        }
++    }
++
++    @Test
++    fun rememberedIdentityMismatchStopsHandshakeWithoutDeletingTrustOrRegisteringAgain() {
++        val receiver = MockReceiver(verifyIdentityBytesOverride = "different-receiver".toByteArray())
++        val requests = mutableListOf<String>()
++        var reconnects = 0
++        var invalidations = 0
++        var newSetups = 0
++        val transport = TlvTransport { path, body ->
++            requests += path
++            receiver.handle(path, body)
++        }
++        val handshake =
++            PairingHandshake(
++                newIdentity(),
++                { transport },
++                { reconnects++ },
++                {},
++                onTrustInvalidated = { invalidations++ },
++                onSetupIdentity = { newSetups++ },
++            )
++        val remembered = PairSetupClient.ReceiverIdentity(receiver.pairingId, receiver.staticKey.publicKey)
++
++        assertThrows(UntrustedReceiverIdentityException::class.java) { handshake.run(remembered, null) }
++        assertEquals(listOf("/pair-verify"), requests)
++        assertEquals(0, reconnects)
++        assertEquals(0, invalidations)
++        assertEquals(0, newSetups)
++    }
++
++    @Test
++    fun pairSetupRejectsOversizedAndEmptySignedReceiverIdentifiers() {
++        for (invalidId in listOf(ByteArray(256) { 'a'.code.toByte() }, ByteArray(0))) {
++            val receiver = MockReceiver(accessoryIdentityBytesOverride = invalidId)
++            assertThrows(UntrustedReceiverIdentityException::class.java) {
++                PairSetupClient(
++                    newIdentity(),
++                    TlvTransport { path, body -> receiver.handle(path, body) },
++                ) {}.run()
++            }
++        }
++    }
++
++    @Test
++    fun pairSetupRejectsControlCharactersInSignedReceiverIdentifier() {
++        val receiver = MockReceiver(accessoryIdentityBytesOverride = "receiver\nforged-log-entry".toByteArray())
++        val logs = mutableListOf<String>()
++        val transport = TlvTransport { path, body -> receiver.handle(path, body) }
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairSetupClient(newIdentity(), transport) { logs += it }.run()
++        }
++        assertTrue(logs.none { it.contains("forged-log-entry") })
++    }
++
++    @Test
++    fun pairSetupRejectsMalformedUtf8SignedReceiverIdentifier() {
++        val receiver = MockReceiver(accessoryIdentityBytesOverride = byteArrayOf(0xC3.toByte(), 0x28))
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairSetupClient(
++                newIdentity(),
++                TlvTransport { path, body -> receiver.handle(path, body) },
++            ) {}.run()
++        }
++    }
++
++    @Test
++    fun pairVerifyRejectsEmptyIdentifierAndShortSignature() {
++        val emptyIdReceiver = MockReceiver(verifyIdentityBytesOverride = ByteArray(0))
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(
++                newIdentity(),
++                TlvTransport { path, body -> emptyIdReceiver.handle(path, body) },
++            ) {}.run(emptyIdReceiver.staticKey.publicKey)
++        }
++
++        val shortSignatureReceiver = MockReceiver(verifySignatureBytesOverride = ByteArray(63))
++        assertThrows(UntrustedReceiverIdentityException::class.java) {
++            PairVerifyClient(
++                newIdentity(),
++                TlvTransport { path, body -> shortSignatureReceiver.handle(path, body) },
++            ) {}.run(shortSignatureReceiver.staticKey.publicKey)
++        }
++    }
++
++    @Test
++    fun pairSetupLogsOnlyAStableIdentifierFingerprint() {
++        val receiver = MockReceiver()
++        val logs = mutableListOf<String>()
++        val transport = TlvTransport { path, body -> receiver.handle(path, body) }
++        PairSetupClient(newIdentity(), transport) { logs += it }.run()
++        assertTrue(logs.any { it.contains("fingerprint=") })
++        assertTrue(logs.none { it.contains(receiver.pairingId) })
++    }
++
+     @Test
+     fun pairingResponsesRejectErrorsAndUnexpectedStates() {
+         for ((path, state) in listOf(
+@@ -374,6 +513,14 @@ class AirPlayPairingTest {
+         private val padded: Boolean = true,
+         private var shortKeyRounds: Int = 0,
+         private val badSetupSignature: Boolean = false,
++        private val accessoryIdentityBytesOverride: ByteArray? = null,
++        private val verifyIdentityBytesOverride: ByteArray? = null,
++        private val omitVerifyIdentifier: Boolean = false,
++        private val omitVerifySignature: Boolean = false,
++        private val omitVerifyEphemeral: Boolean = false,
++        private val omitVerifyEncryptedData: Boolean = false,
++        private val verifyEphemeralBytesOverride: ByteArray? = null,
++        private val verifySignatureBytesOverride: ByteArray? = null,
+     ) {
+         val staticKey = AirPlayCrypto.ed25519Generate()
+         val pairingId = "3e6f5739-b2bf-4ebf-bb87-5b6b57cc42e5"
+@@ -508,7 +655,7 @@ class AirPlayPairingTest {
+             }
+             pairings[controllerId.toString(Charsets.UTF_8)] = controllerLtpk
+ 
+-            val accessoryId = pairingId.toByteArray(Charsets.UTF_8)
++            val accessoryId = accessoryIdentityBytesOverride ?: pairingId.toByteArray(Charsets.UTF_8)
+             val accessorySignKey = hkdf("Pair-Setup-Accessory-Sign-Salt", "Pair-Setup-Accessory-Sign-Info")
+             val signature = AirPlayCrypto.ed25519Sign(staticKey.privateKey, accessorySignKey + accessoryId + staticKey.publicKey)
+             if (badSetupSignature) signature[0] = (signature[0].toInt() xor 1).toByte()
+@@ -539,29 +686,29 @@ class AirPlayPairingTest {
+             pvShared = AirPlayCrypto.x25519Shared(pair.privateKey, clientEphemeral)
+             pvEncryptionKey = hkdf("Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info")
+ 
+-            val accessoryId = pairingId.toByteArray(Charsets.UTF_8)
++            val accessoryId = verifyIdentityBytesOverride ?: pairingId.toByteArray(Charsets.UTF_8)
+             val signature =
+-                AirPlayCrypto.ed25519Sign(
++                verifySignatureBytesOverride ?: AirPlayCrypto.ed25519Sign(
+                     staticKey.privateKey,
+                     pair.publicKey + accessoryId + clientEphemeral,
+                 )
+-            val sub =
+-                Tlv8.encode(
+-                    listOf(
+-                        Tlv8.Item(Tlv8.TYPE_IDENTIFIER, accessoryId),
+-                        Tlv8.Item(Tlv8.TYPE_SIGNATURE, signature),
+-                    ),
+-                )
+-            return Tlv8.encode(
+-                listOf(
+-                    Tlv8.Item(Tlv8.TYPE_STATE, byteArrayOf(2)),
+-                    Tlv8.Item(Tlv8.TYPE_PUBLIC_KEY, pair.publicKey),
++            val subItems = ArrayList<Tlv8.Item>()
++            if (!omitVerifyIdentifier) subItems += Tlv8.Item(Tlv8.TYPE_IDENTIFIER, accessoryId)
++            if (!omitVerifySignature) subItems += Tlv8.Item(Tlv8.TYPE_SIGNATURE, signature)
++            val sub = Tlv8.encode(subItems)
++            val outerItems = ArrayList<Tlv8.Item>()
++            outerItems += Tlv8.Item(Tlv8.TYPE_STATE, byteArrayOf(2))
++            if (!omitVerifyEphemeral) {
++                outerItems += Tlv8.Item(Tlv8.TYPE_PUBLIC_KEY, verifyEphemeralBytesOverride ?: pair.publicKey)
++            }
++            if (!omitVerifyEncryptedData) {
++                outerItems +=
+                     Tlv8.Item(
+                         Tlv8.TYPE_ENCRYPTED_DATA,
+                         AirPlayCrypto.chachaSeal(pvEncryptionKey, AirPlayCrypto.nonceLabel("PV-Msg02"), sub),
+-                    ),
+-                ),
+-            )
++                    )
++            }
++            return Tlv8.encode(outerItems)
+         }
+ 
+         private fun verifyM4(tlv: Map<Int, ByteArray>): ByteArray {
+diff --git a/docs/R49-PAIRING-IDENTITY-HARDENING.md b/docs/R49-PAIRING-IDENTITY-HARDENING.md
+new file mode 100644
+index 0000000..aceda21
+--- /dev/null
++++ b/docs/R49-PAIRING-IDENTITY-HARDENING.md
+@@ -0,0 +1,41 @@
++# R49 / 0.1.36 — AirPlay receiver identity boundary hardening
++
++## Baseline
++
++- R48 / 0.1.35 candidate source.
++- R44 verified source lineage remains unchanged; R48 changes are inherited.
++- This is a security/robustness candidate. It is **not** an E2LB Bluetooth/iAP2 connection fix.
++
++## Findings addressed
++
++1. Pair-Verify M2 identity mismatch was previously thrown as generic `IOException`. `AirPlayClient` could therefore retry the same untrusted receiver response inside the pairing window. It is now `UntrustedReceiverIdentityException`, which follows the existing fail-closed stop path.
++2. Missing Pair-Verify M2 ephemeral key, encrypted identity envelope, identifier, or signature was previously treated as generic protocol I/O failure. These incomplete identity proofs now fail closed as untrusted identity.
++3. Pair-Verify ephemeral X25519 key length is checked before use; X25519 errors and all-zero shared secrets are rejected before deriving the encryption key.
++4. Pair-Setup M6 and Pair-Verify M2 receiver identifiers now require bounded (1..255 byte), strict UTF-8, nonblank text without Unicode control characters.
++5. Pair-Setup logs no longer emit the raw receiver identifier. A short SHA-256 fingerprint is used instead, avoiding control-character log injection and reducing identifier disclosure.
++6. A remembered receiver identity mismatch now has an integration regression proving it does not delete saved trust, reconnect, or fall back to a new Pair-Setup registration.
++
++## Tests
++
++Executed with Kotlin/JVM 1.9.0, JDK 21, Bouncy Castle 1.80 and the repository's focused JUnit-compatible harness:
++
++- `AirPlayPairingTest`: 28 passed.
++- `PairingRejectionTest`: 7 passed.
++- `ReconnectAttemptPolicyTest`: 4 passed (R48 class retained unchanged).
++- Total: **39 passed, 0 failed**.
++
++New fault cases include missing M2 identity fields, short and low-order X25519 ephemeral keys, malformed/empty/oversized identifiers, invalid UTF-8, control-character log injection, short signatures, and remembered-identity mismatch with no retry/fallback.
++
++`git diff --check` passed. The changed pairing production sources and focused tests compiled with `kotlinc`; the only warnings were the existing deprecated `AESEngine()` constructor and an existing unnecessary `!!` in a test.
++
++## Not verified
++
++- Full Android Gradle build, Android Lint, Spotless, APK assembly/signing and emulator tests were not run. `bash gradlew :app:testStandardDebugUnitTest --no-daemon` stopped before Gradle startup because `services.gradle.org` DNS resolution failed (`UnknownHostException`).
++- No physical E2LB test was run.
++- MFi certificate-chain/challenge signature verification is still not implemented. An observed 0xAA03 remains `RESPONSE_UNVERIFIED`; the compatibility 0xAA05 signal is not proof of authentication.
++- 0x4300 no-ACK and the receiver's new-SYN behavior remain unresolved. No protocol payload, challenge length, DUAL_GROUP/SINGLE_GROUP choice or DETECT/SYN behavior was changed without a valid native trace/specification.
++- No APK was produced and no GitHub branch or release was modified.
++
++## Acceptance status
++
++R49 improves AirPlay receiver identity failure handling and diagnostic privacy. It does not close the original Bluetooth/iAP2 startup failure. Release remains blocked on full Android CI and repeated E2LB vehicle acceptance (valid MFi evidence, 0x4300/0x4301, Wi-Fi handoff, AirPlay SETUP/RECORD, video/audio/touch, and reconnect).

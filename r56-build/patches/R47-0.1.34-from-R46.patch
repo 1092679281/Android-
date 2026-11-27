@@ -1,0 +1,627 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3cd5e7e..5cb94fc 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,16 @@
+ Release notes are listed newest first. English is followed by Simplified Chinese.
+ Test releases are experimental and do not establish real-vehicle compatibility.
+ 
++## [v0.1.34-test.1] - 2026-11-26
++
++> R47 experimental candidate. No verified E2LB connection fix; Android and vehicle gates remain open.
++
++- Reject late RFCOMM registration after listener retirement; serialize explicit stop/start.
++- Retain failed network-unbind cleanup and reject verified network handoff when callback registration fails.
++- Bound Ctrl client admission and close active sockets on stop; freeze terminal diagnostic timestamps.
++- 停止监听后拒绝旧监听实例登记；Wi-Fi 解绑失败保留清理状态，监听注册失败不报告入网成功。
++- 限制 Ctrl 接入并发、停止时关闭连接，冻结已结束会话诊断时间。实车握手仍待验证。
++
+ ## [v0.1.33-test.1] - 2026-11-26
+ 
+ > R46 candidate; no verified vehicle connection fix.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index d0e32d7..3bfe124 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.33"
++val appVersionName = "0.1.34"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt
+index 5d7e64f..bd04acd 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/Iap2BluetoothServer.kt
+@@ -85,6 +85,7 @@ class Iap2BluetoothServer(
+         ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
+             PackageManager.PERMISSION_GRANTED
+ 
++    @Synchronized
+     fun start(): Boolean =
+         try {
+             listener.start()
+@@ -238,7 +239,7 @@ class Iap2BluetoothServer(
+             val observation = ReceiverDetectionRuntime.observation(peerAddress)
+             Thread({
+                 try {
+-                    runSession(socket, observation, lease)
++                    runSession(records, socket, observation, lease)
+                 } finally {
+                     // Even if socket.inputStream fails before runSession try/finally.
+                     lease.close()
+@@ -288,6 +289,7 @@ class Iap2BluetoothServer(
+         }
+ 
+     private fun runSession(
++        records: PhoneSdpRecords<BluetoothServerSocket>,
+         socket: BluetoothSocket,
+         observation: ReceiverObservation?,
+         lease: BluetoothSessionArbiter.Lease,
+@@ -302,10 +304,16 @@ class Iap2BluetoothServer(
+             StreamDuplexStream(socket.inputStream, socket.outputStream) {
+                 runCatching { socket.close() }
+             }
+-        val channel = Iap2LinkChannel(stream, name = "iap2-bt") { line -> log(line) }
+-        synchronized(channelLock) {
+-            activeChannel = channel
++        var admitted: Iap2LinkChannel? = null
++        listener.admit(records) {
++            synchronized(channelLock) {
++                if (activeChannel == null && lease.isCurrent) {
++                    admitted = Iap2LinkChannel(stream, name = "iap2-bt") { line -> log(line) }
++                    activeChannel = admitted
++                }
++            }
+         }
++        val channel = admitted ?: return // outer worker closes the socket and lease
+         try {
+             val identity = connectionIdentity() ?: return
+             channel.runSenderSession(
+@@ -341,7 +349,9 @@ class Iap2BluetoothServer(
+             }
+             channel.close()
+             lease.close()
+-            log("SESSION 结束，等待接收端重连（BT 监听仍在运行）")
++            log(
++                if (listener.isRunning) "SESSION 结束，等待接收端重连（BT 监听仍在运行）" else "SESSION 结束，BT 监听已停止",
++            )
+         }
+     }
+ 
+@@ -370,9 +380,13 @@ class Iap2BluetoothServer(
+         )
+     }
+ 
++    @Synchronized
+     fun stop() {
+-        detachCurrentSession()
+-        listener.stop()
++        try {
++            listener.stop()
++        } finally {
++            detachCurrentSession()
++        }
+         log("BT: 监听已停止")
+     }
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/bt/PhoneSdpListener.kt b/app/src/main/java/com/mcarplay/app/bt/PhoneSdpListener.kt
+index e7a13c9..cd991ed 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/PhoneSdpListener.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/PhoneSdpListener.kt
+@@ -19,6 +19,17 @@ internal class PhoneSdpListener<T : Closeable>(
+     @Synchronized
+     fun isCurrent(expected: T): Boolean = records === expected
+ 
++    /** Atomically admit a short registration action only for the still-current listener. */
++    @Synchronized
++    fun admit(
++        expected: T,
++        action: () -> Unit,
++    ): Boolean {
++        if (records !== expected) return false
++        action()
++        return true
++    }
++
+     @Synchronized
+     fun start(): Boolean {
+         if (records != null) return true
+diff --git a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
+index 4c04a07..009834c 100644
+--- a/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
++++ b/app/src/main/java/com/mcarplay/app/diagnostics/ConnectionTimeline.kt
+@@ -350,13 +350,13 @@ class ConnectionTimeline(
+                 stage,
+                 status,
+                 screenSuspended,
+-                ((endedAt ?: elapsedTime()) - started).coerceAtLeast(0),
++                (now - started).coerceAtLeast(0),
+                 code,
+                 frames,
+                 videoBytes,
+                 chunks,
+                 audioBytes,
+-                lastVideo?.let { time -> (elapsedTime() - time).coerceAtLeast(0) },
++                lastVideo?.let { time -> (now - time).coerceAtLeast(0) },
+                 sourceFrames,
+                 audioPackets,
+                 milestones.toMap(),
+diff --git a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
+index e4cba88..b6239f3 100644
+--- a/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
++++ b/app/src/main/java/com/mcarplay/app/net/CarPlayCtrlAdvertiser.kt
+@@ -56,6 +56,7 @@ class CarPlayCtrlAdvertiser(
+ 
+         private const val TAG = "CTRL"
+         private const val MAX_HEAD_BYTES = 16 * 1024
++        private const val MAX_CLIENTS = 8
+ 
+         /** 同一 SSID 的强制重注册冷却（见 ensureForNetwork）。 */
+         private const val FORCE_COOLDOWN_MILLIS = 2_000L
+@@ -63,6 +64,7 @@ class CarPlayCtrlAdvertiser(
+ 
+     @Volatile
+     private var serverSocket: ServerSocket? = null
++    private val clients = CtrlClientRegistry<Socket>(MAX_CLIENTS)
+     private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+ 
+     /** accept 线程是否继续（只有 [stop] 清零；重注册不碰它，端口与线程都保持）。 */
+@@ -265,12 +267,32 @@ class CarPlayCtrlAdvertiser(
+                 } catch (_: Exception) {
+                     break
+                 }
+-            val generation = inviteGeneration
+-            if (serverSocket !== socket || !acceptRunning) {
++            val generation =
++                synchronized(this) {
++                    if (serverSocket !== socket || !acceptRunning || !clients.tryRegister(client)) {
++                        null
++                    } else {
++                        inviteGeneration
++                    }
++                }
++            if (generation == null) {
++                runCatching { client.close() }
++                if (serverSocket !== socket || !acceptRunning) break
++                continue
++            }
++            try {
++                Bg.run("ctrl-client") {
++                    try {
++                        handleClient(client, generation)
++                    } finally {
++                        clients.remove(client)
++                    }
++                }
++            } catch (error: RuntimeException) {
++                clients.remove(client)
+                 runCatching { client.close() }
+-                break
++                log("$TAG: 客户端任务提交失败 - ${error.javaClass.simpleName}")
+             }
+-            Bg.run("ctrl-client") { handleClient(client, generation) }
+         }
+     }
+ 
+@@ -402,6 +424,7 @@ class CarPlayCtrlAdvertiser(
+         registeredNetwork = null
+         runCatching { serverSocket?.close() }
+         serverSocket = null
++        clients.closeAll()
+         log("$TAG: 已停止")
+     }
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/net/CtrlClientRegistry.kt b/app/src/main/java/com/mcarplay/app/net/CtrlClientRegistry.kt
+new file mode 100644
+index 0000000..3a6dea9
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/net/CtrlClientRegistry.kt
+@@ -0,0 +1,33 @@
++package com.mcarplay.app.net
++
++import java.io.Closeable
++import java.util.Collections
++import java.util.IdentityHashMap
++
++/** Bounds active client work. The advertiser serializes admission with server start/stop. */
++internal class CtrlClientRegistry<T : Closeable>(
++    private val limit: Int,
++) {
++    init {
++        require(limit > 0)
++    }
++
++    private val clients = Collections.newSetFromMap(IdentityHashMap<T, Boolean>())
++
++    @Synchronized
++    fun tryRegister(client: T): Boolean = clients.size < limit && clients.add(client)
++
++    @Synchronized
++    fun remove(client: T) {
++        clients.remove(client)
++    }
++
++    fun closeAll() {
++        val retired =
++            synchronized(this) {
++                // Keep slots charged until their workers finish, including across a restart.
++                clients.toList()
++            }
++        retired.forEach { runCatching { it.close() } }
++    }
++}
+diff --git a/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt b/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt
+index e7d8135..2fe9e3c 100644
+--- a/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt
++++ b/app/src/main/java/com/mcarplay/app/net/NetworkBinding.kt
+@@ -4,9 +4,11 @@ package com.mcarplay.app.net
+ internal class NetworkBinding<N : Any, R : Any>(
+     private val bindProcess: (N?) -> Boolean,
+     private val isUsable: (N) -> Boolean,
++    private val onUnbindFailure: () -> Unit = {},
+ ) {
+     private var request: R? = null
+     private var network: N? = null
++    private var unbindPending = false
+ 
+     /** current() 主动清掉、但同一请求的 onLost 尚未到达的网络；onLost 到达时仍需通知一次。 */
+     private var invalidated: N? = null
+@@ -31,13 +33,18 @@ internal class NetworkBinding<N : Any, R : Any>(
+     @Synchronized
+     fun isCurrent(owner: R): Boolean = request === owner
+ 
++    @Synchronized
++    fun hasPendingUnbind(): Boolean = unbindPending
++
+     @Synchronized
+     fun bind(
+         owner: R,
+         candidate: N,
+         isCancelled: () -> Boolean = { false },
+     ): Boolean {
+-        if (request !== owner || isCancelled() || !bindProcess(candidate)) return false
++        if (request !== owner || isCancelled()) return false
++        if (unbindPending && !clearNetwork()) return false
++        if (isCancelled() || !bindProcess(candidate)) return false
+         network = candidate
+         invalidated = null
+         if (isCancelled()) {
+@@ -66,6 +73,10 @@ internal class NetworkBinding<N : Any, R : Any>(
+ 
+     @Synchronized
+     fun current(): N? {
++        if (unbindPending) {
++            clearNetwork()
++            return null
++        }
+         val current = network ?: return null
+         if (!isUsable(current)) {
+             clearNetwork()
+@@ -75,9 +86,12 @@ internal class NetworkBinding<N : Any, R : Any>(
+         return current
+     }
+ 
+-    private fun clearNetwork() {
+-        if (network == null) return
++    private fun clearNetwork(): Boolean {
++        if (network == null && !unbindPending) return true
++        // Never expose a logically retired network, even if the OS refuses to unbind.
+         network = null
+-        bindProcess(null)
++        unbindPending = !runCatching { bindProcess(null) }.getOrDefault(false)
++        if (unbindPending) runCatching { onUnbindFailure() }
++        return !unbindPending
+     }
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt b/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt
+index d467d85..7cd7eae 100644
+--- a/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt
++++ b/app/src/main/java/com/mcarplay/app/net/WifiCarPlayConnector.kt
+@@ -65,6 +65,7 @@ class WifiCarPlayConnector(
+                 if (!live) log("WiFi: 已丢弃失效的网络绑定（$network），下次连接将重新入网")
+                 live
+             },
++            onUnbindFailure = { log("WiFi: 进程解绑失败；旧绑定不再可用，下次绑定前重试清理") },
+         )
+ 
+     val currentNetwork: Network? get() = binding.current()
+@@ -75,8 +76,10 @@ class WifiCarPlayConnector(
+             runCatching {
+                 connectivityManager.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+             }.getOrDefault(false)
++        val bound = binding.current()
++        if (binding.hasPendingUnbind()) return null
+         return chooseWifiNetworkTarget(
+-            binding.current(),
++            bound,
+             connectivityManager.activeNetwork,
+             runCatching { connectivityManager.allNetworks.toList() }.getOrDefault(emptyList()),
+             ::isWifi,
+@@ -645,6 +648,7 @@ class WifiCarPlayConnector(
+             runCatching { connectivityManager.unregisterNetworkCallback(it) }
+         }
+         if (!binding.bind(callback, network)) {
++            binding.releaseIfCurrent(callback)
+             log("WiFi: 绑定已核验网络 $network 失败")
+             return false
+         }
+@@ -665,7 +669,8 @@ class WifiCarPlayConnector(
+                 log("WiFi: 已核验网络已绑定，但断开监听注册失败（${it.message}）")
+                 false
+             }
+-        if (registered && !binding.isCurrent(callback)) {
++        if (!registered || !binding.isCurrent(callback) || binding.current() != network) {
++            binding.releaseIfCurrent(callback)
+             runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+             return false
+         }
+diff --git a/app/src/test/java/com/mcarplay/app/bt/PhoneSdpAdmissionTest.kt b/app/src/test/java/com/mcarplay/app/bt/PhoneSdpAdmissionTest.kt
+new file mode 100644
+index 0000000..70b33e2
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/bt/PhoneSdpAdmissionTest.kt
+@@ -0,0 +1,66 @@
++package com.mcarplay.app.bt
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.Closeable
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import kotlin.concurrent.thread
++
++class PhoneSdpAdmissionTest {
++    private class Record : Closeable {
++        override fun close() = Unit
++    }
++
++    @Test
++    fun delayedAdmissionCannotRegisterAfterStopOrRestart() {
++        val opened = mutableListOf<Record>()
++        val listener = PhoneSdpListener({ Record() }, { opened.add(it) }, {})
++        var admitted = 0
++        listener.start()
++        val old = opened.single()
++        listener.stop()
++        assertFalse(listener.admit(old) { admitted++ })
++        listener.start()
++        assertFalse(listener.admit(old) { admitted++ })
++        assertTrue(listener.admit(opened.last()) { admitted++ })
++        assertEquals(1, admitted)
++        listener.stop()
++    }
++    @Test
++    fun stopCannotInterleaveWithAdmissionAction() {
++        val record = Record()
++        val listener = PhoneSdpListener({ record }, {}, {})
++        listener.start()
++        val entered = CountDownLatch(1)
++        val release = CountDownLatch(1)
++        val stopping = CountDownLatch(1)
++        val stopped = CountDownLatch(1)
++        val admitting = thread(isDaemon = true) {
++            listener.admit(record) {
++                entered.countDown()
++                release.await(2, TimeUnit.SECONDS)
++            }
++        }
++        try {
++            assertTrue(entered.await(2, TimeUnit.SECONDS))
++            val stopper = thread(isDaemon = true) {
++                stopping.countDown()
++                listener.stop()
++                stopped.countDown()
++            }
++            assertTrue(stopping.await(2, TimeUnit.SECONDS))
++            assertFalse(stopped.await(100, TimeUnit.MILLISECONDS))
++            release.countDown()
++            assertTrue(stopped.await(2, TimeUnit.SECONDS))
++            stopper.join(2000)
++            assertFalse(listener.admit(record) { error("retired record admitted") })
++        } finally {
++            release.countDown()
++            admitting.join(2000)
++            listener.stop()
++        }
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionTimelineFreezeTest.kt b/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionTimelineFreezeTest.kt
+new file mode 100644
+index 0000000..7be3fae
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/diagnostics/ConnectionTimelineFreezeTest.kt
+@@ -0,0 +1,24 @@
++package com.mcarplay.app.diagnostics
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class ConnectionTimelineFreezeTest {
++    @Test
++    fun videoAgeAndElapsedFreezeAtEnd() {
++        var now = 0L
++        val timeline = ConnectionTimeline({ now }, { now }, { "test" }, {})
++        val id = timeline.begin("test")
++        now = 100
++        timeline.media(id, true, 1)
++        now = 200
++        timeline.finish(id, DiagnosticCode.USER_STOP, false)
++        val ended = timeline.snapshot()!!
++        now = 9000
++        val later = timeline.snapshot()!!
++        assertEquals(100L, ended.lastVideoMsAgo)
++        assertEquals(ended.lastVideoMsAgo, later.lastVideoMsAgo)
++        assertEquals(ended.elapsedMs, later.elapsedMs)
++        assertEquals(ended.stageDurations, later.stageDurations)
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/net/CtrlClientRegistryTest.kt b/app/src/test/java/com/mcarplay/app/net/CtrlClientRegistryTest.kt
+new file mode 100644
+index 0000000..1cc1a15
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/net/CtrlClientRegistryTest.kt
+@@ -0,0 +1,63 @@
++package com.mcarplay.app.net
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.Closeable
++import java.io.IOException
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.Executors
++import java.util.concurrent.TimeUnit
++
++class CtrlClientRegistryTest {
++    private class Client(private val broken: Boolean = false) : Closeable {
++        var closed = 0
++
++        override fun close() {
++            closed++
++            if (broken) throw IOException("test")
++        }
++    }
++
++    @Test
++    fun saturationAndShutdownCloseAllAdmittedClientsEvenIfOneThrows() {
++        val registry = CtrlClientRegistry<Client>(2)
++        val first = Client(true)
++        val second = Client()
++        val third = Client()
++        assertTrue(registry.tryRegister(first))
++        assertTrue(registry.tryRegister(second))
++        assertFalse(registry.tryRegister(third))
++        registry.closeAll()
++        assertEquals(1, first.closed)
++        assertEquals(1, second.closed)
++        assertEquals(0, third.closed)
++        assertFalse(registry.tryRegister(third))
++        registry.remove(second)
++        assertTrue(registry.tryRegister(third))
++        registry.remove(first)
++        registry.closeAll()
++        assertEquals(1, third.closed)
++    }
++
++    @Test
++    fun concurrentAdmissionsCannotExceedLimit() {
++        val registry = CtrlClientRegistry<Client>(8)
++        val workers = Executors.newFixedThreadPool(16)
++        val start = CountDownLatch(1)
++        try {
++            val results = List(32) {
++                workers.submit<Boolean> {
++                    start.await()
++                    registry.tryRegister(Client())
++                }
++            }
++            start.countDown()
++            assertEquals(8, results.count { it.get(3, TimeUnit.SECONDS) })
++        } finally {
++            registry.closeAll()
++            workers.shutdownNow()
++        }
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/net/NetworkBindingClosureTest.kt b/app/src/test/java/com/mcarplay/app/net/NetworkBindingClosureTest.kt
+new file mode 100644
+index 0000000..b60f68a
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/net/NetworkBindingClosureTest.kt
+@@ -0,0 +1,27 @@
++package com.mcarplay.app.net
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class NetworkBindingClosureTest {
++    @Test
++    fun replacementMustNotBindWhenOldNetworkCannotBeReleased() {
++        var releaseAllowed = false
++        val binding =
++            NetworkBinding<Int, Any>(
++                bindProcess = { value -> value != null || releaseAllowed },
++                isUsable = { true },
++            )
++        val old = Any()
++        val next = Any()
++        binding.replaceRequest(old)
++        assertTrue(binding.bind(old, 1))
++        binding.replaceRequest(next)
++        assertFalse(binding.bind(next, 2))
++        assertNull(binding.current())
++        releaseAllowed = true
++        assertTrue(binding.bind(next, 2))
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/net/NetworkBindingFaultTest.kt b/app/src/test/java/com/mcarplay/app/net/NetworkBindingFaultTest.kt
+new file mode 100644
+index 0000000..f66c4d1
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/net/NetworkBindingFaultTest.kt
+@@ -0,0 +1,56 @@
++package com.mcarplay.app.net
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class NetworkBindingFaultTest {
++    @Test
++    fun failedUnbindIsRetriedBeforeReplacementCanBind() {
++        var allowUnbind = false
++        var failures = 0
++        val calls = mutableListOf<Int?>()
++        val binding = NetworkBinding<Int, Any>(
++            bindProcess = { value ->
++                calls.add(value)
++                value != null || allowUnbind
++            },
++            isUsable = { true },
++            onUnbindFailure = { failures++ },
++        )
++        val old = Any()
++        val next = Any()
++        binding.replaceRequest(old)
++        assertTrue(binding.bind(old, 1))
++        binding.replaceRequest(next)
++        assertFalse(binding.bind(next, 2))
++        assertNull(binding.current())
++        assertEquals(3, failures)
++        assertTrue(binding.hasPendingUnbind())
++        assertFalse(binding.releaseIfCurrent(old))
++        allowUnbind = true
++        assertTrue(binding.bind(next, 2))
++        assertEquals(listOf(1, null, null, null, null, 2), calls)
++        assertEquals(2, binding.current())
++        assertFalse(binding.hasPendingUnbind())
++    }
++
++    @Test
++    fun exceptionDuringUnbindDoesNotForgetPendingCleanup() {
++        var throwOnUnbind = true
++        val binding = NetworkBinding<Int, Any>(
++            bindProcess = { value -> if (value == null && throwOnUnbind) error("OS failure") else true },
++            isUsable = { true },
++        )
++        val owner = Any()
++        binding.replaceRequest(owner)
++        assertTrue(binding.bind(owner, 1))
++        assertTrue(binding.releaseIfCurrent(owner))
++        assertNull(binding.current())
++        throwOnUnbind = false
++        binding.replaceRequest(owner)
++        assertTrue(binding.bind(owner, 2))
++    }
++}
