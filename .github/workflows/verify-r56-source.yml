@@ -93,6 +93,32 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R56-0.1.43-organized-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties'
 
+      - name: Apply verified R57 maintenance candidate after exact R56 verification
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R57-link-hardening-from-R56.patch"
+          echo "a49d62a32917da3aa33e53c11aa92116ad039175a714bdeb002973bb3967d270  $patch" | sha256sum --check
+          cd "$R44_BASELINE"
+          git apply --check "$patch"
+          git apply "$patch"
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0" + sha256(p.read_bytes()).digest() + b"\n")
+          actual = digest.hexdigest()
+          print(f"R57 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 827 or actual != "c0a92358ca8a283ad73f041274ef7915b15f7a10e5c9c45640f0e5f82ed91318":
+              raise SystemExit("R57 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R57-0.1.44-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties'
+
       - name: Audit Kotlin formatting (non-blocking for preserved R56 snapshot)
         continue-on-error: true
         working-directory: ${{ runner.temp }}/r44-baseline
@@ -102,28 +128,59 @@ jobs:
           chmod +x ./gradlew
           ./gradlew --no-daemon --console=plain spotlessCheck
 
-      - name: Run Android tests, lint and build debug APKs
+      - name: Run Android tests, lint and build debug APKs (all gates attempted)
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --console=plain \
+          ./gradlew --no-daemon --console=plain --continue \
             :app:testStandardDebugUnitTest \
             :app:lintStandardDebug \
             :app:assembleStandardDebug \
             :app:testRemoteDebugUnitTest \
             :app:assembleRemoteDebug
 
+      - name: Verify both candidate APKs and record metadata
+        if: ${{ !cancelled() && steps.candidate.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          standard=(app/build/outputs/apk/standard/debug/*.apk)
+          remote=(app/build/outputs/apk/remote/debug/*.apk)
+          test "${#standard[@]}" -eq 1
+          test "${#remote[@]}" -eq 1
+          aapt="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          signer="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          report="$RUNNER_TEMP/r57-apk-verification.txt"
+          : > "$report"
+          verify_apk() {
+            local file="$1" pkg="$2" variant="$3"
+            local badging
+            badging="$("$aapt" dump badging "$file")"
+            printf '\nVariant: %s\n%s\n' "$variant" "$file" >> "$report"
+            printf '%s\n' "$badging" | grep "^package:" | tee -a "$report"
+            printf '%s\n' "$badging" | grep "^package: name='$pkg' versionCode='1440000' versionName='0\.1\.44[^']*-debug'"
+            "$signer" verify --verbose --print-certs "$file" >> "$report"
+            sha256sum "$file" | tee -a "$report"
+          }
+          verify_apk "${standard[0]}" com.mcarplay.app StandardDebug
+          verify_apk "${remote[0]}" com.mcarplay.app.rd RemoteDebug
+
       - name: Upload reconstructed source and debug APKs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcarplay-R56-0.1.43-reconstructed-source-and-debug-apks
+          name: mcarplay-R57-0.1.44-candidate-source-and-debug-apks
           path: |
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
+            ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
+            ${{ runner.temp }}/r57-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/reports/tests/**
+            ${{ runner.temp }}/r44-baseline/app/build/test-results/**
             ${{ runner.temp }}/r44-baseline/app/build/reports/lint-results-standardDebug.html
           if-no-files-found: warn
           retention-days: 90
