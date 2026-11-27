@@ -91,6 +91,28 @@ jobs:
           "$sdkmanager" --sdk_root="$sdk" --install 'platforms;android-35' 'build-tools;35.0.0'
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
 
+      - name: Prepare and check the Android 17 virtual device
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='system-images;android-37.0;default;x86_64'
+          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" --install emulator platform-tools "$image"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-17-avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "${sdkmanager%/*}/avdmanager" create avd --force --name mcarplay-api37 --package "$image" \
+            --path "$ANDROID_AVD_HOME/mcarplay-api37.avd" <<< no
+          test -f "$ANDROID_AVD_HOME/mcarplay-api37.ini"
+          "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fxq mcarplay-api37
+          if [[ ! -w /dev/kvm ]]; then
+            sudo chgrp "$(id -gn)" /dev/kvm
+            sudo chmod g+rw /dev/kvm
+          fi
+          "$ANDROID_HOME/emulator/emulator" -accel-check
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
@@ -384,25 +406,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          image='system-images;android-37.0;default;x86_64'
-          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
-          test -n "$sdkmanager"
-          "$sdkmanager" --sdk_root="$ANDROID_HOME" --install emulator platform-tools "$image"
-          printf 'no\n' | "${sdkmanager%/*}/avdmanager" create avd --name mcarplay-api37 --package "$image"
-          if [[ ! -w /dev/kvm ]]; then
-            sudo chgrp "$(id -gn)" /dev/kvm
-            sudo chmod g+rw /dev/kvm
-          fi
           adb="$ANDROID_HOME/platform-tools/adb"
-          "$ANDROID_HOME/emulator/emulator" -avd mcarplay-api37 -accel on -gpu software \
+          "$adb" start-server
+          export ANDROID_SERIAL=emulator-5554
+          "$ANDROID_HOME/emulator/emulator" -avd mcarplay-api37 -port 5554 -accel on -gpu software \
             -no-window -no-audio -no-snapshot -no-boot-anim > "$RUNNER_TEMP/Android-17-emulator.log" 2>&1 &
           emulator_pid=$!
           trap 'kill "$emulator_pid" 2>/dev/null || true' EXIT
-          export ANDROID_SERIAL=emulator-5554
-          timeout 300 "$adb" wait-for-device
-          for ((attempt = 0; attempt < 90; attempt++)); do
+          for ((attempt = 0; attempt < 150; attempt++)); do
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/Android-17-emulator.log" >&2
+              exit 1
+            fi
             if [[ $("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') == 1 ]]; then break; fi
-            kill -0 "$emulator_pid"
             sleep 2
           done
           test "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" = 1
