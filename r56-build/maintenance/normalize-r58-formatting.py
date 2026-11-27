@@ -50,3 +50,22 @@ replace_once(
             snapshot.code == DiagnosticCode.BT_LINK_CLOSED &&
             bluetoothWasEstablished(snapshot)""",
 )
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/video/ProjectionRuntimePolicy.kt",
+    """            writeNs >= 80_000_000L || queueMs >= 250 ||
+                (renderRecent && lastRenderDurationNs >= 80_000_000L)""",
+    """            writeNs >= 80_000_000L ||
+                queueMs >= 250 ||
+                (renderRecent && lastRenderDurationNs >= 80_000_000L)""",
+)
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/video/ProjectionRuntimePolicy.kt",
+    """                writeNs < 4_000_000L && queueMs < 60 && thermal < 2 &&
+                    (!renderRecent || lastRenderDurationNs < renderBudget * 3 / 4)""",
+    """                writeNs < 4_000_000L &&
+                    queueMs < 60 &&
+                    thermal < 2 &&
+                    (!renderRecent || lastRenderDurationNs < renderBudget * 3 / 4)""",
+)
