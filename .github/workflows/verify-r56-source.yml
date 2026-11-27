@@ -363,6 +363,7 @@ jobs:
           verify_apk "${remote[0]}" com.mcarplay.app.rd RemoteDebug
 
       - name: Build both optimized Release variants and verify R8 outputs
+        id: r8
         if: ${{ !cancelled() && steps.r585.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
@@ -375,6 +376,55 @@ jobs:
             test -s "$mapping"
             grep -Fxq 'com.mcarplay.app.shizuku.CarInputServiceImpl -> com.mcarplay.app.shizuku.CarInputServiceImpl:' "$mapping"
           done
+
+      - name: Smoke-test both optimized APKs on Android 17
+        if: ${{ !cancelled() && steps.r8.outcome == 'success' }}
+        timeout-minutes: 15
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='system-images;android-37.0;default;x86_64'
+          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          "$sdkmanager" --sdk_root="$ANDROID_HOME" --install emulator platform-tools "$image"
+          printf 'no\n' | "${sdkmanager%/*}/avdmanager" create avd --name mcarplay-api37 --package "$image"
+          if [[ ! -w /dev/kvm ]]; then
+            sudo chgrp "$(id -gn)" /dev/kvm
+            sudo chmod g+rw /dev/kvm
+          fi
+          adb="$ANDROID_HOME/platform-tools/adb"
+          "$ANDROID_HOME/emulator/emulator" -avd mcarplay-api37 -accel on -gpu software \
+            -no-window -no-audio -no-snapshot -no-boot-anim > "$RUNNER_TEMP/Android-17-emulator.log" 2>&1 &
+          emulator_pid=$!
+          trap 'kill "$emulator_pid" 2>/dev/null || true' EXIT
+          export ANDROID_SERIAL=emulator-5554
+          timeout 300 "$adb" wait-for-device
+          for ((attempt = 0; attempt < 90; attempt++)); do
+            if [[ $("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') == 1 ]]; then break; fi
+            kill -0 "$emulator_pid"
+            sleep 2
+          done
+          test "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" = 1
+          test "$("$adb" shell getprop ro.build.version.sdk | tr -d '\r')" = 37
+          shopt -s nullglob
+          smoke() {
+            local package="$1" apk="$2" activity="com.mcarplay.app.MainActivity"
+            "$adb" install -r "$apk"
+            "$adb" logcat -b crash -c
+            "$adb" shell am start -W -n "$package/$activity" | tee "$RUNNER_TEMP/Android-17-$package.txt"
+            grep -Fq 'Status: ok' "$RUNNER_TEMP/Android-17-$package.txt"
+            sleep 5
+            "$adb" shell pidof "$package"
+            "$adb" logcat -b crash -d >> "$RUNNER_TEMP/Android-17-$package.txt"
+            if grep -Fq "Process: $package," "$RUNNER_TEMP/Android-17-$package.txt"; then return 1; fi
+          }
+          standard=(app/build/outputs/apk/standard/release/*.apk)
+          remote=(app/build/outputs/apk/remote/release/*.apk)
+          test "${#standard[@]}" -eq 1
+          test "${#remote[@]}" -eq 1
+          smoke com.mcarplay.app "${standard[0]}"
+          smoke com.mcarplay.app.rd "${remote[0]}"
 
       - name: Upload reconstructed source and debug APKs
         if: always()
@@ -391,6 +441,8 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.5-0.1.45-candidate-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
+            ${{ runner.temp }}/Android-17-*.txt
+            ${{ runner.temp }}/Android-17-emulator.log
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/reports/tests/**
