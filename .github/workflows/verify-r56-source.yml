@@ -207,7 +207,7 @@ jobs:
               r"(?m)^(?P<indent>[ \t]*)if\s*\(\s*!response\.valid\s*\|\|\s*"
               r"response\.value\s*==\s*null\s*\|\|\s*"
               r"certificate\s*==\s*null\s*\|\|\s*"
-              r"receiverIdentification\s*==\s*null\|\|\s*"
+              r"receiverIdentification\s*==\s*null\s*\|\|\s*"
               r"challenge\s*==\s*null\s*\)\s*\{"
           )
           matches = list(pattern.finditer(source))
