@@ -12,6 +12,7 @@ on:
       - "r56-build/**"
       - ".github/workflows/verify-r56-source.yml"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   actions: read
@@ -229,9 +230,9 @@ jobs:
           print("R58.2 compile fix applied: pass log function value, not invalid ::log reference")
           PY
           chmod +x ./gradlew
-          ./gradlew --no-daemon --console=plain --rerun-tasks spotlessApply
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain --rerun-tasks spotlessApply
           python3 "$GITHUB_WORKSPACE/kit/r56-build/maintenance/normalize-r58-formatting.py"
-          ./gradlew --no-daemon --console=plain --rerun-tasks spotlessCheck
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain --rerun-tasks spotlessCheck
           zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
           python3 - <<'PY'
@@ -296,8 +297,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --console=plain spotlessApply
-          ./gradlew --no-daemon --console=plain spotlessCheck
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from pathlib import Path
           from hashlib import sha256
@@ -325,7 +326,7 @@ jobs:
           echo "91fbf5804efa944d688b898ab945911aca2c4ff8117abbc1a7e0be8811267dd8  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
-          ./gradlew --no-daemon --console=plain spotlessCheck
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from hashlib import sha256
           from pathlib import Path
@@ -363,7 +364,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --console=plain --dependency-verification strict --continue \
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain --dependency-verification strict --continue \
             :app:testStandardDebugUnitTest \
             :app:lintStandardDebug \
             :app:assembleStandardDebug \
@@ -405,7 +406,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --console=plain --dependency-verification strict -Pmcarplay.minifyRelease=true \
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain --dependency-verification strict -Pmcarplay.minifyRelease=true \
             :app:assembleStandardRelease :app:assembleRemoteRelease
           for variant in standardRelease remoteRelease; do
             mapping="app/build/outputs/mapping/$variant/mapping.txt"

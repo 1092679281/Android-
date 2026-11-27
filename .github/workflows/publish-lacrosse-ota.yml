@@ -1,109 +1,238 @@
-name: Publish signed LaCrosse update to public APK channel
+name: Prepare signed CarPlay OTA
 
 on:
+  pull_request:
+    branches: [maintenance/r56-source-of-truth]
+    paths:
+      - ".github/workflows/publish-lacrosse-ota.yml"
+      - "r56-build/maintenance/ota-release.*"
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Signed stable version tag matching app/build.gradle.kts (currently v0.1.8)'
+        description: 'OTA version tag, for example v0.1.46-test.1'
         required: true
-        default: 'v0.1.8'
         type: string
 
 permissions:
+  actions: read
   contents: read
 
+concurrency:
+  group: carplay-ota-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: false
+
 jobs:
-  publish:
+  verified-source:
+    if: ${{ github.event_name != 'pull_request' && github.repository == '1092679281/Android-' }}
+    permissions:
+      actions: read
+      contents: write
+    uses: ./.github/workflows/verify-r56-source.yml
+
+  package:
+    needs: verified-source
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || needs.verified-source.result == 'success') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 45
     env:
-      CHANNEL_REPOSITORY: 1092679281/CarPlay-Updates
+      OTA_TAG: ${{ github.event_name == 'pull_request' && 'v0.1.46-test.1' || inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
           path: kit
-      - uses: actions/checkout@v4
-        with:
-          repository: wangxso/mcarplay
-          ref: 8e25e0f69ab7a3bec14649542adea6eb22f74f9a
-          path: upstream
           persist-credentials: false
+      - name: Download source from successful verification
+        uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-R58.5-0.1.45-candidate-source-and-debug-apks
+          run-id: ${{ github.event_name == 'pull_request' && '45998362756' || github.run_id }}
+          github-token: ${{ github.token }}
+          path: snapshot
+      - name: Verify and restore OTA source and Gradle checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir="$RUNNER_TEMP/ota-source"
+          mkdir -p "$source_dir"
+          unzip -q snapshot/mcarplay-R58.5-0.1.45-candidate-source.zip -d "$source_dir"
+          cd "$source_dir"
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          files = sorted(path for path in Path(".").rglob("*") if path.is_file())
+          digest = sha256()
+          for path in files:
+              digest.update(path.as_posix().encode() + b"\0" + sha256(path.read_bytes()).digest() + b"\n")
+          if len(files) != 837 or digest.hexdigest() != "ee63699431fde032169ee3bc33cdf6aa6dfa16c0bc7097766c0fbb3e26dc5173":
+              raise SystemExit("Unexpected OTA source fingerprint")
+          PY
+          bzip2 -dc "$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2" > gradle/verification-metadata.xml
+          echo 'cff60d48679cbf36629fe4ecba826204a067de75520c3bd6b4cd589646beb984  gradle/verification-metadata.xml' | sha256sum -c
+          chmod +x gradlew
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
-      - name: Install Android SDK 35
-        run: |
-          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
-          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
-          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
-          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null || true
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install 'platforms;android-35' 'build-tools;35.0.0'
       - uses: gradle/actions/setup-gradle@v4
-      - name: Verify release prerequisites and persistent signing inputs
-        env:
-          RELEASE_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
-          RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-          UPDATE_PUBLISH_TOKEN: ${{ secrets.UPDATE_PUBLISH_TOKEN }}
+      - name: Install Android SDK
+        shell: bash
         run: |
           set -euo pipefail
-          test "${{ inputs.release_tag }}" = "v0.1.8" || {
-            echo "::error::Update R15 base version and update tests before publishing another tag."
-            exit 1
-          }
-          for key in RELEASE_KEYSTORE_B64 RELEASE_STORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD UPDATE_PUBLISH_TOKEN; do
-            test -n "${!key}" || { echo "::error::Missing required GitHub Actions secret: $key"; exit 1; }
+          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          test -n "$sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" --install 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Build both versions with one disposable rehearsal key
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export MCARPLAY_KEYSTORE_FILE="$RUNNER_TEMP/ota-rehearsal.p12"
+          trap 'rm -f -- "$MCARPLAY_KEYSTORE_FILE"' EXIT
+          export KEY_ALIAS=ota-rehearsal KEYSTORE_PASSWORD="$(openssl rand -hex 20)"
+          export KEY_PASSWORD="$KEYSTORE_PASSWORD"
+          keytool -genkeypair -keystore "$MCARPLAY_KEYSTORE_FILE" -storetype PKCS12 -alias "$KEY_ALIAS" \
+            -keyalg RSA -keysize 2048 -validity 7 -dname 'CN=OTA CI rehearsal' -storepass:env KEYSTORE_PASSWORD -keypass:env KEY_PASSWORD
+          export OTA_SIGNER_SHA256="$(keytool -exportcert -keystore "$MCARPLAY_KEYSTORE_FILE" -alias "$KEY_ALIAS" \
+            -storepass:env KEYSTORE_PASSWORD | sha256sum | cut -d' ' -f1)"
+          helper=kit/r56-build/maintenance/ota-release.sh
+          bash "$helper" "$RUNNER_TEMP/ota-source" v0.1.45-test.1 "$RUNNER_TEMP/ota-before"
+          bash "$helper" "$RUNNER_TEMP/ota-source" "$OTA_TAG" "$RUNNER_TEMP/ota-after"
+      - name: Verify Android 17 updates the existing installation
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          image='system-images;android-37.0;default;x86_64'
+          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+          "$sdkmanager" --install emulator platform-tools "$image"
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/ota-avds"
+          mkdir -p "$ANDROID_AVD_HOME"
+          "${sdkmanager%/*}/avdmanager" create avd --name ota-api37 --package "$image" --path "$ANDROID_AVD_HOME/ota-api37.avd" <<< no
+          "$ANDROID_HOME/emulator/emulator" -list-avds | grep -Fxq ota-api37
+          if [[ ! -w /dev/kvm ]]; then
+            sudo chgrp "$(id -gn)" /dev/kvm
+            sudo chmod g+rw /dev/kvm
+          fi
+          adb="$ANDROID_HOME/platform-tools/adb"
+          "$adb" start-server
+          export ANDROID_SERIAL=emulator-5554
+          "$ANDROID_HOME/emulator/emulator" -avd ota-api37 -port 5554 -accel on -gpu software \
+            -no-window -no-audio -no-snapshot -no-boot-anim > "$RUNNER_TEMP/ota-emulator.log" 2>&1 &
+          emulator_pid=$!
+          trap 'kill "$emulator_pid" 2>/dev/null || true' EXIT
+          for ((attempt = 0; attempt < 150; attempt++)); do
+            if ! kill -0 "$emulator_pid" 2>/dev/null; then
+              cat "$RUNNER_TEMP/ota-emulator.log" >&2
+              exit 1
+            fi
+            if [[ $("$adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r') == 1 ]]; then break; fi
+            sleep 2
           done
-          echo "$RELEASE_KEYSTORE_B64" | base64 --decode > "$RUNNER_TEMP/carplay-release.keystore"
-          chmod 600 "$RUNNER_TEMP/carplay-release.keystore"
-          test -s "$RUNNER_TEMP/carplay-release.keystore"
-          echo "MCARPLAY_KEYSTORE_FILE=$RUNNER_TEMP/carplay-release.keystore" >> "$GITHUB_ENV"
-      - name: Build, test and sign release APK
+          test "$("$adb" shell getprop sys.boot_completed | tr -d '\r')" = 1
+          test "$("$adb" shell getprop ro.build.version.sdk | tr -d '\r')" = 37
+          "$adb" install "$RUNNER_TEMP/ota-before/mcarplay-0.1.45.apk"
+          "$adb" shell am start -W -n com.mcarplay.app/.MainActivity | grep -F 'Status: ok'
+          "$adb" shell pm grant com.mcarplay.app android.permission.POST_NOTIFICATIONS
+          "$adb" shell dumpsys package com.mcarplay.app > "$RUNNER_TEMP/ota-before-package.txt"
+          "$adb" install -r "$RUNNER_TEMP/ota-after/mcarplay-0.1.46.apk"
+          "$adb" shell dumpsys package com.mcarplay.app > "$RUNNER_TEMP/ota-after-package.txt"
+          grep -F 'versionCode=1450000 ' "$RUNNER_TEMP/ota-before-package.txt"
+          grep -F 'versionCode=1460000 ' "$RUNNER_TEMP/ota-after-package.txt"
+          grep -F 'android.permission.POST_NOTIFICATIONS: granted=true' "$RUNNER_TEMP/ota-after-package.txt"
+          diff <(grep -E '^[[:space:]]+(firstInstallTime|userId|appId)=' "$RUNNER_TEMP/ota-before-package.txt") \
+            <(grep -E '^[[:space:]]+(firstInstallTime|userId|appId)=' "$RUNNER_TEMP/ota-after-package.txt")
+          "$adb" shell am start -W -n com.mcarplay.app/.MainActivity | grep -F 'Status: ok'
+      - name: Upload update rehearsal evidence
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-ota-rehearsal
+          path: |
+            ${{ runner.temp }}/ota-*-package.txt
+            ${{ runner.temp }}/ota-emulator.log
+      - name: Build signed standard OTA package
+        if: github.event_name != 'pull_request'
         env:
-          R7_UPSTREAM: ${{ github.workspace }}/upstream
-          R15_OUTPUT: ${{ runner.temp }}/r15-signed-release
-          R15_SIGNED_RELEASE: '1'
-          R15_RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_KEYSTORE: ${{ secrets.RELEASE_KEYSTORE_B64 }}
           KEYSTORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          OTA_SIGNER_SHA256: ${{ vars.OTA_SIGNER_SHA256 }}
+        shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile kit/tools/integrate_and_build_r15.py
-          python3 kit/tools/integrate_and_build_r15.py
-      - name: Upload signed release for audit
+          for name in RELEASE_KEYSTORE KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then echo "::error::Missing persistent release-signing input $name"; exit 1; fi
+          done
+          [[ "$OTA_SIGNER_SHA256" =~ ^[a-fA-F0-9]{64}$ ]] || {
+            echo '::error::OTA_SIGNER_SHA256 must identify the existing release certificate.'; exit 1;
+          }
+          umask 077
+          export MCARPLAY_KEYSTORE_FILE="$RUNNER_TEMP/ota-release.keystore"
+          trap 'rm -f -- "$MCARPLAY_KEYSTORE_FILE"' EXIT
+          printf '%s' "$RELEASE_KEYSTORE" | base64 --decode > "$MCARPLAY_KEYSTORE_FILE"
+          unset RELEASE_KEYSTORE
+          bash kit/r56-build/maintenance/ota-release.sh "$RUNNER_TEMP/ota-source" "$OTA_TAG" "$RUNNER_TEMP/ota-dist"
+      - name: Upload verified signed OTA package
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: LaCrosse-R15-signed-v0.1.8
-          path: ${{ runner.temp }}/r15-signed-release/
+          name: mcarplay-signed-ota
+          path: ${{ runner.temp }}/ota-dist
           if-no-files-found: error
-          retention-days: 30
-      - name: Publish signed APK and SHA256SUMS to public GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.UPDATE_PUBLISH_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
+
+  draft:
+    needs: package
+    if: ${{ github.event_name == 'push' && github.repository == '1092679281/Android-' }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OTA_TAG: ${{ github.ref_name }}
+      OTA_SIGNER_SHA256: ${{ vars.OTA_SIGNER_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: kit
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-signed-ota
+          path: dist
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Check version and signer continuity, then create a draft release
+        shell: bash
         run: |
           set -euo pipefail
-          gh repo view "$CHANNEL_REPOSITORY" --json visibility --jq '.visibility' | grep -qx PUBLIC || {
-            echo "::error::Create a public $CHANNEL_REPOSITORY repository before publishing."
-            exit 1
-          }
-          if gh release view "$RELEASE_TAG" --repo "$CHANNEL_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Refusing to overwrite an existing published release."
-            exit 1
+          if gh release view "$OTA_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo '::error::This release tag already exists.'; exit 1
           fi
-          OUT="$RUNNER_TEMP/r15-signed-release"
-          test -f "$OUT/mcarplay-0.1.8.apk" && test -f "$OUT/SHA256SUMS.txt"
-          cd "$OUT"
-          sha256sum --check SHA256SUMS.txt
-          gh release create "$RELEASE_TAG" \
-            "$OUT/mcarplay-0.1.8.apk" "$OUT/SHA256SUMS.txt" \
-            --repo "$CHANNEL_REPOSITORY" \
-            --target main \
-            --title "LaCrosse CarPlay v0.1.8" \
-            --notes "R15: project-owned in-app update channel. Signed APK with SHA-256, Android package and certificate verification. Installation requires user confirmation."
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          previous="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            python3 kit/r56-build/maintenance/ota-release.py previous "$OTA_TAG")"
+          if [[ -n "$previous" ]]; then
+            IFS=$'\t' read -r previous_tag previous_apk <<< "$previous"
+            gh release download "$previous_tag" --repo "$GITHUB_REPOSITORY" --pattern "$previous_apk" --dir "$RUNNER_TEMP/ota-previous"
+            sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -1)"
+            yes | "$sdkmanager" --licenses >/dev/null || true
+            "$sdkmanager" --install 'build-tools;35.0.0'
+            previous_cert="$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$RUNNER_TEMP/ota-previous/$previous_apk" |
+              sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: //p')"
+            [[ "${previous_cert,,}" == "${OTA_SIGNER_SHA256,,}" ]] || {
+              echo '::error::The latest published APK uses another certificate.'; exit 1;
+            }
+          fi
+          options=(--draft --verify-tag)
+          if [[ "$OTA_TAG" == *-test.* ]]; then options+=(--prerelease); fi
+          gh release create "$OTA_TAG" dist/*.apk dist/SHA256SUMS.txt dist/APK-signature.txt \
+            --repo "$GITHUB_REPOSITORY" "${options[@]}" --title "mcarplay $OTA_TAG" \
+            --notes "Standard signed OTA candidate based on R58.5. Review the release notes and vehicle validation before publication."

@@ -41,3 +41,19 @@ The R44 Actions artifact expires on 2026-12-25. The validation workflow archives
 - R56 is a source candidate only. Do not tag it as a stable release before complete Android CI and E2LB vehicle acceptance.
 - Do not commit signing keys, keystore passwords, `local.properties`, APKs, raw diagnostic logs, or personal data.
 - MFi cryptographic verification, E2LB 0x4300 acknowledgement, 0x4301/Wi-Fi handoff and AirPlay vehicle acceptance remain unresolved or unverified.
+
+## R58.5 标准版在线更新
+
+应用首页的「检查更新」读取本仓库的 GitHub Releases。发布流程使用维护分支重建并通过 CI 的源码，
+按发行标签写入 APK 版本，使用固定证书签名，再生成标准 APK 与 `SHA256SUMS.txt`。
+`remote` 是另一包名，继续通过自己的诊断产物分发。
+
+- 在 GitHub Actions 配置已有的 `RELEASE_KEYSTORE_B64`、`RELEASE_STORE_PASSWORD`、
+  `RELEASE_KEY_ALIAS`、`RELEASE_KEY_PASSWORD`，并将签名证书公开指纹配置为变量
+  `OTA_SIGNER_SHA256`。已有正式安装应继续使用其原签名密钥。可以从原 APK 的
+  `apksigner verify --print-certs` 输出读取证书 SHA-256。密钥和密码应存放在仓库 Secrets。
+- 在已审查的维护提交上推送递增标签，例如 `v0.1.46-test.1`。工作流通过证书、
+  版本和 SHA-256 检查后创建本仓库的 Release 草稿；审核说明和验证范围后再公开。
+  应用只会发现已公开、有匹配 APK 的发行项。签名不匹配、版本退回和重复标签都会阻止发布。
+- PR 演练使用单次测试密钥签发两个版本，在 Android 17 模拟器覆盖安装，检查版本、
+  安装记录和已有通知授权。测试证书只用于该次演练。
