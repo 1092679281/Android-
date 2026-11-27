@@ -1,0 +1,42 @@
+from pathlib import Path
+
+def replace_once(path: str, old: str, new: str) -> None:
+    target = Path(path)
+    source = target.read_text()
+    old_count = source.count(old)
+    new_count = source.count(new)
+    if old_count == 1:
+        target.write_text(source.replace(old, new, 1))
+        print(f"{path}: normalized")
+    elif old_count == 0 and new_count == 1:
+        print(f"{path}: canonical formatting already present")
+    else:
+        raise SystemExit(
+            f"{path}: expected exactly one old or canonical block; "
+            f"old={old_count} canonical={new_count}"
+        )
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/net/EndpointHosts.kt",
+    """                        it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' ||
+                            it == '_' || it == '-' || it == '.'""",
+    """                        it in 'a'..'z' ||
+                            it in 'A'..'Z' ||
+                            it in '0'..'9' ||
+                            it == '_' ||
+                            it == '-' ||
+                            it == '.'""",
+)
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt",
+    """        if (next !== layout || nextSourceStatus != sourceStatus || pressed != pressTarget || focused != focusBounds ||
+            animating()
+        ) {""",
+    """        if (next !== layout ||
+            nextSourceStatus != sourceStatus ||
+            pressed != pressTarget ||
+            focused != focusBounds ||
+            animating()
+        ) {""",
+)

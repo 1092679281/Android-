@@ -198,42 +198,7 @@ jobs:
           PY
           chmod +x ./gradlew
           ./gradlew --no-daemon --console=plain --rerun-tasks spotlessApply
-          python3 - <<'PY'
-          from pathlib import Path
-          def replace_once(path, old, new):
-              p = Path(path)
-              source = p.read_text()
-              count = source.count(old)
-              if count == 1:
-                  p.write_text(source.replace(old, new, 1))
-              elif count == 0 and source.count(new) == 1:
-                  print(f"{path}: canonical formatting already present")
-              else:
-                  raise SystemExit(f"{path}: expected one old or one canonical formatting block; old={count} new={source.count(new)}")
-          replace_once(
-              "app/src/main/java/com/mcarplay/app/net/EndpointHosts.kt",
-              """                        it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' ||
-                            it == '_' || it == '-' || it == '.'""",
-              """                        it in 'a'..'z' ||
-                            it in 'A'..'Z' ||
-                            it in '0'..'9' ||
-                            it == '_' ||
-                            it == '-' ||
-                            it == '.'""",
-          )
-          replace_once(
-              "app/src/main/java/com/mcarplay/app/video/ProjectedDashboardRenderer.kt",
-              """        if (next !== layout || nextSourceStatus != sourceStatus || pressed != pressTarget || focused != focusBounds ||
-            animating()
-        ) {""",
-              """        if (next !== layout ||
-            nextSourceStatus != sourceStatus ||
-            pressed != pressTarget ||
-            focused != focusBounds ||
-            animating()
-        ) {""",
-          )
-          PY
+          python3 "$GITHUB_WORKSPACE/kit/r56-build/maintenance/normalize-r58-formatting.py"
           ./gradlew --no-daemon --console=plain --rerun-tasks spotlessCheck
           zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
