@@ -198,6 +198,24 @@ jobs:
           PY
           chmod +x ./gradlew
           ./gradlew --no-daemon --console=plain spotlessApply
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/src/main/java/com/mcarplay/app/airplay/VirtualIap2Link.kt")
+          source = p.read_text()
+          compact = "if (!response.valid || response.value == null || certificate == null || receiverIdentification == null || challenge == null) {"
+          formatted = """if (!response.valid ||
+                              response.value == null ||
+                              certificate == null ||
+                              receiverIdentification == null ||
+                              challenge == null
+                          ) {"""
+          if source.count(compact) == 1:
+              p.write_text(source.replace(compact, formatted, 1))
+          elif source.count(formatted) == 1:
+              print("VirtualIap2Link.kt condition already formatted")
+          else:
+              raise SystemExit("Unexpected MFi response guard shape; refusing broad rewrite")
+          PY
           ./gradlew --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from pathlib import Path
