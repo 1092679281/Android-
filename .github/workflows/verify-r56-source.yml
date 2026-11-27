@@ -228,6 +228,8 @@ jobs:
           print("R58.2 MFi guard normalized independent of pre-format whitespace")
           PY
           ./gradlew --no-daemon --console=plain spotlessCheck
+          zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
           python3 - <<'PY'
           from pathlib import Path
           from hashlib import sha256
@@ -236,8 +238,6 @@ jobs:
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
-          zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
-            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
           actual = digest.hexdigest()
           print(f"R58.2 candidate: files={len(files)} tree_sha256={actual}")
           if len(files) != 832 or actual != "2158c86e835dfa4a3c249554934374a2a6d399e4d7f5d0e3d1ca436afab799d9":
