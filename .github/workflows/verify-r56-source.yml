@@ -198,6 +198,35 @@ jobs:
           PY
           chmod +x ./gradlew
           ./gradlew --no-daemon --console=plain spotlessApply
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("app/src/main/java/com/mcarplay/app/airplay/VirtualIap2Link.kt")
+          source = p.read_text()
+          pattern = re.compile(
+              r"(?m)^(?P<indent>[ \\t]*)if\\s*\\(\\s*!response\\.valid\\s*\\|\\|\\s*"
+              r"response\\.value\\s*==\\s*null\\s*\\|\\|\\s*"
+              r"certificate\\s*==\\s*null\\s*\\|\\|\\s*"
+              r"receiverIdentification\\s*==\\s*null\\|\\|\\s*"
+              r"challenge\\s*==\\s*null\\s*\\)\\s*\\{"
+          )
+          matches = list(pattern.finditer(source))
+          if len(matches) != 1:
+              raise SystemExit(f"Expected exactly one MFi response guard; found {len(matches)}")
+          match = matches[0]
+          indent = match.group("indent")
+          formatted = (
+              f"{indent}if (!response.valid ||\\n"
+              f"{indent}    response.value == null ||\\n"
+              f"{indent}    certificate == null ||\\n"
+              f"{indent}    receiverIdentification == null ||\\n"
+              f"{indent}    challenge == null\\n"
+              f"{indent}) {{"
+          )
+          source = source[:match.start()] + formatted + source[match.end():]
+          p.write_text(source)
+          print("R58.2 MFi guard normalized independent of pre-format whitespace")
+          PY
           ./gradlew --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from pathlib import Path
