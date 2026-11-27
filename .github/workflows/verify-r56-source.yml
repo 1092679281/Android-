@@ -139,7 +139,7 @@ jobs:
           files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
           digest = sha256()
           for p in files:
-              digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\\0" + sha256(p.read_bytes()).digest() + b"\\n")
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + b"\0" + sha256(p.read_bytes()).digest() + b"\n")
           actual = digest.hexdigest()
           print(f"R58 candidate: files={len(files)} tree_sha256={actual}")
           if len(files) != 830 or actual != "5567e7c633be5e466b0f8ce3a09726caf9f79c0704e872eadd7a8e77a9f325a7":
@@ -208,7 +208,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
             ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58-0.1.45-candidate-source.zip
-            ${{ runner.temp }}/r57-apk-verification.txt
+            ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/reports/tests/**
