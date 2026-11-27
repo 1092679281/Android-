@@ -1,0 +1,329 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e28a639..f2e93c0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,23 @@
+ # Changelog
+ 
++## [v0.1.40-test.1] - 2026-11-26
++
++> R53 bounded retry for transient receiver-store I/O. Corrupt or invalid configuration remains fail-closed; this does not claim to fix E2LB startup.
++
++### English
++- Retry transient `IOException` while loading or first-writing the private receiver configuration store, with a maximum of three attempts and bounded 100/250 ms backoff.
++- Do not retry malformed JSON, schema mismatch, invalid secret length, validation failures, or interrupted operations.
++- Expose the number of storage retries in the redacted receiver-detection summary.
++- Add exact-source tests for transient recovery, bounded exhaustion, malformed-store fail-fast, and interruption handling.
++- Full Android Gradle build and E2LB real-vehicle behavior remain unverified.
++
++### 简体中文
++- 本机接收端配置存储读取或首次写入遇到临时 `IOException` 时，最多重试三次，退避间隔为 100/250 毫秒。
++- JSON 损坏、schema 不匹配、密钥长度错误、数据校验失败及线程中断均不重试，继续安全失败。
++- 在脱敏的接收端诊断摘要中记录本次存储初始化重试次数。
++- 新增临时 I/O 恢复、重试上限、损坏配置快速失败和中断处理测试。
++- 完整 Android 编译与 E2LB 实车行为仍未验证。
++
+ ## [v0.1.39-test.1] - 2026-11-26
+ 
+ > R52 bounded receiver-store readiness. This closes a cold-start race that could disable receiver-scoped experiment memory on the first Bluetooth attempt; it does not claim to fix the E2LB vehicle connection.
+diff --git a/IMPLEMENTATION_PLAN.md b/IMPLEMENTATION_PLAN.md
+index 3412178..abc1eba 100644
+--- a/IMPLEMENTATION_PLAN.md
++++ b/IMPLEMENTATION_PLAN.md
+@@ -6,6 +6,7 @@
+ 
+ ## 当前基线与结论
+ 
++- **11 月 26 日 R53 接收端配置存储 I/O 恢复（离线候选，未上车）：** R52 在 `ReceiverConfigurationStore` 首次读取或首次 AtomicFile 持久化遇到瞬时 `IOException` 时会立即将一次性 readiness 门闩置为失败；即使短暂 I/O 故障自行恢复，本进程也不会再次尝试。本轮只对 `IOException` 最多重试三次（100/250ms 退避），JSON/schema/密钥/校验错误与中断不重试；诊断摘要记录重试次数。新增独立 JVM 故障注入测试。该修改只改善本机配置存储恢复，不改变 iAP2 报文、MFi 或 E2LB A/B 策略，也不证明车机连接问题已解决。完整 Android 门禁、APK 和实车验收仍待完成。详见 `docs/R53-RECEIVER-STORE-IO-RETRY.md`。
+ - **11 月 26 日 R52 冷启动绑定就绪竞态修复（离线候选，未上车）：** R51 的接收端配置存储在会话控制器首次 ensure 后异步加载；蓝牙连接若先到达，客户端默认参数或服务端 accept 路径会在 store 就绪前创建 observation=null，导致本轮禁用按车机持久化的 E2LB 回退。R52 将初始化提前至 Application.onCreate，并在蓝牙会话工作线程最多等待 1.5 秒；失败/超时继续连接但不生成共享绑定。新增就绪门闩并发/超时/中断测试。此项只修复实验状态可用性，不证明 DUAL_GROUP 是车机重启根因，也不解决 MFi/0x4300 实车启动。
+ 
+ - **11 月 26 日 R51 E2LB 回退隔离加固（离线候选，未上车）：** R50 在接收端私有配置存储尚未加载、或本轮没有有效 Bluetooth 实例绑定时，仍会把空 binding 与接收端能力摘要组合成持久化指纹；相同能力画像的不同 E2LB 实例可能共享 SINGLE_GROUP 回退状态。R51 改为仅接受 `ReceiverConfigurationStore` 生成的 64 位小写 HMAC binding，并校验持久化键格式；无稳定 binding 时遵循本轮用户选择，但不读写跨轮回退。新增绑定缺失/畸形/不同实例隔离测试。该修改不证明 DUAL_GROUP 是 SYN 重启根因，也未解决 MFi、0x4300/0x4301 实车启动；完整 Android 门禁、APK 与实车验收仍待完成。详见 `docs/R51-E2LB-FALLBACK-BINDING-ISOLATION.md`。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index e8cac64..c143849 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.39"
++val appVersionName = "0.1.40"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt b/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt
+index 4465ddd..945fbce 100644
+--- a/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt
++++ b/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt
+@@ -7,6 +7,7 @@ import com.mcarplay.app.BuildConfig
+ import com.mcarplay.app.carlife.CarLifeLauncher
+ import com.mcarplay.app.diagnostics.ConnectionDiagnostics
+ import java.io.File
++import java.io.IOException
+ import java.util.concurrent.Executors
+ import java.util.concurrent.TimeUnit
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -43,6 +44,11 @@ object ReceiverDetectionRuntime {
+     var storageError: Boolean = false
+         private set
+ 
++    /** Number of transient I/O retries used by the most recent startup load. */
++    @Volatile
++    var storageRetryCount: Int = 0
++        private set
++
+     @Volatile
+     var saving: Boolean = false
+         private set
+@@ -61,24 +67,32 @@ object ReceiverDetectionRuntime {
+                 runCatching {
+                     val atomic = AtomicFile(File(app.filesDir, "receiver-configurations.json"))
+                     file = atomic
++                    storageRetryCount = 0
+                     val loaded =
+-                        if (atomic.baseFile.exists() || File(atomic.baseFile.path + ".bak").exists()) {
+-                            atomic.openRead().use { input ->
+-                                val buffer = ByteArray(ReceiverConfigurationStore.MAX_BYTES + 1)
+-                                var size = 0
+-                                while (size < buffer.size) {
+-                                    val count = input.read(buffer, size, buffer.size - size)
+-                                    if (count < 0) break
+-                                    size += count
++                        ReceiverStoreIoRetry.execute(
++                            onRetry = { attempt, _ -> storageRetryCount = attempt },
++                        ) {
++                            if (atomic.baseFile.exists() || File(atomic.baseFile.path + ".bak").exists()) {
++                                atomic.openRead().use { input ->
++                                    val buffer = ByteArray(ReceiverConfigurationStore.MAX_BYTES + 1)
++                                    var size = 0
++                                    while (size < buffer.size) {
++                                        val count = input.read(buffer, size, buffer.size - size)
++                                        if (count < 0) break
++                                        size += count
++                                    }
++                                    require(size <= ReceiverConfigurationStore.MAX_BYTES)
++                                    ReceiverConfigurationStore.decode(String(buffer, 0, size, Charsets.UTF_8))
++                                }
++                            } else {
++                                ReceiverConfigurationStore().also {
++                                    if (!persist(it)) throw IOException("Could not create receiver configuration store")
+                                 }
+-                                require(size <= ReceiverConfigurationStore.MAX_BYTES)
+-                                ReceiverConfigurationStore.decode(String(buffer, 0, size, Charsets.UTF_8))
+                             }
+-                        } else {
+-                            ReceiverConfigurationStore().also { require(persist(it)) }
+                         }
+                     environment = environmentOf(app)
+                     store = loaded
++                    storageError = false
+                 }.onFailure { storageError = true }
+             } finally {
+                 // Publish readiness only after both the secret-backed store and environment exist.
+@@ -305,7 +319,7 @@ object ReceiverDetectionRuntime {
+     /** 仅固定枚举与计数；不导出绑定摘要、环境摘要、能力摘要或目标名称。 */
+     fun reportSummary(): String {
+         val current = detection.snapshot()
+-        return "ready=$ready storageError=$storageError savedCount=${store?.entries?.size ?: 0} " +
++        return "ready=$ready storageError=$storageError storeRetries=$storageRetryCount savedCount=${store?.entries?.size ?: 0} " +
+             "state=${current?.state ?: "none"} trial=${current?.trial ?: 0} stage=${current?.stage ?: "none"} " +
+             "videoFrames=${current?.videoFrames ?: 0} audioPackets=${current?.audioPackets ?: 0} touches=${current?.touches ?: 0}"
+     }
+diff --git a/app/src/main/java/com/mcarplay/app/compat/ReceiverStoreIoRetry.kt b/app/src/main/java/com/mcarplay/app/compat/ReceiverStoreIoRetry.kt
+new file mode 100644
+index 0000000..d70ff30
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/compat/ReceiverStoreIoRetry.kt
+@@ -0,0 +1,49 @@
++package com.mcarplay.app.compat
++
++import java.io.IOException
++import java.io.InterruptedIOException
++
++/**
++ * Bounded retry for transient receiver-store I/O only.
++ *
++ * Format, schema, validation and cryptographic-binding failures are not IOExceptions and are
++ * deliberately not retried. This avoids treating corrupt or untrusted persisted state as a
++ * temporary storage outage. Interruption is also terminal and remains visible to the caller.
++ */
++internal object ReceiverStoreIoRetry {
++    const val MAX_ATTEMPTS = 3
++
++    fun delayBeforeRetryMillis(completedAttempt: Int): Long =
++        when (completedAttempt) {
++            1 -> 100L
++            2 -> 250L
++            else -> 0L
++        }
++
++    fun <T> execute(
++        sleep: (Long) -> Unit = { Thread.sleep(it) },
++        onRetry: (completedAttempt: Int, error: IOException) -> Unit = { _, _ -> },
++        operation: () -> T,
++    ): T {
++        var attempt = 0
++        while (true) {
++            attempt++
++            try {
++                return operation()
++            } catch (error: IOException) {
++                if (error is InterruptedIOException || Thread.currentThread().isInterrupted || attempt >= MAX_ATTEMPTS) {
++                    throw error
++                }
++                onRetry(attempt, error)
++                try {
++                    sleep(delayBeforeRetryMillis(attempt))
++                } catch (interrupted: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    throw InterruptedIOException("Receiver configuration store retry interrupted").also {
++                        it.initCause(interrupted)
++                    }
++                }
++            }
++        }
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/compat/ReceiverStoreIoRetryTest.kt b/app/src/test/java/com/mcarplay/app/compat/ReceiverStoreIoRetryTest.kt
+new file mode 100644
+index 0000000..90e7ab7
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/compat/ReceiverStoreIoRetryTest.kt
+@@ -0,0 +1,105 @@
++package com.mcarplay.app.compat
++
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.IOException
++import java.io.InterruptedIOException
++
++class ReceiverStoreIoRetryTest {
++    @Test
++    fun retriesTransientIoAndReturnsFirstSuccessfulLoad() {
++        var calls = 0
++        val delays = mutableListOf<Long>()
++        val value =
++            ReceiverStoreIoRetry.execute(sleep = { delays += it }) {
++                calls++
++                if (calls == 1) throw IOException("temporary read failure")
++                "loaded"
++            }
++        assertTrue(value == "loaded")
++        assertTrue(calls == 2)
++        assertTrue(delays == listOf(100L))
++    }
++
++    @Test
++    fun usesBoundedBackoffForTwoTransientFailures() {
++        var calls = 0
++        val delays = mutableListOf<Long>()
++        val value =
++            ReceiverStoreIoRetry.execute(sleep = { delays += it }) {
++                calls++
++                if (calls < 3) throw IOException("temporary storage failure")
++                42
++            }
++        assertTrue(value == 42)
++        assertTrue(calls == 3)
++        assertTrue(delays == listOf(100L, 250L))
++    }
++
++    @Test
++    fun malformedStoreIsNotRetried() {
++        var calls = 0
++        val delays = mutableListOf<Long>()
++        val failed =
++            runCatching {
++                ReceiverStoreIoRetry.execute(sleep = { delays += it }) {
++                    calls++
++                    throw IllegalArgumentException("invalid schema")
++                }
++            }.isFailure
++        assertTrue(failed)
++        assertTrue(calls == 1)
++        assertTrue(delays.isEmpty())
++    }
++
++    @Test
++    fun stopsAfterMaximumAttempts() {
++        var calls = 0
++        val delays = mutableListOf<Long>()
++        val failed =
++            runCatching {
++                ReceiverStoreIoRetry.execute(sleep = { delays += it }) {
++                    calls++
++                    throw IOException("disk unavailable")
++                }
++            }.isFailure
++        assertTrue(failed)
++        assertTrue(calls == ReceiverStoreIoRetry.MAX_ATTEMPTS)
++        assertTrue(delays == listOf(100L, 250L))
++    }
++
++    @Test
++    fun interruptedIoIsNeverRetried() {
++        var calls = 0
++        val delays = mutableListOf<Long>()
++        val failed =
++            runCatching {
++                ReceiverStoreIoRetry.execute(sleep = { delays += it }) {
++                    calls++
++                    throw InterruptedIOException("cancelled")
++                }
++            }.exceptionOrNull()
++        assertTrue(failed is InterruptedIOException)
++        assertTrue(calls == 1)
++        assertTrue(delays.isEmpty())
++    }
++
++    @Test
++    fun interruptedBackoffPreservesThreadInterruptFlag() {
++        var calls = 0
++        val failure =
++            runCatching {
++                ReceiverStoreIoRetry.execute(sleep = { throw InterruptedException("cancelled") }) {
++                    calls++
++                    throw IOException("temporary read failure")
++                }
++            }.exceptionOrNull()
++        assertTrue(failure is InterruptedIOException)
++        assertTrue(calls == 1)
++        try {
++            assertTrue(Thread.currentThread().isInterrupted)
++        } finally {
++            Thread.interrupted()
++        }
++    }
++}
+diff --git a/docs/R53-RECEIVER-STORE-IO-RETRY.md b/docs/R53-RECEIVER-STORE-IO-RETRY.md
+new file mode 100644
+index 0000000..082307d
+--- /dev/null
++++ b/docs/R53-RECEIVER-STORE-IO-RETRY.md
+@@ -0,0 +1,26 @@
++# R53 — bounded receiver-store I/O retry
++
++## Finding
++
++R52 publishes a one-shot readiness result. `ReceiverDetectionRuntime.initialize()` used `runCatching` around the first `AtomicFile.openRead()` / initial `persist()`, then permanently completed the readiness gate with `false` on any exception. A transient storage I/O failure therefore disabled receiver-scoped configuration for the remainder of the process even if the file system recovered moments later.
++
++## Change
++
++- Added `ReceiverStoreIoRetry`, which retries only `IOException`, at most three total attempts, with 100 ms then 250 ms backoff.
++- The first-time empty-store write is converted to `IOException` if `persist()` returns false, so transient AtomicFile failures use the same bounded retry path.
++- JSON/schema/secret/field validation failures are not `IOException` and fail immediately; interrupted I/O is not retried. If the backoff sleep is interrupted, the thread interrupt flag is restored and an `InterruptedIOException` is thrown.
++- The redacted `ReceiverDetectionRuntime.reportSummary()` includes `storeRetries`; it never exposes the receiver address, HMAC binding, or secret.
++- The one-shot readiness contract is unchanged: after all retries fail, this process remains not-ready. No raw address or fallback identity is created.
++
++## Tests
++
++- transient read error followed by success;
++- two transient errors followed by success and exact bounded backoff;
++- malformed store fail-fast without retry;
++- retry exhaustion after three attempts;
++- `InterruptedIOException` fail-fast;
++- interruption during backoff preserves the interrupt flag.
++
++## Limits
++
++This only improves local configuration-store startup resilience. It does not change iAP2 wire behavior, MFi verification, 0x4300 body shape, retransmission, SYN/DETECT handling, 0x4301 acceptance, Wi-Fi handoff or AirPlay. Full Android Gradle build and E2LB real-vehicle validation remain required.

@@ -1,0 +1,683 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 092bc1b..bf38142 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,23 @@
+ # Changelog
+ 
++## [v0.1.37-test.1] - 2026-11-26
++
++> R50 E2LB 0x4300 A/B recovery candidate. The automatic fallback is triggered only by a written DUAL_GROUP request followed by a peer-initiated iAP2 restart before 0x4301; it does not prove causation or claim a vehicle fix.
++
++### English
++- Separate peer ACK-only frames from peer payload frames in 0x4300 startup diagnostics.
++- Distinguish not-transmitted, local-write-incomplete, transport-ACKed-without-0x4301, ACK-only activity, payload activity, and peer-link termination.
++- When an explicitly enabled E2LB DUAL_GROUP request was locally written and the receiver then restarts iAP2 before 0x4301, remember a receiver-fingerprint-scoped SINGLE_GROUP fallback for the next attempt.
++- A manual change of the DUAL_GROUP setting clears the remembered fallback and starts a fresh A/B experiment. No other receiver is affected.
++- Preserve wire format, MFi behavior, and retransmission policy; real-vehicle outcome remains unverified.
++
++### 简体中文
++- 在 0x4300 启动诊断中分开统计车机纯 ACK 帧与带载荷数据帧。
++- 分别识别未发送、本地写入未完成、仅链路 ACK、仅 ACK 活动、数据活动及对端链路结束。
++- 对明确启用 DUAL_GROUP 的 E2LB，如果 0x4300 已完成本地写入，随后车机在 0x4301 前主动重启 iAP2，则按车机指纹记住下一轮使用 SINGLE_GROUP。
++- 用户手动切换 DUAL_GROUP 开关会清除自动回退记录，重新开始 A/B 实验；不影响其它车机。
++- 不改变报文格式、MFi 行为或重传策略；实车结果仍待验证。
++
+ ## [v0.1.36-test.1] - 2026-11-26
+ 
+ > R49 identity-boundary hardening candidate. No E2LB/iAP2 connection fix claimed.
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 76753dc..ec50bc7 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.36"
++val appVersionName = "0.1.37"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt b/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
+index 0b34552..a48fda0 100644
+--- a/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
++++ b/app/src/main/java/com/mcarplay/app/compat/CompatibilityPrefs.kt
+@@ -12,6 +12,7 @@ object CompatibilityPrefs {
+     private const val KEY_VEHICLE_PRESET = "compat_vehicle_preset"
+     private const val KEY_AUDIO_BASELINE = "compat_audio_baseline"
+     private const val KEY_E2LB_DUAL_GROUP = "e2lb_dual_group_4300_experiment"
++    private const val KEY_E2LB_DUAL_GROUP_FALLBACK_PREFIX = "e2lb_dual_group_4300_fallback_"
+ 
+     private const val KEY_PASSAT_RETURN = "compat_passat_return_strategy"
+ 
+@@ -71,11 +72,33 @@ object CompatibilityPrefs {
+         context: Context,
+         enabled: Boolean,
+     ) {
+-        context
++        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        val editor = prefs.edit().putBoolean(KEY_E2LB_DUAL_GROUP, enabled)
++        // A deliberate user change starts a fresh A/B experiment for every remembered receiver.
++        prefs.all.keys.filter { it.startsWith(KEY_E2LB_DUAL_GROUP_FALLBACK_PREFIX) }.forEach(editor::remove)
++        editor.apply()
++    }
++
++    /** True when this receiver previously restarted iAP2 after a written DUAL_GROUP request. */
++    fun e2lbSingleGroupFallbackFor(
++        context: Context,
++        receiverFingerprint: String?,
++    ): Boolean {
++        if (receiverFingerprint.isNullOrBlank()) return false
++        return context
+             .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+-            .edit()
+-            .putBoolean(KEY_E2LB_DUAL_GROUP, enabled)
+-            .apply()
++            .getBoolean(KEY_E2LB_DUAL_GROUP_FALLBACK_PREFIX + receiverFingerprint, false)
++    }
++
++    /** Persist only a stable one-way receiver fingerprint, never the raw Bluetooth address or name. */
++    fun rememberE2lbSingleGroupFallback(
++        context: Context,
++        receiverFingerprint: String,
++    ): Boolean {
++        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
++        if (!prefs.getBoolean(KEY_E2LB_DUAL_GROUP, false)) return false
++        prefs.edit().putBoolean(KEY_E2LB_DUAL_GROUP_FALLBACK_PREFIX + receiverFingerprint, true).apply()
++        return true
+     }
+ 
+     /** 帕萨特「回主界面再进」实验策略；默认关，仅用户手动选择时生效。 */
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt b/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+index 5fb4813..a50cfa2 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicy.kt
+@@ -38,3 +38,31 @@ internal object E2lbAvailabilityBodyPolicy {
+             }
+         }
+ }
++
++
++/**
++ * One-way evidence gate for the E2LB 0x4300 A/B experiment.
++ * A DUAL_GROUP attempt is only auto-fallen-back after a completed local write is followed by
++ * a peer-initiated iAP2 restart before 0x4301. This is an A/B compatibility probe, not proof that
++ * the DUAL_GROUP body caused the peer restart.
++ */
++internal object E2lbAvailabilityFallbackPolicy {
++    fun shouldFallbackToSingleGroup(
++        isE2lb: Boolean,
++        shape: E2lbAvailabilityBodyPolicy.Shape?,
++        state: Iap2AvailabilityProgress.State,
++        terminationReason: String?,
++        receiptState: Iap2LinkEngine.ControlReceipt.State?,
++        receiptEndedFrom: Iap2LinkEngine.ControlReceipt.State?,
++        receiptLocalWriteCompleted: Boolean?,
++        startSessionReceived: Boolean,
++    ): Boolean =
++        isE2lb &&
++            shape == E2lbAvailabilityBodyPolicy.Shape.DUAL_GROUP &&
++            state == Iap2AvailabilityProgress.State.LINK_ENDED &&
++            terminationReason?.startsWith("peer restarted iAP2 negotiation") == true &&
++            receiptState == Iap2LinkEngine.ControlReceipt.State.ENDED &&
++            receiptEndedFrom == Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED &&
++            receiptLocalWriteCompleted == true &&
++            !startSessionReceived
++}
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
+index d74264b..3ddda24 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2AvailabilityProgress.kt
+@@ -1,10 +1,24 @@
+ package com.mcarplay.app.iap2
+ 
+-/** Separates transport-level replies from a verified CarPlay-start signal. */
++/** Separates local submission, link-layer acknowledgement and a verified CarPlay-start signal. */
+ internal object Iap2AvailabilityProgress {
+-    enum class State { START_SESSION, LINK_SILENT, LINK_ACTIVITY_NO_START, DETECT_ONLY, NOT_TRANSMITTED, LINK_ENDED }
++    enum class State {
++        START_SESSION,
++        NOT_TRANSMITTED,
++        LOCAL_WRITE_INCOMPLETE,
++        LINK_ENDED,
++        TRANSPORT_ACKED_NO_START,
++        DETECT_ONLY,
++        LINK_ACK_ONLY_NO_START,
++        PEER_PAYLOAD_NO_START,
++        LINK_ACTIVITY_NO_START,
++        LINK_SILENT,
++    }
+ 
+-    /** This is an observation, not proof of a receiver reset or refusal. */
++    /**
++     * Classify only what the local transport observed. A bare ACK is not an application response,
++     * and a successful stream.write is not proof that the receiver accepted 0x4300.
++     */
+     fun classifyWindow(
+         beforeFrames: Long,
+         before: Iap2LinkEngine.ParserStats,
+@@ -13,12 +27,27 @@ internal object Iap2AvailabilityProgress {
+         receipt: Iap2LinkEngine.ControlReceipt.State?,
+         alive: Boolean,
+         startSessionReceived: Boolean,
++        receiptEndedFrom: Iap2LinkEngine.ControlReceipt.State? = null,
++        receiptLocalWriteCompleted: Boolean? = null,
++        peerPayloadFramesDelta: Long = 0L,
++        peerAckOnlyFramesDelta: Long = 0L,
+     ): State {
+-        if (!alive) return State.LINK_ENDED
+         if (startSessionReceived) return State.START_SESSION
+-        if (receipt == Iap2LinkEngine.ControlReceipt.State.QUEUED) return State.NOT_TRANSMITTED
++
++        val progressBeforeEnd = if (receipt == Iap2LinkEngine.ControlReceipt.State.ENDED) receiptEndedFrom else receipt
++        if (progressBeforeEnd == Iap2LinkEngine.ControlReceipt.State.QUEUED || receipt == Iap2LinkEngine.ControlReceipt.State.QUEUED) {
++            return State.NOT_TRANSMITTED
++        }
++        if (progressBeforeEnd == Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED && receiptLocalWriteCompleted == false) {
++            return State.LOCAL_WRITE_INCOMPLETE
++        }
++        if (!alive) return State.LINK_ENDED
++        if (receipt == Iap2LinkEngine.ControlReceipt.State.PEER_ACKED) return State.TRANSPORT_ACKED_NO_START
++
++        val frameDelta = (afterFrames - beforeFrames).coerceAtLeast(0L)
+         if (receipt == Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED &&
+-            afterFrames == beforeFrames &&
++            receiptLocalWriteCompleted == true &&
++            frameDelta == 0L &&
+             after.detectMarkers - before.detectMarkers >= 3 &&
+             after.invalidHeaderChecksums == before.invalidHeaderChecksums &&
+             after.invalidPayloadChecksums == before.invalidPayloadChecksums &&
+@@ -27,10 +56,13 @@ internal object Iap2AvailabilityProgress {
+         ) {
+             return State.DETECT_ONLY
+         }
+-        return classify((afterFrames - beforeFrames).coerceAtLeast(0L), false)
++        if (peerPayloadFramesDelta > 0L) return State.PEER_PAYLOAD_NO_START
++        if (peerAckOnlyFramesDelta > 0L) return State.LINK_ACK_ONLY_NO_START
++        if (frameDelta > 0L) return State.LINK_ACTIVITY_NO_START
++        return State.LINK_SILENT
+     }
+ 
+-    /** Preserve a legitimate alternative handoff; stop only the unsupported E2LB branch. */
++    /** Preserve a legitimate alternative handoff; stop only an unsupported E2LB startup branch. */
+     fun shouldStopBeforeEndpoint(
+         isE2lb: Boolean,
+         state: State,
+@@ -43,7 +75,9 @@ internal object Iap2AvailabilityProgress {
+                     (
+                         !verifiedInvite &&
+                             !accessoryWifi &&
+-                            (state == State.DETECT_ONLY || state == State.NOT_TRANSMITTED)
++                            (state == State.DETECT_ONLY ||
++                                state == State.NOT_TRANSMITTED ||
++                                state == State.LOCAL_WRITE_INCOMPLETE)
+                     )
+             )
+ 
+diff --git a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+index d445105..a8e286f 100644
+--- a/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
++++ b/app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt
+@@ -1,5 +1,6 @@
+ package com.mcarplay.app.iap2
+ 
++import com.mcarplay.app.compat.CompatibilityPrefs
+ import com.mcarplay.app.compat.ReceiverCompatibility
+ import com.mcarplay.app.compat.ReceiverFingerprint
+ import com.mcarplay.app.compat.ReceiverObservation
+@@ -195,6 +196,8 @@ class Iap2SenderSession(
+     /** Frames received before 0x4300; counts include link ACK, not evidence of session acceptance. */
+     private var availabilityBefore: Iap2LinkChannel.LinkSnapshot? = null
+     private var availabilityReceipt: Iap2LinkEngine.ControlReceipt? = null
++    private var availabilityShape: E2lbAvailabilityBodyPolicy.Shape? = null
++    private var availabilityReceiverFingerprint: String? = null
+ 
+     private fun isE2lb(): Boolean =
+         receiverSignals.model.equals("E2LB", ignoreCase = true) &&
+@@ -663,6 +666,10 @@ class Iap2SenderSession(
+                     after.receiptState,
+                     after.alive,
+                     startSession != null,
++                    receiptEndedFrom = after.receiptEndedFrom,
++                    receiptLocalWriteCompleted = after.receiptLocalWriteCompleted,
++                    peerPayloadFramesDelta = (after.peerPayloadFrames - before.peerPayloadFrames).coerceAtLeast(0L),
++                    peerAckOnlyFramesDelta = (after.peerAckOnlyFrames - before.peerAckOnlyFrames).coerceAtLeast(0L),
+                 )
+             log(
+                 "LINK-PARSER 0x4300 window: DETECT=${after.parser.detectMarkers - before.parser.detectMarkers} " +
+@@ -672,11 +679,41 @@ class Iap2SenderSession(
+                     "noiseBytes=${after.parser.discardedNoiseBytes - before.parser.discardedNoiseBytes}",
+             )
+             log(
+-                "iap2 0x4300 observation: peerFrames=$delta receipt=${after.receiptState} " +
+-                    "endedFrom=${after.receiptEndedFrom ?: "none"} " +
++                "iap2 0x4300 observation: peerFrames=$delta " +
++                    "ackOnly=${(after.peerAckOnlyFrames - before.peerAckOnlyFrames).coerceAtLeast(0L)} " +
++                    "payloadFrames=${(after.peerPayloadFrames - before.peerPayloadFrames).coerceAtLeast(0L)} " +
++                    "receipt=${after.receiptState} endedFrom=${after.receiptEndedFrom ?: "none"} " +
+                     "localWriteCompleted=${after.receiptLocalWriteCompleted} result=$outcome; " +
+-                    "ACK is not CarPlay authorization",
++                    "transport ACK is not CarPlay authorization",
+             )
++            val shouldFallbackShape =
++                E2lbAvailabilityFallbackPolicy.shouldFallbackToSingleGroup(
++                    isE2lb = isE2lb(),
++                    shape = availabilityShape,
++                    state = outcome,
++                    terminationReason = after.terminationReason,
++                    receiptState = after.receiptState,
++                    receiptEndedFrom = after.receiptEndedFrom,
++                    receiptLocalWriteCompleted = after.receiptLocalWriteCompleted,
++                    startSessionReceived = startSession != null,
++                )
++            if (shouldFallbackShape) {
++                val fingerprint = availabilityReceiverFingerprint
++                val remembered =
++                    if (context != null && !fingerprint.isNullOrBlank()) {
++                        CompatibilityPrefs.rememberE2lbSingleGroupFallback(context, fingerprint)
++                    } else {
++                        false
++                    }
++                log(
++                    if (remembered) {
++                        "E2LB 0x4300 DUAL_GROUP 已写入后车机重新协商且未收到 0x4301——" +
++                            "为该车机记住下轮 SINGLE_GROUP 对照；未判定 DUAL_GROUP 是根因，用户切换实验开关可重新试验"
++                    } else {
++                        "E2LB 0x4300 DUAL_GROUP 后车机重新协商；无法持久化 SINGLE_GROUP 回退（缺少上下文或实验开关已关闭）"
++                    },
++                )
++            }
+             // Never carry a detect-only, unacknowledged E2LB startup into Wi-Fi discovery.
+             // Throw before handing off an endpoint: the existing Bluetooth ownership and
+             // reconnect circuit breaker dispose of this attempt. The bounded probe policy
+@@ -1189,14 +1226,29 @@ class Iap2SenderSession(
+      */
+     private fun sendCarPlayAvailability() {
+         if (carPlayAvailabilitySent) return
+-        val availabilityShape =
++        val receiverFingerprint =
++            "e2lb4300_" + ReceiverFingerprint.digest(
++                listOf(receiverBinding.orEmpty()) + ReceiverFingerprint.identity(receiverSignals),
++            )
++        availabilityReceiverFingerprint = receiverFingerprint
++        val autoFallback =
++            isE2lb() &&
++                experimentalE2lbDualGroup &&
++                context != null &&
++                CompatibilityPrefs.e2lbSingleGroupFallbackFor(context, receiverFingerprint)
++        val useDualGroup = experimentalE2lbDualGroup && !autoFallback
++        val selectedShape =
+             E2lbAvailabilityBodyPolicy.select(
+                 receiverSignals.model,
+                 receiverSignals.manufacturer,
+                 bluetoothMac,
+-                experimentalE2lbDualGroup,
++                useDualGroup,
+             )
+-        val body = E2lbAvailabilityBodyPolicy.body(availabilityShape, bluetoothMac)
++        availabilityShape = selectedShape
++        if (autoFallback) {
++            log("E2LB 0x4300：此前 DUAL_GROUP 后发生已写入的对端重新协商，本轮自动使用 SINGLE_GROUP；切换实验开关可清除此回退")
++        }
++        val body = E2lbAvailabilityBodyPolicy.body(selectedShape, bluetoothMac)
+         val frame = Iap2Csm.encode(Iap2MessageIds.CARPLAY_AVAILABILITY, body)
+         if (isE2lb() && channel.supportsObservedControl() && frame.size <= (channel.peerMaxControlPayload() ?: 0)) {
+             // Observe this one specific sequence without introducing a new retransmission policy.
+@@ -1220,7 +1272,7 @@ class Iap2SenderSession(
+             if (isE2lb()) log("iap2 0x4300 passive receipt unavailable for this negotiated transport; preserving normal send")
+             sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, body)
+         }
+-        log("iap2 0x4300 形态=$availabilityShape (E2LB 实验开关=$experimentalE2lbDualGroup；未证实车机已接受)")
++        log("iap2 0x4300 形态=$selectedShape (E2LB 实验开关=$experimentalE2lbDualGroup 自动回退=$autoFallback；未证实车机已接受)")
+         carPlayAvailabilitySent = true
+         reached(ConnectionMilestone.CARPLAY_AVAILABILITY_SUBMITTED)
+         log("iap2 0x4300 已提交链路发送（awaitAck=false）；尚无证据证明车机应用层认可或已开启 CarPlay")
+diff --git a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+index 3036789..340c0a9 100644
+--- a/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
++++ b/app/src/main/java/com/mcarplay/app/transport/Iap2LinkChannel.kt
+@@ -42,6 +42,12 @@ class Iap2LinkChannel(
+     /** Incoming iAP2 frames (including bare ACK), not a count of accepted application messages. */
+     private var receivedPeerFrameCount = 0L
+ 
++    /** Non-SYN frames carrying payload; useful to distinguish protocol data from bare link ACKs. */
++    private var receivedPeerPayloadFrameCount = 0L
++
++    /** Pure ACK-only frames; these prove link-layer activity, never CarPlay application acceptance. */
++    private var receivedPeerAckOnlyFrameCount = 0L
++
+     /** 原始字节转储预算（每方向每连接），真车字节级对照用。 */
+     private var rxDumpBudget = RAW_DUMP_LIMIT
+     private var txDumpBudget = RAW_DUMP_LIMIT_TX
+@@ -65,6 +71,14 @@ class Iap2LinkChannel(
+         engine.onFrameReceived = { control, sequence, ack, sessionId, size ->
+             lastPeerFrameAtMillis = nowMillis()
+             receivedPeerFrameCount++
++            val isSyn = control and 0x80 != 0
++            val isAck = control and 0x40 != 0
++            val isExtendedAck = control and 0x20 != 0
++            if (!isSyn && isAck && !isExtendedAck && size > 0) {
++                receivedPeerPayloadFrameCount++
++            } else if (!isSyn && isAck && size == 0) {
++                receivedPeerAckOnlyFrameCount++
++            }
+             // 真车调试关键观测：车机在识别阶段是否回帧、回什么（静默分歧全靠它定位）
+             if (rxFrameLogs < FRAME_LOG_LIMIT) {
+                 rxFrameLogs++
+@@ -123,6 +137,8 @@ class Iap2LinkChannel(
+         val receiptEndedFrom: Iap2LinkEngine.ControlReceipt.State? = null,
+         val terminationReason: String? = null,
+         val receiptLocalWriteCompleted: Boolean? = null,
++        val peerPayloadFrames: Long = 0L,
++        val peerAckOnlyFrames: Long = 0L,
+     )
+ 
+     /** Counters and receipt belong to the same reader/pacer lock acquisition. */
+@@ -136,6 +152,8 @@ class Iap2LinkChannel(
+                 receipt?.endedFrom,
+                 terminationReason,
+                 receipt?.localWriteCompleted,
++                receivedPeerPayloadFrameCount,
++                receivedPeerAckOnlyFrameCount,
+             )
+         }
+ 
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
+index 291cd57..1b3ab7b 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityBodyPolicyTest.kt
+@@ -20,6 +20,15 @@ class E2lbAvailabilityBodyPolicyTest {
+         )
+     }
+ 
++    @Test fun singleGroupEncodesOnlyTheWirelessIdentifierGroup() {
++        val body = E2lbAvailabilityBodyPolicy.body(E2lbAvailabilityBodyPolicy.Shape.SINGLE_GROUP, mac)
++        val groups = Iap2Csm.parseParams(body)
++        assertEquals(listOf(1), groups.map { it.id })
++        val values = Iap2Csm.parseParams(groups.single().value)
++        assertEquals(listOf(0, 1), values.map { it.id })
++        assertEquals("4C:92:D2:AB:CD:EF", values[1].value.toString(Charsets.UTF_8).trimEnd('\u0000'))
++    }
++
+     @Test fun dualGroupEncodesWiredAndLowercaseWirelessIdentifiers() {
+         val shape = E2lbAvailabilityBodyPolicy.select("E2LB", "Saic General Motors", mac, true)
+         assertEquals(E2lbAvailabilityBodyPolicy.Shape.DUAL_GROUP, shape)
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt
+new file mode 100644
+index 0000000..0ff001b
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/iap2/E2lbAvailabilityFallbackPolicyTest.kt
+@@ -0,0 +1,49 @@
++package com.mcarplay.app.iap2
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class E2lbAvailabilityFallbackPolicyTest {
++    private fun shouldFallback(
++        isE2lb: Boolean = true,
++        shape: E2lbAvailabilityBodyPolicy.Shape? = E2lbAvailabilityBodyPolicy.Shape.DUAL_GROUP,
++        state: Iap2AvailabilityProgress.State = Iap2AvailabilityProgress.State.LINK_ENDED,
++        reason: String? = "peer restarted iAP2 negotiation (seq=118 oldSeq=204)",
++        receipt: Iap2LinkEngine.ControlReceipt.State? = Iap2LinkEngine.ControlReceipt.State.ENDED,
++        endedFrom: Iap2LinkEngine.ControlReceipt.State? = Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED,
++        localWrite: Boolean? = true,
++        start: Boolean = false,
++    ) = E2lbAvailabilityFallbackPolicy.shouldFallbackToSingleGroup(
++        isE2lb,
++        shape,
++        state,
++        reason,
++        receipt,
++        endedFrom,
++        localWrite,
++        start,
++    )
++
++    @Test
++    fun onlyWrittenDualGroupFollowedByPeerRestartTriggersFallback() {
++        assertTrue(shouldFallback())
++    }
++
++    @Test
++    fun otherReceiversAndSingleGroupNeverFallback() {
++        assertFalse(shouldFallback(isE2lb = false))
++        assertFalse(shouldFallback(shape = E2lbAvailabilityBodyPolicy.Shape.SINGLE_GROUP))
++        assertFalse(shouldFallback(shape = null))
++    }
++
++    @Test
++    fun incompleteOrUnrelatedFailuresNeverFallback() {
++        assertFalse(shouldFallback(localWrite = false))
++        assertFalse(shouldFallback(endedFrom = Iap2LinkEngine.ControlReceipt.State.QUEUED))
++        assertFalse(shouldFallback(reason = "packet 110 not acknowledged"))
++        assertFalse(shouldFallback(state = Iap2AvailabilityProgress.State.DETECT_ONLY))
++        assertFalse(shouldFallback(receipt = Iap2LinkEngine.ControlReceipt.State.PEER_ACKED))
++        assertFalse(shouldFallback(start = true))
++    }
++}
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
+index 258313e..9bc72c3 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2AvailabilityProgressTest.kt
+@@ -13,6 +13,10 @@ class Iap2AvailabilityProgressTest {
+         receipt: Iap2LinkEngine.ControlReceipt.State? = Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED,
+         alive: Boolean = true,
+         start: Boolean = false,
++        endedFrom: Iap2LinkEngine.ControlReceipt.State? = null,
++        localWrite: Boolean? = true,
++        payloadFrames: Long = 0L,
++        ackOnlyFrames: Long = 0L,
+     ) = Iap2AvailabilityProgress.classifyWindow(
+         8L,
+         baseline,
+@@ -21,10 +25,14 @@ class Iap2AvailabilityProgressTest {
+         receipt,
+         alive,
+         start,
++        receiptEndedFrom = endedFrom,
++        receiptLocalWriteCompleted = localWrite,
++        peerPayloadFramesDelta = payloadFrames,
++        peerAckOnlyFramesDelta = ackOnlyFrames,
+     )
+ 
+     @Test
+-    fun fiveVehicleWindowsReplayAsDetectOnly() {
++    fun repeatedCleanDetectsAfterWrittenFrameAreDetectOnly() {
+         repeat(5) { assertEquals(Iap2AvailabilityProgress.State.DETECT_ONLY, classify()) }
+     }
+ 
+@@ -35,11 +43,44 @@ class Iap2AvailabilityProgressTest {
+     }
+ 
+     @Test
+-    fun queuedDeadAndExplicitStartRemainDistinct() {
++    fun queuedAndEndedBeforeGenerationAreNotTransmitted() {
+         assertEquals(Iap2AvailabilityProgress.State.NOT_TRANSMITTED, classify(receipt = Iap2LinkEngine.ControlReceipt.State.QUEUED))
++        assertEquals(
++            Iap2AvailabilityProgress.State.NOT_TRANSMITTED,
++            classify(receipt = Iap2LinkEngine.ControlReceipt.State.ENDED, endedFrom = Iap2LinkEngine.ControlReceipt.State.QUEUED, alive = false),
++        )
++    }
++
++    @Test
++    fun generatedButNotLocallyWrittenIsDistinct() {
++        assertEquals(
++            Iap2AvailabilityProgress.State.LOCAL_WRITE_INCOMPLETE,
++            classify(receipt = Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, localWrite = false),
++        )
++        assertEquals(
++            Iap2AvailabilityProgress.State.LOCAL_WRITE_INCOMPLETE,
++            classify(receipt = Iap2LinkEngine.ControlReceipt.State.ENDED, endedFrom = Iap2LinkEngine.ControlReceipt.State.FRAME_GENERATED, localWrite = false, alive = false),
++        )
++    }
++
++    @Test
++    fun transportAckIsNotCarPlayStart() {
++        assertEquals(
++            Iap2AvailabilityProgress.State.TRANSPORT_ACKED_NO_START,
++            classify(receipt = Iap2LinkEngine.ControlReceipt.State.PEER_ACKED),
++        )
++    }
++
++    @Test
++    fun ackOnlyAndPayloadFramesAreSeparated() {
++        assertEquals(Iap2AvailabilityProgress.State.LINK_ACK_ONLY_NO_START, classify(frames = 2L, ackOnlyFrames = 2L))
++        assertEquals(Iap2AvailabilityProgress.State.PEER_PAYLOAD_NO_START, classify(frames = 1L, payloadFrames = 1L))
++    }
++
++    @Test
++    fun linkEndAndExplicitStartRemainDistinct() {
+         assertEquals(Iap2AvailabilityProgress.State.LINK_ENDED, classify(alive = false))
+-        assertEquals(Iap2AvailabilityProgress.State.START_SESSION, classify(start = true))
+-        assertEquals(Iap2AvailabilityProgress.State.LINK_ACTIVITY_NO_START, classify(frames = 1L))
++        assertEquals(Iap2AvailabilityProgress.State.START_SESSION, classify(start = true, alive = false))
+     }
+ 
+     @Test
+@@ -54,13 +95,21 @@ class Iap2AvailabilityProgressTest {
+         }
+     }
+ 
++    @Test
++    fun deadLinkAlwaysStopsButIncompleteWriteMayUseVerifiedAlternativeHandoff() {
++        assertEquals(true, Iap2AvailabilityProgress.shouldStopBeforeEndpoint(true, Iap2AvailabilityProgress.State.LINK_ENDED, true, true))
++        assertEquals(true, Iap2AvailabilityProgress.shouldStopBeforeEndpoint(true, Iap2AvailabilityProgress.State.LOCAL_WRITE_INCOMPLETE, false, false))
++        assertEquals(false, Iap2AvailabilityProgress.shouldStopBeforeEndpoint(true, Iap2AvailabilityProgress.State.LOCAL_WRITE_INCOMPLETE, true, false))
++        assertEquals(false, Iap2AvailabilityProgress.shouldStopBeforeEndpoint(true, Iap2AvailabilityProgress.State.LOCAL_WRITE_INCOMPLETE, false, true))
++    }
++
+     @Test
+     fun silentLinkDoesNotCountAsCarPlayStart() {
+         assertEquals(Iap2AvailabilityProgress.State.LINK_SILENT, Iap2AvailabilityProgress.classify(0L, false))
+     }
+ 
+     @Test
+-    fun ackOrHeartbeatsAloneAreNotCarPlayStartEvidence() {
++    fun genericLinkActivityDoesNotCountAsCarPlayStart() {
+         assertEquals(Iap2AvailabilityProgress.State.LINK_ACTIVITY_NO_START, Iap2AvailabilityProgress.classify(11L, false))
+     }
+ 
+diff --git a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+index e71d441..fff77a4 100644
+--- a/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
++++ b/app/src/test/java/com/mcarplay/app/iap2/Iap2SenderSessionTest.kt
+@@ -103,7 +103,12 @@ class Iap2SenderSessionTest {
+             ).run(timeoutMillis = 10_000L)
+ 
+         assertEquals(
+-            listOf(ConnectionMilestone.BT_LINK, ConnectionMilestone.IAP2_IDENTIFIED, ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED),
++            listOf(
++                ConnectionMilestone.BT_LINK,
++                ConnectionMilestone.IAP2_IDENTIFIED,
++                ConnectionMilestone.IAP2_AUTH_SIGNAL_UNVERIFIED,
++                ConnectionMilestone.CARPLAY_AVAILABILITY_SUBMITTED,
++            ),
+             synchronized(milestones) { milestones.toList() },
+         )
+         assertEquals("MockAP", endpoint.ssid)
+diff --git a/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt b/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
+index a8c3fc8..b290043 100644
+--- a/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
++++ b/app/src/test/java/com/mcarplay/app/transport/Iap2LinkChannelRestartTest.kt
+@@ -174,6 +174,41 @@ class Iap2LinkChannelRestartTest {
+         }
+     }
+ 
++
++    @Test
++    fun snapshotSeparatesPeerAckOnlyFromPeerPayloadFrames() {
++        val pair = InMemoryStreamPair()
++        val phone = Iap2LinkChannel(pair.sideA, name = "evidence-phone")
++        val peer = Iap2LinkChannel(pair.sideB, name = "evidence-peer")
++        try {
++            assertTrue(phone.awaitReady(5_000))
++            assertTrue(peer.awaitReady(5_000))
++            val baseline = phone.snapshot()
++
++            assertTrue(phone.sendControl(byteArrayOf(9, 8, 7)))
++            assertNotNull(peer.recvControl(2_000))
++            val ackDeadline = System.nanoTime() + 2_000_000_000L
++            while (phone.snapshot().peerAckOnlyFrames == baseline.peerAckOnlyFrames && System.nanoTime() < ackDeadline) {
++                Thread.sleep(5)
++            }
++            val afterAck = phone.snapshot()
++            assertTrue(afterAck.peerAckOnlyFrames > baseline.peerAckOnlyFrames)
++            assertTrue(afterAck.peerPayloadFrames == baseline.peerPayloadFrames)
++
++            assertTrue(peer.sendControl(byteArrayOf(6, 5, 4)))
++            assertNotNull(phone.recvControl(2_000))
++            val payloadDeadline = System.nanoTime() + 2_000_000_000L
++            while (phone.snapshot().peerPayloadFrames == baseline.peerPayloadFrames && System.nanoTime() < payloadDeadline) {
++                Thread.sleep(5)
++            }
++            val afterPayload = phone.snapshot()
++            assertTrue(afterPayload.peerPayloadFrames > baseline.peerPayloadFrames)
++        } finally {
++            phone.close()
++            peer.close()
++        }
++    }
++
+     @Test
+     fun newSynClosesTheChannelAndSurfacesTheRestartReason() {
+         val pair = InMemoryStreamPair()
+diff --git a/docs/R50-E2LB-4300-AB-FALLBACK.md b/docs/R50-E2LB-4300-AB-FALLBACK.md
+new file mode 100644
+index 0000000..a4eff83
+--- /dev/null
++++ b/docs/R50-E2LB-4300-AB-FALLBACK.md
+@@ -0,0 +1,51 @@
++# R50 — E2LB 0x4300 A/B fallback
++
++## Evidence from the supplied R44 log
++
++The supplied three-attempt trace shows the same sequence in each attempt:
++
++1. The sender submits `0x4300` using `DUAL_GROUP`.
++2. No `0x4301` is observed.
++3. The receiver emits DETECT markers.
++4. A new pure SYN arrives with a changed sequence/session negotiation context.
++5. The current iAP2 link is retired.
++
++This is a strong correlation, not proof that the DUAL_GROUP body caused the receiver restart. The source already exposes a user opt-in DUAL_GROUP experiment, so R50 uses a bounded A/B fallback rather than changing the protocol globally.
++
++## Runtime behavior
++
++- The user's DUAL_GROUP preference remains unchanged.
++- A fallback is recorded only for E2LB and only when all conditions hold:
++  - the selected body was `DUAL_GROUP`;
++  - the `0x4300` control frame was generated;
++  - the local stream write returned successfully;
++  - the observed receipt ended from `FRAME_GENERATED` (not `PEER_ACKED`);
++  - the link ended because the peer restarted iAP2 negotiation;
++  - no `0x4301` was received.
++- The receiver key is a SHA-256 fingerprint of the local binding plus normalized receiver capability identity. Each fingerprint has its own preference key, so separate receiver profiles do not overwrite one another. No raw Bluetooth address or receiver display name is stored in this preference.
++- On the next attempt for that fingerprint, the sender uses `SINGLE_GROUP` while leaving the user's experiment toggle on. The log explains the fallback.
++- Manually changing the experiment toggle clears all remembered per-receiver fallbacks so the user can intentionally retry DUAL_GROUP.
++- No other receiver is affected.
++
++## Diagnostic improvements
++
++`Iap2LinkChannel` now counts peer payload frames and ACK-only frames separately. `Iap2AvailabilityProgress` distinguishes:
++
++- not transmitted;
++- local write incomplete;
++- link ended;
++- transport ACK received but no `0x4301`;
++- DETECT-only activity;
++- ACK-only activity;
++- peer payload activity without `0x4301`;
++- no peer activity.
++
++A transport ACK is still not treated as CarPlay application acceptance.
++
++## Safety / non-claims
++
++- No iAP2 wire format was changed.
++- No retransmission, SYN, DETECT, or MFi behavior was changed.
++- The fallback is an evidence-driven compatibility experiment, not a verified diagnosis of the receiver's firmware.
++- A successful `SINGLE_GROUP` attempt must still be confirmed by a real `0x4301`, Wi-Fi handoff, AirPlay SETUP/RECORD, and actual video/audio/touch.
++- If `SINGLE_GROUP` also fails, the next required evidence is a new diagnostic log from R50 showing the selected shape, receipt state, local-write state, ACK-only/payload counters, and peer termination reason.

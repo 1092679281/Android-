@@ -1,0 +1,35 @@
+R56 SOURCE REPLAY VALIDATION
+===========================
+
+Canonical candidate: R56 / 0.1.43
+Baseline: R44 / 0.1.31
+R44 baseline commit: 967caf7eeff3ed54c7e3f4f9c1452821e8161a28
+R44 source archive SHA-256: d7e3ea795ee908bd77e3f920511f3f0f532ba63b182df23a57624ca58fcc321b
+
+Incremental patch replay:
+- R45 through R56: 12 patches
+- Every patch passed git apply --check on a clean R44 worktree
+- Every patch applied in order without conflict
+- Replayed pre-organization tree: 820 files
+- Compared with pinned R56 source tree: 0 missing, 0 extra, 0 content differences
+
+Source organization:
+- R56-source-organization.patch applied after R56 protocol patches
+- organize-source.sh executed
+- Final organized source: 827 files
+- Compared with mcarplay-0.1.43-R56-organized-full.zip: 0 missing, 0 extra, 0 content differences
+- Deterministic organized tree SHA-256:
+  29bd33771f52538d918b8f9c2a66e6822b84d3e2c65a9817aff926dcde5fbec5
+
+Archive hashes:
+- R56 full candidate ZIP:
+  686f1968b5846fe49e55f9b96032c21d77e5408f281d13434b79831d34afcbff
+- R56 organized full ZIP:
+  877a54f7af496ee4f82a2064fbabab7cccbf1b702d2672828f12620252ffebab
+- R56 clean source ZIP:
+  b7cc114e73f4426ceca59fcb309584da4d712dae131a6cde1198a7b4a1f2f06f
+
+The R56 source organization patch was reassembled from paginated file reads with the missing page-boundary newlines restored. Its Git blob SHA-1 exactly matches the local git hash-object:
+96fd683a8d360b374574aa4772553c1caa5e085e
+
+This report verifies source reconstruction and archive equivalence only. It does not establish Android Gradle build success, APK validity, MFi cryptographic authentication, E2LB 0x4300 acknowledgement, real-vehicle Wi-Fi handoff, or AirPlay acceptance.

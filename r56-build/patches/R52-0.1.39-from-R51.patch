@@ -1,0 +1,452 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 048c258..e28a639 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,25 @@
+ # Changelog
+ 
++## [v0.1.39-test.1] - 2026-11-26
++
++> R52 bounded receiver-store readiness. This closes a cold-start race that could disable receiver-scoped experiment memory on the first Bluetooth attempt; it does not claim to fix the E2LB vehicle connection.
++
++### English
++- Start loading the private receiver configuration store from `Application.onCreate`, not only after the session controller is first ensured.
++- Publish store readiness exactly once after both the persisted HMAC secret and environment fingerprint have loaded successfully (or initialization has failed).
++- Bluetooth session workers may wait up to 1.5 seconds for readiness before creating a receiver observation; timeout/failure proceeds without a binding and never blocks indefinitely.
++- Preserve receiver identity isolation: no empty-binding or raw-address fallback key is introduced.
++- Add concurrent waiter, initialization-failure, timeout, interruption-preservation and one-shot completion tests.
++- Full Android Gradle build and E2LB real-vehicle behavior remain unverified.
++
++### 简体中文
++- 将本机接收端配置存储初始化提前到 `Application.onCreate`，不再只依赖会话控制器首次初始化。
++- 只有持久化 HMAC 密钥和环境指纹均加载完成（或明确初始化失败）后，才一次性发布存储就绪状态。
++- 蓝牙会话工作线程在创建车机观察对象前最多等待 1.5 秒；超时或失败时安全地不使用持久化绑定，不会无限阻塞连接。
++- 保留按车机隔离原则，不引入空绑定或原始地址回退键。
++- 新增并发等待、初始化失败、超时、中断状态保留和一次性完成测试。
++- 完整 Android 编译与 E2LB 实车行为仍未验证。
++
+ ## [v0.1.38-test.1] - 2026-11-26
+ 
+ > R51 receiver-scoped E2LB fallback isolation. This prevents missing receiver bindings from sharing persistent A/B state; it does not claim to fix the E2LB vehicle connection.
+diff --git a/IMPLEMENTATION_PLAN.md b/IMPLEMENTATION_PLAN.md
+index a01d23d..3412178 100644
+--- a/IMPLEMENTATION_PLAN.md
++++ b/IMPLEMENTATION_PLAN.md
+@@ -6,6 +6,8 @@
+ 
+ ## 当前基线与结论
+ 
++- **11 月 26 日 R52 冷启动绑定就绪竞态修复（离线候选，未上车）：** R51 的接收端配置存储在会话控制器首次 ensure 后异步加载；蓝牙连接若先到达，客户端默认参数或服务端 accept 路径会在 store 就绪前创建 observation=null，导致本轮禁用按车机持久化的 E2LB 回退。R52 将初始化提前至 Application.onCreate，并在蓝牙会话工作线程最多等待 1.5 秒；失败/超时继续连接但不生成共享绑定。新增就绪门闩并发/超时/中断测试。此项只修复实验状态可用性，不证明 DUAL_GROUP 是车机重启根因，也不解决 MFi/0x4300 实车启动。
++
+ - **11 月 26 日 R51 E2LB 回退隔离加固（离线候选，未上车）：** R50 在接收端私有配置存储尚未加载、或本轮没有有效 Bluetooth 实例绑定时，仍会把空 binding 与接收端能力摘要组合成持久化指纹；相同能力画像的不同 E2LB 实例可能共享 SINGLE_GROUP 回退状态。R51 改为仅接受 `ReceiverConfigurationStore` 生成的 64 位小写 HMAC binding，并校验持久化键格式；无稳定 binding 时遵循本轮用户选择，但不读写跨轮回退。新增绑定缺失/畸形/不同实例隔离测试。该修改不证明 DUAL_GROUP 是 SYN 重启根因，也未解决 MFi、0x4300/0x4301 实车启动；完整 Android 门禁、APK 与实车验收仍待完成。详见 `docs/R51-E2LB-FALLBACK-BINDING-ISOLATION.md`。
+ 
+ - **11 月 14 日 issue #62 诊断补充（仅离线验证，未上车，未改协议行为）：** 奔驰 MB_E-P-4（AirPlay 480.7.4，2025 款 GLC）报告链路全通、CarWith 透传 1392 帧 / 109 s，车机却无画面、点 CarPlay 图标无反应。报告里三条线索此前只能靠「缺席」推断：`/info` 的 `displays[0]`（1278 高）与 `displayPanels[0].initialVideoStreams`（1728 高）几何冲突、`modesChanged` 应答恒为 42B `{}`、MIB3 突发后车机零订阅。本次只新增三类诊断（显示表面对照、模式切换应答归类计数、MIB3 订阅观察），**未**按面板几何改协商、也**未**改 `modesChanged` 时序——两者都需实车对照。详见 `docs/CARWITH-ENTRY-FINDINGS.md`。已通过新增 JVM 单测与本地门禁；无设备或实车证据。
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index d85391f..e8cac64 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -15,7 +15,7 @@ plugins {
+  * Optional signed build suffix: -Pmcarplay.buildNumber=N.
+  * Tagged releases use the base version; update it before publishing a new tag.
+  */
+-val appVersionName = "0.1.38"
++val appVersionName = "0.1.39"
+ // 可覆盖安装的 remote 诊断包；兼容第一版诊断包的构建参数。
+ val diagnosticsBuild =
+     providers
+diff --git a/app/src/main/java/com/mcarplay/app/SenderApp.kt b/app/src/main/java/com/mcarplay/app/SenderApp.kt
+index d344905..fe96bf7 100644
+--- a/app/src/main/java/com/mcarplay/app/SenderApp.kt
++++ b/app/src/main/java/com/mcarplay/app/SenderApp.kt
+@@ -2,6 +2,7 @@ package com.mcarplay.app
+ 
+ import android.app.Application
+ import android.util.Log
++import com.mcarplay.app.compat.ReceiverDetectionRuntime
+ import com.mcarplay.app.diagnostics.ConnectionDiagnostics
+ import com.mcarplay.app.i18n.AppLanguage
+ import com.mcarplay.app.service.WifiLowLatencyForce
+@@ -21,6 +22,8 @@ open class SenderApp : Application() {
+         // 都会让它被算进「历史」。
+         DebugFileLog.markSessionStart(this)
+         ConnectionDiagnostics.initialize(this)
++        // Load the private receiver binding store at process start, before the first BT session.
++        ReceiverDetectionRuntime.initialize(this)
+         // 上次进程被系统杀死时可能没走到 StreamingWifiLock.release()；Shizuku 就绪后恢复。
+         WifiLowLatencyForce.restoreAfterCrash(this)
+         // 界面语言：未选过时落到默认中文（不跟随系统语言）
+diff --git a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+index 693ad1f..468d204 100644
+--- a/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
++++ b/app/src/main/java/com/mcarplay/app/bt/BtSession.kt
+@@ -48,10 +48,19 @@ internal fun Iap2LinkChannel.runSenderSession(
+     unverifiedInvitePending: () -> Boolean = { false },
+     isSessionCurrent: () -> Boolean = { true },
+ ) {
++    // The default observation can be null if the async private-store load races the first
++    // accepted RFCOMM socket. Retry after a bounded wait on this session worker so R51's
++    // receiver-scoped E2LB experiment state is available on the first connection when possible.
++    val sessionObservation =
++        observation ?: ReceiverDetectionRuntime.observationWhenReady(peerAddress).also { resolved ->
++            if (resolved == null && !peerAddress.isNullOrBlank()) {
++                log("BT: 本轮未取得稳定车机绑定（配置存储未就绪、加载失败或地址不可用）；保留当前连接，但禁用跨轮车机专属实验记忆")
++            }
++        }
+     val originatingLink = java.lang.ref.WeakReference(this)
+     val attempt = ConnectionDiagnostics.timeline.snapshot()?.id
+     val recordMilestone: (ConnectionMilestone) -> Unit = { milestone ->
+-        if (attempt != null && isSessionCurrent() && ReceiverDetectionRuntime.isCurrent(observation)) {
++        if (attempt != null && isSessionCurrent() && ReceiverDetectionRuntime.isCurrent(sessionObservation)) {
+             ConnectionDiagnostics.timeline.milestone(attempt, milestone)
+         }
+     }
+@@ -61,36 +70,36 @@ internal fun Iap2LinkChannel.runSenderSession(
+             { line -> log(line) },
+             logBluetoothMac(identity, log),
+             DeviceIdentity.deviceName(context),
+-            { wifi -> if (ReceiverDetectionRuntime.isCurrent(observation)) onWifiCredentials(wifi.copy(observation = observation)) },
++            { wifi -> if (ReceiverDetectionRuntime.isCurrent(sessionObservation)) onWifiCredentials(wifi.copy(observation = sessionObservation)) },
+             { update ->
+-                if (ReceiverDetectionRuntime.isCurrent(observation)) {
++                if (ReceiverDetectionRuntime.isCurrent(sessionObservation)) {
+                     onEndpointUpdate(
+-                        update.copy(observation = observation, peerAddress = peerAddress, originatingControlLink = originatingLink),
++                        update.copy(observation = sessionObservation, peerAddress = peerAddress, originatingControlLink = originatingLink),
+                     )
+                 }
+             },
+             knownCarSsid,
+-            { receiverInvited(observation) },
++            { receiverInvited(sessionObservation) },
+             // MFi 挑战长度按车机身份持久化（省掉 20B 静默 6 秒的试探）
+             context.applicationContext,
+-            receiverBinding = observation?.binding,
+-            rememberMfi = !ReceiverDetectionRuntime.collecting(observation),
++            receiverBinding = sessionObservation?.binding,
++            rememberMfi = !ReceiverDetectionRuntime.collecting(sessionObservation),
+             onMilestone = recordMilestone,
+             unverifiedInvitePending = unverifiedInvitePending,
+             experimentalE2lbDualGroup = CompatibilityPrefs.e2lbDualGroup(context),
+         )
+     onSession(session)
+-    onObservation(observation, true)
++    onObservation(sessionObservation, true)
+     var endpointDelivered = false
+     var failureReason: String? = null
+     try {
+         recordMilestone(ConnectionMilestone.RFCOMM_CONNECTED)
+         val endpoint = session.run(timeoutMillis)
+         onGeneration(session.linkGeneration)
+-        if (!ReceiverDetectionRuntime.isCurrent(observation)) return
++        if (!ReceiverDetectionRuntime.isCurrent(sessionObservation)) return
+         session.ensureEndpointHandoffActive()
+         endpointDelivered = true
+-        onEndpoint(endpoint.copy(observation = observation, peerAddress = peerAddress, originatingControlLink = originatingLink))
++        onEndpoint(endpoint.copy(observation = sessionObservation, peerAddress = peerAddress, originatingControlLink = originatingLink))
+         // Phase 2 过渡：保持控制通道存活记录配件消息；AirPlay 配对由 onEndpoint 回调发起
+         session.pumpIncomingForever()
+     } catch (error: IOException) {
+@@ -98,19 +107,19 @@ internal fun Iap2LinkChannel.runSenderSession(
+         failureReason = error.message ?: error.javaClass.simpleName
+         throw error
+     } finally {
+-        onObservation(observation, false)
+-        if (endpointDelivered && ReceiverDetectionRuntime.isCurrent(observation)) {
++        onObservation(sessionObservation, false)
++        if (endpointDelivered && ReceiverDetectionRuntime.isCurrent(sessionObservation)) {
+             // 只有交付过端点的链路才可能拥有当前交接；Phase 1 前失败的候选链路
+             // 不得取消另一条已经进入入网/配对的健康链路。
+             session.linkTerminationReason?.let { log("SESSION 链路终止原因: $it") }
+-            onLinkClosed(observation, peerAddress)
++            onLinkClosed(sessionObservation, peerAddress)
+         } else {
+             // Phase 1 之前就结束（协商超时/车机拆链/识别失败）：onLinkClosed 不会触发，
+             // 这里补一次上报，否则主控既不会结束本轮时间线，也不会把连续失败计入熔断
+             // （bug #66：退化 0x1d01 + 协商重启的保时捷形态）。
+             // 与 onLinkClosed 一样要求本链路仍是当前轮次，避免旧链路收尾误伤新一轮。
+             val reason = failureReason ?: session.linkTerminationReason ?: "ended before endpoint"
+-            if (ReceiverDetectionRuntime.isCurrent(observation)) {
++            if (ReceiverDetectionRuntime.isCurrent(sessionObservation)) {
+                 onPreEndpointFailure(reason, peerAddress)
+             }
+         }
+diff --git a/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt b/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt
+index 14645e1..4465ddd 100644
+--- a/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt
++++ b/app/src/main/java/com/mcarplay/app/compat/ReceiverDetectionRuntime.kt
+@@ -16,6 +16,7 @@ import java.util.concurrent.atomic.AtomicLong
+ object ReceiverDetectionRuntime {
+     val detection = ReceiverDetection()
+     private val initializing = AtomicBoolean(false)
++    private val storeReadiness = ReceiverStoreReadiness()
+     private val epochs = AtomicLong()
+     private val sessions = AtomicLong()
+ 
+@@ -56,34 +57,60 @@ object ReceiverDetectionRuntime {
+         val app = context.applicationContext
+         application = app
+         worker.execute {
+-            runCatching {
+-                val atomic = AtomicFile(File(app.filesDir, "receiver-configurations.json"))
+-                file = atomic
+-                val loaded =
+-                    if (atomic.baseFile.exists() || File(atomic.baseFile.path + ".bak").exists()) {
+-                        atomic.openRead().use { input ->
+-                            val buffer = ByteArray(ReceiverConfigurationStore.MAX_BYTES + 1)
+-                            var size = 0
+-                            while (size < buffer.size) {
+-                                val count = input.read(buffer, size, buffer.size - size)
+-                                if (count < 0) break
+-                                size += count
++            try {
++                runCatching {
++                    val atomic = AtomicFile(File(app.filesDir, "receiver-configurations.json"))
++                    file = atomic
++                    val loaded =
++                        if (atomic.baseFile.exists() || File(atomic.baseFile.path + ".bak").exists()) {
++                            atomic.openRead().use { input ->
++                                val buffer = ByteArray(ReceiverConfigurationStore.MAX_BYTES + 1)
++                                var size = 0
++                                while (size < buffer.size) {
++                                    val count = input.read(buffer, size, buffer.size - size)
++                                    if (count < 0) break
++                                    size += count
++                                }
++                                require(size <= ReceiverConfigurationStore.MAX_BYTES)
++                                ReceiverConfigurationStore.decode(String(buffer, 0, size, Charsets.UTF_8))
+                             }
+-                            require(size <= ReceiverConfigurationStore.MAX_BYTES)
+-                            ReceiverConfigurationStore.decode(String(buffer, 0, size, Charsets.UTF_8))
++                        } else {
++                            ReceiverConfigurationStore().also { require(persist(it)) }
+                         }
+-                    } else {
+-                        ReceiverConfigurationStore().also { require(persist(it)) }
+-                    }
+-                environment = environmentOf(app)
+-                store = loaded
+-            }.onFailure { storageError = true }
++                    environment = environmentOf(app)
++                    store = loaded
++                }.onFailure { storageError = true }
++            } finally {
++                // Publish readiness only after both the secret-backed store and environment exist.
++                storeReadiness.complete(ready)
++            }
+         }
+         worker.scheduleWithFixedDelay({ runCatching { tick() } }, 1, 1, TimeUnit.SECONDS)
+     }
+ 
+     fun binding(address: String?): String? = store?.binding(address)
+ 
++    /**
++     * Wait briefly for the one-shot private-store load before creating a receiver observation.
++     * This is called only from Bluetooth session workers, never from the UI thread. If storage
++     * initialization fails or the deadline expires, the caller safely proceeds without a
++     * persistent receiver binding rather than blocking connection establishment indefinitely.
++     */
++    fun observationWhenReady(
++        address: String?,
++        timeoutMillis: Long = BINDING_READY_WAIT_MILLIS,
++    ): ReceiverObservation? {
++        if (address.isNullOrBlank()) return null
++        if (!awaitReady(timeoutMillis)) return null
++        return observation(address)
++    }
++
++    fun awaitReady(timeoutMillis: Long = BINDING_READY_WAIT_MILLIS): Boolean {
++        if (ready) return true
++        val initializationSucceeded = storeReadiness.await(timeoutMillis.coerceIn(0L, BINDING_READY_WAIT_MILLIS))
++        return initializationSucceeded && ready
++    }
++
+     fun saved(address: String?): LocalReceiverConfiguration? {
+         val key = binding(address) ?: return null
+         return store?.entries?.firstOrNull { it.binding == key }
+@@ -359,4 +386,6 @@ object ReceiverDetectionRuntime {
+                 componentVersion(context, CarLifeLauncher.CARLIFE_PACKAGE),
+             ),
+         )
++
++    private const val BINDING_READY_WAIT_MILLIS = 1_500L
+ }
+diff --git a/app/src/main/java/com/mcarplay/app/compat/ReceiverStoreReadiness.kt b/app/src/main/java/com/mcarplay/app/compat/ReceiverStoreReadiness.kt
+new file mode 100644
+index 0000000..ed9edf9
+--- /dev/null
++++ b/app/src/main/java/com/mcarplay/app/compat/ReceiverStoreReadiness.kt
+@@ -0,0 +1,41 @@
++package com.mcarplay.app.compat
++
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++
++/**
++ * One-shot result of loading the private receiver store.
++ *
++ * Bluetooth session workers may wait briefly for startup I/O, but must never wait indefinitely.
++ * A failed initialization is terminal for this process and is reported as not-ready.
++ */
++internal class ReceiverStoreReadiness {
++    private val completedLatch = CountDownLatch(1)
++
++    @Volatile
++    private var completed = false
++
++    @Volatile
++    private var ready = false
++
++    fun complete(isReady: Boolean) {
++        synchronized(this) {
++            if (completed) return
++            ready = isReady
++            completed = true
++            completedLatch.countDown()
++        }
++    }
++
++    fun await(timeoutMillis: Long): Boolean {
++        if (completed) return ready
++        if (timeoutMillis <= 0L) return false
++        return try {
++            completedLatch.await(timeoutMillis, TimeUnit.MILLISECONDS) && ready
++        } catch (_: InterruptedException) {
++            Thread.currentThread().interrupt()
++            false
++        }
++    }
++
++}
+diff --git a/app/src/test/java/com/mcarplay/app/compat/ReceiverStoreReadinessTest.kt b/app/src/test/java/com/mcarplay/app/compat/ReceiverStoreReadinessTest.kt
+new file mode 100644
+index 0000000..a59aba7
+--- /dev/null
++++ b/app/src/test/java/com/mcarplay/app/compat/ReceiverStoreReadinessTest.kt
+@@ -0,0 +1,95 @@
++package com.mcarplay.app.compat
++
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.util.concurrent.CountDownLatch
++import java.util.concurrent.TimeUnit
++import java.util.concurrent.atomic.AtomicBoolean
++
++class ReceiverStoreReadinessTest {
++    @Test
++    fun returnsImmediatelyWhenStoreWasAlreadyLoaded() {
++        val gate = ReceiverStoreReadiness()
++        gate.complete(true)
++        assertTrue(gate.await(0))
++    }
++
++    @Test
++    fun waitsForSuccessfulInitializationWithinBoundedDeadline() {
++        val gate = ReceiverStoreReadiness()
++        val result = AtomicBoolean(false)
++        val finished = CountDownLatch(1)
++        val worker = Thread {
++            result.set(gate.await(1_000))
++            finished.countDown()
++        }
++        worker.start()
++        Thread.sleep(25)
++        gate.complete(true)
++        assertTrue(finished.await(1, TimeUnit.SECONDS))
++        assertTrue(result.get())
++    }
++
++    @Test
++    fun initializationFailureUnblocksWaitersAsNotReady() {
++        val gate = ReceiverStoreReadiness()
++        val result = AtomicBoolean(true)
++        val finished = CountDownLatch(1)
++        Thread {
++            result.set(gate.await(1_000))
++            finished.countDown()
++        }.start()
++        Thread.sleep(25)
++        gate.complete(false)
++        assertTrue(finished.await(1, TimeUnit.SECONDS))
++        assertFalse(result.get())
++    }
++
++    @Test
++    fun timeoutDoesNotWaitForeverAndLaterCompletionCanBeObserved() {
++        val gate = ReceiverStoreReadiness()
++        assertFalse(gate.await(15))
++        gate.complete(true)
++        assertTrue(gate.await(0))
++    }
++
++    @Test
++    fun completionIsOneShotAndCannotBeReversed() {
++        val gate = ReceiverStoreReadiness()
++        gate.complete(false)
++        gate.complete(true)
++        assertFalse(gate.await(0))
++    }
++
++    @Test
++    fun interruptedWaiterReturnsNotReadyAndPreservesInterruptFlag() {
++        val gate = ReceiverStoreReadiness()
++        Thread.currentThread().interrupt()
++        try {
++            assertFalse(gate.await(1_000))
++            assertTrue(Thread.currentThread().isInterrupted)
++        } finally {
++            Thread.interrupted()
++        }
++    }
++
++    @Test
++    fun multipleWaitersAreReleasedByOneCompletion() {
++        val gate = ReceiverStoreReadiness()
++        val start = CountDownLatch(3)
++        val done = CountDownLatch(3)
++        val successes = AtomicBoolean(true)
++        repeat(3) {
++            Thread {
++                start.countDown()
++                if (!gate.await(1_000)) successes.set(false)
++                done.countDown()
++            }.start()
++        }
++        assertTrue(start.await(1, TimeUnit.SECONDS))
++        gate.complete(true)
++        assertTrue(done.await(1, TimeUnit.SECONDS))
++        assertTrue(successes.get())
++    }
++}
+diff --git a/docs/R52-RECEIVER-STORE-READINESS.md b/docs/R52-RECEIVER-STORE-READINESS.md
+new file mode 100644
+index 0000000..c842ee9
+--- /dev/null
++++ b/docs/R52-RECEIVER-STORE-READINESS.md
+@@ -0,0 +1,26 @@
++# R52 — bounded receiver-store readiness
++
++## Finding
++
++R51 intentionally disables persisted E2LB fallback when `receiverBinding` is missing. That isolation rule is correct. However, the private receiver store was initialized asynchronously from `SessionController.ensure()`. The inbound server path can create a `ReceiverObservation` immediately after `accept()`, and the outbound client path evaluates the default observation before entering the sender session. If either arrives before the asynchronous store load completes, the observation is null for that entire attempt and R51 cannot persist the per-receiver A/B result even if the store becomes ready moments later.
++
++## Change
++
++- Initialize `ReceiverDetectionRuntime` from `SenderApp.onCreate()` immediately after diagnostics initialization. The existing `SessionController.ensure()` call remains idempotent.
++- Add a one-shot `ReceiverStoreReadiness` gate. It publishes success only after both the HMAC-backed store and environment fingerprint are available; initialization failure also releases waiters as not-ready.
++- In the shared `runSenderSession` path, if the early observation is null, retry observation creation after a maximum 1.5-second wait on the Bluetooth session worker.
++- On timeout, failed initialization, or unavailable peer address, continue the Bluetooth session without a persistent receiver binding and log that per-receiver experiment memory is disabled. No unbounded wait, raw MAC key, or empty-binding fingerprint is introduced.
++
++## Regression coverage
++
++- already-ready fast path;
++- wait succeeds when initialization completes;
++- initialization failure releases waiters as not-ready;
++- timeout returns without indefinite blocking and later completion remains observable;
++- completion is one-shot;
++- interrupted waiters return not-ready and preserve the interrupt flag;
++- multiple concurrent waiters are released by a single completion.
++
++## Non-claims
++
++This fixes a cold-start availability race for R51's receiver-scoped experiment memory only. It does not prove DUAL_GROUP caused the peer SYN restart, does not change iAP2 wire format, and does not implement MFi authentication. Full Android Gradle build, APK signing/installability, and E2LB vehicle validation remain required.
