@@ -243,17 +243,45 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.3-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
-      - name: Audit Kotlin formatting (blocking verification after formatter)
-
-        if: ${{ steps.r583.outcome == 'success' }}
+      - name: Apply R58.4 CBR-first encoder selection
+        id: r584
+        if: ${{ steps.r584.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.4-cbr-first-encoder.patch.bz2"
+          echo "ae1838d89e552fb2800dd94e3fb674d3841bd05428c58bbf4dbb10998a4d7012  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.4-cbr-first-encoder.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "9c13115f5867fd049e82df1c2c22641a0f2113b8affdd99a836a9afd48abb3d4  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+
+      - name: Audit Kotlin formatting (blocking verification after formatter)
+
+        if: ${{ steps.r584.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain spotlessApply
           ./gradlew --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          print(f"R58.4 formatted candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.4-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
       - name: Run Android tests, lint and build debug APKs (all gates attempted)
-        if: ${{ steps.r583.outcome == 'success' }}
+        if: ${{ steps.r584.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -266,7 +294,7 @@ jobs:
             :app:assembleRemoteDebug
 
       - name: Verify both candidate APKs and record metadata
-        if: ${{ !cancelled() && steps.r583.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.r584.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -297,7 +325,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcarplay-R58.3-0.1.45-candidate-source-and-debug-apks
+          name: mcarplay-R58.4-0.1.45-candidate-source-and-debug-apks
           path: |
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
             ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
@@ -305,6 +333,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.1-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.2-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.3-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
