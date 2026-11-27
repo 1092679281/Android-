@@ -232,7 +232,7 @@ jobs:
 
       - name: Apply R58.3 E2LB startup probe suppression
         id: r583
-        if: ${{ steps.r583.outcome == 'success' }}
+        if: ${{ steps.r582.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
