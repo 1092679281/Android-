@@ -177,18 +177,52 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.1-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
-      - name: Audit Kotlin formatting (non-blocking for preserved R56 snapshot)
-        if: ${{ steps.r58delta.outcome == 'success' }}
-        continue-on-error: true
+      - name: Apply R58.2 compile fix and canonical Kotlin formatting
+        id: r582
+        if: \${{ steps.r58delta.outcome == 'success' }}
+        working-directory: \${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/src/main/java/com/mcarplay/app/iap2/Iap2SenderSession.kt")
+          source = p.read_text()
+          bad = "Iap2AvailabilityFramePump(initialStartSession, ::deferFrame, ::log)"
+          good = "Iap2AvailabilityFramePump(initialStartSession, ::deferFrame, log)"
+          count = source.count(bad)
+          if count != 1:
+              raise SystemExit(f"Expected exactly one stale function reference; found {count}")
+          p.write_text(source.replace(bad, good, 1))
+          print("R58.2 compile fix applied: pass log function value, not invalid ::log reference")
+          PY
+          chmod +x ./gradlew
+          ./gradlew --no-daemon --console=plain spotlessApply
+          ./gradlew --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path(".").resolve()
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          print(f"R58.2 candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
+          PY
+          zip -qr "\${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
+      - name: Audit Kotlin formatting (blocking verification after formatter)
+
+        if: ${{ steps.r582.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x ./gradlew
           ./gradlew --no-daemon --console=plain spotlessCheck
 
       - name: Run Android tests, lint and build debug APKs (all gates attempted)
-        if: ${{ steps.r58delta.outcome == 'success' }}
+        if: ${{ steps.r582.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -201,7 +235,7 @@ jobs:
             :app:assembleRemoteDebug
 
       - name: Verify both candidate APKs and record metadata
-        if: ${{ !cancelled() && steps.r58delta.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.r582.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -232,12 +266,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcarplay-R58.1-0.1.45-candidate-source-and-debug-apks
+          name: mcarplay-R58.2-0.1.45-candidate-source-and-debug-apks
           path: |
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
             ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.1-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.2-0.1.45-candidate-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
