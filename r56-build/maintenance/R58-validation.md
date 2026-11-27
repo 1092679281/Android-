@@ -149,7 +149,8 @@ Replaying the R58.5 patch on that source produced 837 files and tree SHA-256
   frame rate with a fallback to the base configuration.
 - CI builds both R8 Release variants as a separate verification gate and checks the Shizuku service name in the mapping. The application
   keeps R8 opt-in pending device verification. The build rejects dynamic or changing Release runtime versions when this gate is enabled.
-  Gradle dependency checksums and signatures still require a reviewed verification manifest.
+  Linux CI pins and checks SHA-256 for 685 artifacts and metadata files across 388 resolved Gradle components.
+  The checked-in manifest covers Debug tests and lint, APK packaging, and the optimized Release builds.
 
 A local JVM run passed 46 focused audio and AirPlay tests, including the identity envelope and retired audio stream regressions.
 Android Keystore migration on an actual device, Android 17 runtime behavior, real-vehicle 0x4300 ACK and renewed SYN timing, mDNS

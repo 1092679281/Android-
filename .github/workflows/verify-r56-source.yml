@@ -343,13 +343,27 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
-      - name: Run Android tests, lint and build debug APKs (all gates attempted)
+      - name: Install pinned Gradle dependency checksums
+        id: dependency_checksums
         if: ${{ steps.r585.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --console=plain --continue \
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2"
+          echo "f04d83373aedfecd2622595767180b39f9920deaca426285089580b1ad88e3ef  $archive" | sha256sum --check
+          metadata=gradle/verification-metadata.xml
+          test ! -e "$metadata"
+          bzip2 -dc "$archive" > "$metadata"
+          echo "cff60d48679cbf36629fe4ecba826204a067de75520c3bd6b4cd589646beb984  $metadata" | sha256sum --check
+
+      - name: Run Android tests, lint and build debug APKs (all gates attempted)
+        if: ${{ steps.dependency_checksums.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain --dependency-verification strict --continue \
             :app:testStandardDebugUnitTest \
             :app:lintStandardDebug \
             :app:assembleStandardDebug \
@@ -357,7 +371,7 @@ jobs:
             :app:assembleRemoteDebug
 
       - name: Verify both candidate APKs and record metadata
-        if: ${{ !cancelled() && steps.r585.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.dependency_checksums.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -386,12 +400,12 @@ jobs:
 
       - name: Build both optimized Release variants and verify R8 outputs
         id: r8
-        if: ${{ !cancelled() && steps.r585.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.dependency_checksums.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
-          ./gradlew --no-daemon --console=plain -Pmcarplay.minifyRelease=true \
+          ./gradlew --no-daemon --console=plain --dependency-verification strict -Pmcarplay.minifyRelease=true \
             :app:assembleStandardRelease :app:assembleRemoteRelease
           for variant in standardRelease remoteRelease; do
             mapping="app/build/outputs/mapping/$variant/mapping.txt"
