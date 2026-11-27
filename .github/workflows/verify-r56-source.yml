@@ -6,6 +6,11 @@ on:
     paths:
       - "r56-build/**"
       - ".github/workflows/verify-r56-source.yml"
+  pull_request:
+    branches: [maintenance/r56-source-of-truth]
+    paths:
+      - "r56-build/**"
+      - ".github/workflows/verify-r56-source.yml"
   workflow_dispatch:
 
 permissions:
@@ -18,6 +23,7 @@ concurrency:
 
 jobs:
   reconstruct-and-build:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -41,6 +47,10 @@ jobs:
           if gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name' 2>/dev/null | grep -Fxq "$asset"; then
             gh release download "$tag" --repo "$repo" --pattern "$asset" --dir "$RUNNER_TEMP"
           else
+            if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+              echo "The pinned R44 release asset must be available for pull request validation." >&2
+              exit 1
+            fi
             curl --fail --location --retry 3 \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -258,8 +268,7 @@ jobs:
           git apply --check "$patch"
           git apply "$patch"
 
-      - name: Audit Kotlin formatting (blocking verification after formatter)
-
+      - name: Audit R58.4 Kotlin formatting (blocking verification after formatter)
         if: ${{ steps.r584.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
@@ -280,8 +289,40 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.4-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
-      - name: Run Android tests, lint and build debug APKs (all gates attempted)
+      - name: Apply and verify R58.5 lifecycle and identity fixes
+        id: r585
         if: ${{ steps.r584.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-lifecycle-and-identity-hardening.patch.bz2"
+          echo "d13159d6f3db06b292cd1bf39d48c8df5949911ee943c0d9fc62540f13f6f506  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5-lifecycle-and-identity-hardening.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "91fbf5804efa944d688b898ab945911aca2c4ff8117abbc1a7e0be8811267dd8  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          ./gradlew --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          root = Path.cwd()
+          ignored = {".git", ".gradle", "build", "__pycache__"}
+          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts))
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.5 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 837 or actual != "ee63699431fde032169ee3bc33cdf6aa6dfa16c0bc7097766c0fbb3e26dc5173":
+              raise SystemExit("R58.5 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
+      - name: Run Android tests, lint and build debug APKs (all gates attempted)
+        if: ${{ steps.r585.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -294,7 +335,7 @@ jobs:
             :app:assembleRemoteDebug
 
       - name: Verify both candidate APKs and record metadata
-        if: ${{ !cancelled() && steps.r584.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.r585.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -321,11 +362,25 @@ jobs:
           verify_apk "${standard[0]}" com.mcarplay.app StandardDebug
           verify_apk "${remote[0]}" com.mcarplay.app.rd RemoteDebug
 
+      - name: Build both optimized Release variants and verify R8 outputs
+        if: ${{ !cancelled() && steps.r585.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --console=plain -Pmcarplay.minifyRelease=true \
+            :app:assembleStandardRelease :app:assembleRemoteRelease
+          for variant in standardRelease remoteRelease; do
+            mapping="app/build/outputs/mapping/$variant/mapping.txt"
+            test -s "$mapping"
+            grep -Fxq 'com.mcarplay.app.shizuku.CarInputServiceImpl -> com.mcarplay.app.shizuku.CarInputServiceImpl:' "$mapping"
+          done
+
       - name: Upload reconstructed source and debug APKs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mcarplay-R58.4-0.1.45-candidate-source-and-debug-apks
+          name: mcarplay-R58.5-0.1.45-candidate-source-and-debug-apks
           path: |
             ${{ runner.temp }}/mcarplay-R56-0.1.43-organized-source.zip
             ${{ runner.temp }}/mcarplay-R57-0.1.44-candidate-source.zip
@@ -334,6 +389,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.2-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.3-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.5-0.1.45-candidate-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/standard/debug/*.apk
             ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk

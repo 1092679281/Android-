@@ -127,3 +127,31 @@ The three failures have the same sequence:
 ## Important interaction with MFi gate
 
 The historical R44 trace shows an unverified 0xAA03 response followed by a compatibility 0xAA05. R58 intentionally removed that unsafe behavior. In R58.2/R58.3 production construction, both Bluetooth Iap2SenderSession and AirPlay VirtualIap2Link still use MfiAuthenticationVerifier.UNAVAILABLE. Consequently the current candidate correctly aborts before sending 0xAA05 and will not reach 0x4300 on a real vehicle until an authorized MFi verifier and trust/profile material are integrated. Do not use test doubles or an authentication bypass to test around this blocker.
+
+## R58.5 maintenance candidate
+
+R58.5 applies after the formatted R58.4 source from commit
+`2a24ebcd2d1b39f650aca767b7b7edbf4301a469`.
+The R58.4 CI source has 834 files and tree SHA-256
+`506c6b7ca9fd2f668730b88782245df9f1cf249903d380e76aa41da4c3d5a4dd`.
+Replaying the R58.5 patch on that source produced 837 files and tree SHA-256
+`ee63699431fde032169ee3bc33cdf6aa6dfa16c0bc7097766c0fbb3e26dc5173`.
+
+- Network discovery releases its multicast lock after resolution, stop or failure. Network loss stops the old discovery and releases the
+  video sender's streaming Wi-Fi lock. The streaming lock follows actual video output and is released on suspension or teardown.
+- Audio sockets, recorder and codec have an idempotent shutdown path. A stopped negotiated stream cannot restart with the same key and
+  counter. Projection revocation stops only its matching audio capture.
+- Shizuku touch gestures are serialized and can send CANCEL on failure, replacement or display teardown. The new Binder transaction is appended.
+- Projection grants are passed directly to the foreground service. Service teardown clears and stops the owned projection.
+- The AirPlay controller's Ed25519 seed migrates to Android Keystore-backed AES-GCM storage while preserving the pairing ID. SRP server
+  proofs use a timing-resistant comparison.
+- The session's serial RTSP control worker bounds its pending queue and times out when idle. Decoder rate hints use a supported nominal
+  frame rate with a fallback to the base configuration.
+- CI builds both R8 Release variants as a separate verification gate and checks the Shizuku service name in the mapping. The application
+  keeps R8 opt-in pending device verification. The build rejects dynamic or changing Release runtime versions when this gate is enabled.
+  Gradle dependency checksums and signatures still require a reviewed verification manifest.
+
+A local JVM run passed 46 focused audio and AirPlay tests, including the identity envelope and retired audio stream regressions.
+Android Keystore migration on an actual device, Android 17 runtime behavior, real-vehicle 0x4300 ACK and renewed SYN timing, mDNS
+reliability, and decoder behavior still require device or vehicle evidence. The production MFi trust material and verifier are still
+required before this candidate can reach the authenticated 0x4300 exchange on the vehicle.
