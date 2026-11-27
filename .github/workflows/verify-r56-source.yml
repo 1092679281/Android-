@@ -179,8 +179,8 @@ jobs:
 
       - name: Apply R58.2 compile fix and canonical Kotlin formatting
         id: r582
-        if: \${{ steps.r58delta.outcome == 'success' }}
-        working-directory: \${{ runner.temp }}/r44-baseline
+        if: ${{ steps.r58delta.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
@@ -209,7 +209,7 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           print(f"R58.2 candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
           PY
-          zip -qr "\${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
+          zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
       - name: Audit Kotlin formatting (blocking verification after formatter)
