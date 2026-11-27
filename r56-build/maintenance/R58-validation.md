@@ -89,3 +89,41 @@ Findings:
 ## Release status
 
 Candidate only. No stable release or formal Release was created. No physical-device install/launch/crash validation and no real-vehicle protocol validation are claimed.
+
+
+## R58.3 targeted E2LB probe experiment (2026-11-27)
+
+R58.3 patch: r56-build/maintenance/R58.3-disable-speculative-detect-probe.patch.bz2
+Compressed patch SHA-256: 39d49444fb1371e16f7d14b6bcef46e05f292a77302bb5080d78a5b675b6e203.
+Uncompressed patch SHA-256: 37192a930a3b66d6bf2d359088263b9459ba141e0da6e4d7d5640f31aa8c5b9b.
+Candidate tree: 832 files, SHA-256 ed5634d5b98a93da9fb7365d43415502e1f290d8eea76bb4df54cbf03a0b6ea0.
+
+### Original R44 trace evidence (粘贴的文本 (1).txt)
+
+The three failures have the same sequence:
+- 0x4300 was sent as `awaitAck=false` / passive receipt (seq 110); this directly confirms the original sender did not request link-layer acknowledgement/retransmission for this request.
+- The phone then observed repeated DETECT markers.
+- The phone emitted a standalone DETECT marker reply (reply=1/2).
+- A new pure SYN arrived from the peer roughly 18 ms after that reply in all three attempts:
+  - 11:29:19.082 marker reply -> 11:29:19.100 peer SYN seq 118.
+  - 11:29:27.539 marker reply -> 11:29:27.618 peer SYN seq 165.
+  - 11:29:36.115 marker reply -> 11:29:36.190 peer SYN seq 187.
+- Therefore the peer initiated the observed renegotiation. The temporal correlation between our standalone marker reply and the peer SYN is strong and repeatable, but the log omits raw wire bytes; it does not prove that the marker reply caused the peer restart.
+
+### R58.3 change
+
+- Keep E2LB conservative reliable send-window behavior.
+- Disable only the speculative standalone marker echo for E2LB while an observed control request is awaiting ACK.
+- Other engine users retain the previous default unless they explicitly disable the probe.
+- Add regression coverage proving repeated DETECT markers do not produce outbound marker replies when disabled, and that the exact cumulative ACK still advances the 0x4300 receipt to PEER_ACKED.
+- This is a targeted mitigation/experiment based on the repeated trace timing, not a proven root-cause fix. The vehicle must be retested to determine whether the SYN restart stops.
+
+### R58.3 local focused validation
+
+- Kotlin/JVM loopback smoke using the exact Iap2LinkEngine source: passed; marker replies remained suppressed and exact 0x4300 ACK was accepted.
+- Full Gradle test execution could not be run in the local container because the Gradle 8.10.2 distribution was not cached and outbound DNS/network access was unavailable. GitHub Actions is the authoritative full Android validation gate for this patch.
+- R58.3 Spotless, Standard/Remote tests, Lint and APK builds: pending the new GitHub Actions run.
+
+## Important interaction with MFi gate
+
+The historical R44 trace shows an unverified 0xAA03 response followed by a compatibility 0xAA05. R58 intentionally removed that unsafe behavior. In R58.2/R58.3 production construction, both Bluetooth Iap2SenderSession and AirPlay VirtualIap2Link still use MfiAuthenticationVerifier.UNAVAILABLE. Consequently the current candidate correctly aborts before sending 0xAA05 and will not reach 0x4300 on a real vehicle until an authorized MFi verifier and trust/profile material are integrated. Do not use test doubles or an authentication bypass to test around this blocker.
