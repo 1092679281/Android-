@@ -5,7 +5,9 @@ on:
     branches: [maintenance/r56-source-of-truth]
     paths:
       - ".github/workflows/publish-lacrosse-ota.yml"
+      - ".github/workflows/verify-r56-source.yml"
       - "r56-build/maintenance/ota-release.*"
+      - "r56-build/maintenance/R58*.patch.bz2"
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -64,7 +66,7 @@ jobs:
           digest = sha256()
           for path in files:
               digest.update(path.as_posix().encode() + b"\0" + sha256(path.read_bytes()).digest() + b"\n")
-          if len(files) != 837 or digest.hexdigest() != "ee63699431fde032169ee3bc33cdf6aa6dfa16c0bc7097766c0fbb3e26dc5173":
+          if len(files) != 845 or digest.hexdigest() != "5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d":
               raise SystemExit("Unexpected OTA source fingerprint")
           PY
           bzip2 -dc "$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2" > gradle/verification-metadata.xml

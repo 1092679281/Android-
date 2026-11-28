@@ -206,3 +206,15 @@ Patch: `r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2`
 - Repeated CI runs showed two Spotless-accepted layouts for one boolean condition in `SessionController.kt`: a line break before `!connectCancelled` or the same expression on one line. No executable token or behavior changes.
 - R58.5.1/R58.5.2/R58.5.3 fingerprint gates now normalize only that exact whitespace-only line-wrap before hashing. The expected canonical hashes remain strict for every other file and byte.
 - This avoids a false source-integrity failure without weakening patch SHA-256 checks, source file counts, `spotlessCheck`, or Android test/build gates.
+
+
+## R58.5.4 terminal MFi peer block and Bluetooth retry stop (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.4-terminal-mfi-autoconnect-block.patch.bz2`
+
+- Compressed patch SHA-256: `e86ef9ddd7c07d1c786704dcd0c04c2094c569216ef58ffb8fd8a940ecbffa28`.
+- Uncompressed patch SHA-256: `339a10fc92765f8b0660dce82355ba378b9f3bd0f83097b205c4c832b433af56`.
+- Adds a terminal per-peer MFi authentication block so a known terminal authentication failure does not keep re-entering the Bluetooth automatic retry loop. It does not bypass MFi verification or manufacture authentication success.
+- Canonical source fingerprint after pinned Spotless formatting: 845 files, `5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d`.
+- The R58.5.4 CI gate is ordered after R58.5.3 and the pinned dependency-checksum gate now depends on R58.5.4 success. A diagnostic source snapshot is retained if the strict fingerprint gate fails.
+- Current CI has only established patch checksum, apply-check and Spotless success; Android tests/build are still pending until the fingerprint gate is updated and rerun.

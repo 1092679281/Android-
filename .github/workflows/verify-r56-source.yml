@@ -502,6 +502,9 @@ jobs:
           git apply "$patch"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
+          # Keep a diagnostic snapshot even when the strict fingerprint gate rejects the candidate.
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5.4-diagnostic-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
           python3 - <<'PY'
           from pathlib import Path
           from hashlib import sha256
@@ -520,7 +523,7 @@ jobs:
               digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.4 candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 845 or actual != "0000000000000000000000000000000000000000000000000000000000000000":
+          if len(files) != 845 or actual != "5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d":
               raise SystemExit("R58.5.4 canonical source fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
@@ -650,6 +653,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.3-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.5-0.1.45-candidate-source.zip
+            ${{ runner.temp }}/mcarplay-R58.5.4-diagnostic-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/Android-17-*.txt
             ${{ runner.temp }}/Android-17-emulator.log
