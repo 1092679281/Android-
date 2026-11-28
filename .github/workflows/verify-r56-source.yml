@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: r56-source-validation
+  group: r56-source-validation-${{ github.workflow }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
