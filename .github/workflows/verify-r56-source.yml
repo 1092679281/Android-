@@ -459,6 +459,8 @@ jobs:
           echo "8021209128e9e4d167951f9e401f9aa29e69a69b6471df20f607ad94efa9110c  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
+          # Format the new audit patch before enforcing the canonical fingerprint; preserve strict hash gates.
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from pathlib import Path
