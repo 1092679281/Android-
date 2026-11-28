@@ -450,10 +450,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2"
-          echo "57364a3f03071868e77665e793cf113606710e8a4e772f2855d7fa93a08a0369  $archive" | sha256sum --check
+          echo "739a4bf681f13abeea472bc17e5475e18d88c23a098182dad67282bc36547d79  $archive" | sha256sum --check
           patch="$RUNNER_TEMP/R58.5.3-full-maintenance-audit.patch"
           bzip2 -dc "$archive" > "$patch"
-          echo "e9a4a7826a6235bfab9eacd5c47b341765afcdada99e52f91bbe5e3411eaa9e5  $patch" | sha256sum --check
+          echo "0d3af84f08ba7b97bbc2e47d0c1093424891dbe0fea8c8bc01c131302b76242d  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
@@ -475,7 +475,7 @@ jobs:
               digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.3 full-audit candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 841 or actual != "544d5ee94f352b7584239081b8f70939b1a47e66a70f64b18ef91ea29a9f9aca":
+          if len(files) != 843 or actual != "3de28ad00f2a11203ab2cc12b145d13a21af74258676ab54512236cd73044bb1":
               raise SystemExit("R58.5.3 canonical source fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
