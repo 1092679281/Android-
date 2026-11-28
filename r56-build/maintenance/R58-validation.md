@@ -170,5 +170,18 @@ Patch: `r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2`
 - Regression tests cover stable blocker classification and the virtual-link callback. Both paths remain fail-closed: no unverified `0xAA05`, no authenticated milestone, and no MIB3 burst.
 - This patch does **not** implement the production MFi verifier. `Iap2SenderSession` and `VirtualIap2Link` still use `MfiAuthenticationVerifier.UNAVAILABLE` until the project receives authorized MFi trust anchors/certificate profile, licensed signature and canonicalization specification, and known-good/known-bad vectors. Do not add guessed roots, bypasses, or private keys.
 - CI determinism finding: the pinned Gradle verification metadata was previously installed only after the Spotless/KtLint formatting steps. That allowed an unpinned formatter dependency to change a single Kotlin line between runs and invalidate the R58.4/R58.5 tree fingerprint. The workflow now installs the pinned metadata before the first formatter invocation and excludes that build-only file from candidate fingerprints and source archives.
-- R58.5.1 Android CI and formatter fingerprint: pending this commit's GitHub Actions run. The R58.2/R58.3/R58.4 fingerprints are now blocking checks using the pinned formatter metadata.
+- R58.5.1 CI run `46115158849` completed. R56–R58.5.1 reconstruction, patch application, source fingerprints, Debug APK packaging, optimized Release builds, R8 mapping checks, Android 17 install/launch smoke tests, and artifact upload succeeded. The aggregate test gate failed because `LogContractTest.codeAdviceCoversEveryDiagnosticCode` found that `tools/logbot/rules.py` omitted `MFI_AUTH_UNAVAILABLE` and `MFI_AUTH_FAILED`; the standard and remote variants each reported this same single assertion failure. R58.5.2 below adds the missing fail-closed advice and regression coverage.
 - 0x4300/0x4301, Wi-Fi, AirPlay SETUP/RECORD, and video/audio/touch still require the authorized MFi gate to be cleared before the complete chain can be exercised on the E2LB vehicle. Existing synthetic tests are not real-vehicle acceptance.
+
+
+## R58.5.2 MFi diagnostic advice coverage (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2`
+
+- Compressed patch SHA-256: `d725dc4a9f4cfc2cf25bb2ca1744cafca9dee314353c468633cddc9483a7b737`.
+- Uncompressed patch SHA-256: `3719068a8fa27ef2b8d01712fdf996c598dd54117a812afd108c2f03a0c53852`.
+- Adds explicit Chinese diagnosis and remediation guidance for `MFI_AUTH_UNAVAILABLE` and `MFI_AUTH_FAILED` to `tools/logbot/rules.py`, preserving the fail-closed policy and explicitly forbidding authentication bypass.
+- Updates the diagnostic code reference table and adds Python regression tests asserting both MFi failure codes return terminal, non-bypass guidance.
+- Local Python logbot suite: 16/16 tests passed.
+- Candidate source fingerprint: 838 files, `bd865a2a7247829f3da64ba86b6ed15785c65943c5dcb3b8d5e6dd34f4594fdc`.
+- R58.5.2 GitHub Actions Android test, lint, Debug/Release APK, R8, and Android 17 smoke-test verification: pending.
