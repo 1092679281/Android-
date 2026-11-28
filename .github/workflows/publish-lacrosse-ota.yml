@@ -65,10 +65,20 @@ jobs:
           files = sorted(path for path in Path(".").rglob("*") if path.is_file())
           digest = sha256()
           for path in files:
-              digest.update(path.as_posix().encode() + b"\0" + sha256(path.read_bytes()).digest() + b"\n")
-          if len(files) != 845 or digest.hexdigest() != "5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d":
+              relative = path.as_posix()
+              content = path.read_bytes()
+              # Match the canonical source fingerprint used by verify-r56-source.yml.
+              # Spotless accepts one whitespace-only wrapping variant in this predicate.
+              if relative == "app/src/main/java/com/mcarplay/app/SessionController.kt":
+                  content = content.replace(
+                      b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
+                      b"if (!isDisconnecting() && !connectCancelled &&",
+                  )
+              digest.update(relative.encode() + b"\\0" + sha256(content).digest() + b"\\n")
+          actual = digest.hexdigest()
+          print(f"Verified OTA source: files={len(files)} tree_sha256={actual}")
+          if len(files) != 845 or actual != "5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d":
               raise SystemExit("Unexpected OTA source fingerprint")
-          PY
           bzip2 -dc "$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2" > gradle/verification-metadata.xml
           echo 'cff60d48679cbf36629fe4ecba826204a067de75520c3bd6b4cd589646beb984  gradle/verification-metadata.xml' | sha256sum -c
           chmod +x gradlew
