@@ -156,3 +156,18 @@ A local JVM run passed 46 focused audio and AirPlay tests, including the identit
 Android Keystore migration on an actual device, Android 17 runtime behavior, real-vehicle 0x4300 ACK and renewed SYN timing, mDNS
 reliability, and decoder behavior still require device or vehicle evidence. The production MFi trust material and verifier are still
 required before this candidate can reach the authenticated 0x4300 exchange on the vehicle.
+
+
+## R58.5.1 terminal MFi failure handling (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2`
+
+- Compressed patch SHA-256: `59933aa3f8b5473527165d29e9ea0960d34bc3de54d607a5e910ecf49c80acc2`.
+- Uncompressed patch SHA-256: `30f5dcf6d130db39a7e796c4d87fdf94e8c54acbc435bb9ad6bb22469284b911`.
+- Candidate adds one Kotlin test file (838 files before formatter normalization).
+- Bluetooth startup now classifies `RESPONSE_UNVERIFIED` and `CRYPTOGRAPHICALLY_REJECTED` as terminal MFi blockers, reports a dedicated diagnostic, and stops automatic Bluetooth reconnect for that receiver. Manual connection remains available after the missing authorized verifier is supplied.
+- The AirPlay virtual iAP2 path now forwards malformed, rejected, timed-out, and unverifiable MFi outcomes to the owning session. The owner tears down the failed attempt instead of silently waiting for a never-authenticated tunnel.
+- Regression tests cover stable blocker classification and the virtual-link callback. Both paths remain fail-closed: no unverified `0xAA05`, no authenticated milestone, and no MIB3 burst.
+- This patch does **not** implement the production MFi verifier. `Iap2SenderSession` and `VirtualIap2Link` still use `MfiAuthenticationVerifier.UNAVAILABLE` until the project receives authorized MFi trust anchors/certificate profile, licensed signature and canonicalization specification, and known-good/known-bad vectors. Do not add guessed roots, bypasses, or private keys.
+- R58.5.1 Android CI and formatter fingerprint: pending this commit's GitHub Actions run.
+- 0x4300/0x4301, Wi-Fi, AirPlay SETUP/RECORD, and video/audio/touch still require the authorized MFi gate to be cleared before the complete chain can be exercised on the E2LB vehicle. Existing synthetic tests are not real-vehicle acceptance.

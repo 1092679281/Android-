@@ -42,6 +42,12 @@ The R44 Actions artifact expires on 2026-12-25. The validation workflow archives
 - Do not commit signing keys, keystore passwords, `local.properties`, APKs, raw diagnostic logs, or personal data.
 - MFi cryptographic verification, E2LB 0x4300 acknowledgement, 0x4301/Wi-Fi handoff and AirPlay vehicle acceptance remain unresolved or unverified.
 
+## R58.5.1 MFi 失败收敛
+
+R58.5.1 不伪造 MFi 成功，也不实现未经授权的密码学验证。它将缺少信任材料和明确密码学拒绝标记为终止性认证阻塞，停止同一车机的自动重连，并在 Bluetooth 与 AirPlay 虚拟 iAP2 两条路径上统一上报失败。只有接入获授权的验证器/信任材料后，手动重试才有意义。
+
+该补丁不会解除当前 MFi 认证阻塞；在获得授权验证器和真车证据前，仍不得将候选标记为已完成 CarPlay 真车验收。
+
 ## R58.5 标准版在线更新
 
 应用首页的「检查更新」读取本仓库的 GitHub Releases。发布流程使用维护分支重建并通过 CI 的源码，

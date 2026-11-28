@@ -344,9 +344,42 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
+      - name: Apply R58.5.1 terminal MFi failure handling
+        id: r5851
+        if: ${{ steps.r585.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2"
+          echo "59933aa3f8b5473527165d29e9ea0960d34bc3de54d607a5e910ecf49c80acc2  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5.1-mfi-auth-failure-stop.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "30f5dcf6d130db39a7e796c4d87fdf94e8c54acbc435bb9ad6bb22469284b911  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path.cwd()
+          ignored = {".git", ".gradle", "build", "__pycache__"}
+          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts))
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.5.1 formatted candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 838:
+              raise SystemExit("R58.5.1 candidate file count mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+
       - name: Install pinned Gradle dependency checksums
         id: dependency_checksums
-        if: ${{ steps.r585.outcome == 'success' }}
+        if: ${{ steps.r5851.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
