@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/publish-lacrosse-ota.yml"
       - "r56-build/maintenance/ota-release.*"
+      - "r56-build/maintenance/R58.5-mfi-verifier-failure.patch.bz2"
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -68,6 +69,13 @@ jobs:
           if len(files) != 837 or digest.hexdigest() != "ee63699431fde032169ee3bc33cdf6aa6dfa16c0bc7097766c0fbb3e26dc5173":
               raise SystemExit("Unexpected OTA source fingerprint")
           PY
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-mfi-verifier-failure.patch.bz2"
+          echo "f71ea7d4067766238952acb3b34a3c7dc2ea9138f017d951388de02cc66289ad  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5-mfi-verifier-failure.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "35418aa67d99c932bf81cf2eaa0b3bf20000bcfe4d2f880331dd14f06149cc7e  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
           bzip2 -dc "$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2" > gradle/verification-metadata.xml
           echo 'cff60d48679cbf36629fe4ecba826204a067de75520c3bd6b4cd589646beb984  gradle/verification-metadata.xml' | sha256sum -c
           chmod +x gradlew
