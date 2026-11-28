@@ -352,10 +352,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2"
-          echo "59933aa3f8b5473527165d29e9ea0960d34bc3de54d607a5e910ecf49c80acc2  $archive" | sha256sum --check
+          echo "bde7d4d392d6b80814c040eb7f5f0bdc23b17b09ece4e0fb30227c683139710c  $archive" | sha256sum --check
           patch="$RUNNER_TEMP/R58.5.1-mfi-auth-failure-stop.patch"
           bzip2 -dc "$archive" > "$patch"
-          echo "30f5dcf6d130db39a7e796c4d87fdf94e8c54acbc435bb9ad6bb22469284b911  $patch" | sha256sum --check
+          echo "975dbaeb648e394dc9b1699133b5da7a74eb810ec7ff1db6c212aae73a1f2862  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply

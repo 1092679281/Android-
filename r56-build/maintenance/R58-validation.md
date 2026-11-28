@@ -162,9 +162,9 @@ required before this candidate can reach the authenticated 0x4300 exchange on th
 
 Patch: `r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2`
 
-- Compressed patch SHA-256: `59933aa3f8b5473527165d29e9ea0960d34bc3de54d607a5e910ecf49c80acc2`.
-- Uncompressed patch SHA-256: `30f5dcf6d130db39a7e796c4d87fdf94e8c54acbc435bb9ad6bb22469284b911`.
-- Candidate adds one Kotlin test file (838 files before formatter normalization).
+- Compressed patch SHA-256: `bde7d4d392d6b80814c040eb7f5f0bdc23b17b09ece4e0fb30227c683139710c`.
+- Uncompressed patch SHA-256: `975dbaeb648e394dc9b1699133b5da7a74eb810ec7ff1db6c212aae73a1f2862`.
+- Candidate adds one Kotlin test file and updates the existing sender-session tests (838 files before formatter normalization).
 - Bluetooth startup now classifies `RESPONSE_UNVERIFIED` and `CRYPTOGRAPHICALLY_REJECTED` as terminal MFi blockers, reports a dedicated diagnostic, and stops automatic Bluetooth reconnect for that receiver. Manual connection remains available after the missing authorized verifier is supplied.
 - The AirPlay virtual iAP2 path now forwards malformed, rejected, timed-out, and unverifiable MFi outcomes to the owning session. The owner tears down the failed attempt instead of silently waiting for a never-authenticated tunnel.
 - Regression tests cover stable blocker classification and the virtual-link callback. Both paths remain fail-closed: no unverified `0xAA05`, no authenticated milestone, and no MIB3 burst.
