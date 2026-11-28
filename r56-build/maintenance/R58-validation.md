@@ -185,3 +185,17 @@ Patch: `r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2`
 - Local Python logbot suite: 16/16 tests passed.
 - Candidate source fingerprint: 838 files, `84c953fa8c72caded48f42f9437380484adfe0210f355254dda7e93fe8e775d8`.
 - The first R58.5.2 CI attempt `46116628534` stopped before Android tests because the compressed patch archive checksum did not match the stored file. The patch archive and both blocking checksums were regenerated from the exact R58.5.1 formatted source; the next CI run must pass patch checksum, `git apply --check`, the 16-test logbot suite, and the 838-file candidate fingerprint before Android gates can start.
+
+
+## R58.5.3 full maintenance audit and TimingServer lifecycle fix (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2`
+
+- Compressed patch SHA-256: `173773b6970ec5a67028cb31af98879a7c627a9b9e42f95b99c2bbd4854cd64a`.
+- Uncompressed patch SHA-256: `54b85f7551c588ba0282b5c394a3a28bca5b7c19c660c3bc6c2915b75147c46b`.
+- Adds `docs/MAINTENANCE-AUDIT-2026-11-28.md` with measured whole-source risks and evidence. It separates confirmed defects from static-risk candidates.
+- Fixes the `TimingServer.start()/stop()` socket ownership race; adds concurrent-start, start-vs-stop, real UDP timesync and restart regression tests.
+- Corrects the stale `AirPlayClient` timing-server lifecycle comment.
+- Local Kotlin compile and live UDP/concurrency smoke test passed. Local logbot suite: 16/16 passed.
+- Candidate fingerprint: 839 files, `21fe9a07751f33f8654f1703ebc682a943cfe5400f5d490b37807ddd076b594c`.
+- GitHub Spotless, Standard/Remote Android tests, lint, Debug/Release/R8 and Android 17 smoke verification: pending.

@@ -428,6 +428,38 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
+      - name: Apply R58.5.3 full maintenance audit and TimingServer lifecycle fix
+        id: r5853
+        if: ${{ steps.r5853.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2"
+          echo "173773b6970ec5a67028cb31af98879a7c627a9b9e42f95b99c2bbd4854cd64a  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5.3-full-maintenance-audit.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "54b85f7551c588ba0282b5c394a3a28bca5b7c19c660c3bc6c2915b75147c46b  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path.cwd()
+          ignored = {".git", ".gradle", "build", "__pycache__"}
+          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
+          digest = sha256()
+          for p in files:
+              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.5.3 full-audit candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 839 or actual != "21fe9a07751f33f8654f1703ebc682a943cfe5400f5d490b37807ddd076b594c":
+              raise SystemExit("R58.5.3 candidate fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
+
       - name: Verify pinned Gradle dependency checksums before Android build
         id: dependency_checksums
         if: ${{ steps.r5852.outcome == 'success' }}
