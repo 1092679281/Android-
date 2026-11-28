@@ -298,6 +298,7 @@ jobs:
         run: |
           set -euo pipefail
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
+          python3 "$GITHUB_WORKSPACE/kit/r56-build/maintenance/normalize-r58-formatting.py"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from pathlib import Path

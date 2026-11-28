@@ -94,3 +94,16 @@ replace_once(
                     hero.height >= contentArea.height
                 ) {""",
 )
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/airplay/VirtualIap2Link.kt",
+    """                if (!response.valid || response.value == null || certificate == null || receiverIdentification == null ||
+                    challenge == null
+                ) {""",
+    """                if (!response.valid ||
+                    response.value == null ||
+                    certificate == null ||
+                    receiverIdentification == null ||
+                    challenge == null
+                ) {""",
+)
