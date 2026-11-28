@@ -259,8 +259,8 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.2 candidate: files={len(files)} tree_sha256={actual}")
-          print("if len(files) != 832 or actual != "c857aed40a119e5821cd5566040191d5b91ef15c466b81bfd27ee2083991741f":
-    raise SystemExit("R58.2 candidate fingerprint mismatch")")
+          if len(files) != 832 or actual != "c857aed40a119e5821cd5566040191d5b91ef15c466b81bfd27ee2083991741f":
+              raise SystemExit("R58.2 candidate fingerprint mismatch")
           PY
       - name: Apply R58.3 E2LB startup probe suppression
         id: r583
@@ -286,8 +286,8 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.3 candidate: files={len(files)} tree_sha256={actual}")
-          print("if len(files) != 832 or actual != "970e295435c6d02da87a79389c5c8d7e904541ca93badbd6d1cb5c69078b4479":
-    raise SystemExit("R58.3 candidate fingerprint mismatch")")
+          if len(files) != 832 or actual != "970e295435c6d02da87a79389c5c8d7e904541ca93badbd6d1cb5c69078b4479":
+              raise SystemExit("R58.3 candidate fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.3-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
