@@ -530,9 +530,59 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
+      - name: Apply R58.5.5 Phase 1a session ports
+        id: r5855
+        if: ${{ steps.r5854.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          encoded="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.5-phase1a-session-ports.patch.gz.b64"
+          archive="$RUNNER_TEMP/R58.5.5-phase1a-session-ports.patch.gz"
+          base64 --decode "$encoded" > "$archive"
+          echo "9b11fcd8837e7f1b927cebbc32fe13cc96f511084dc20caf56a3753b4cd9e4d8  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5.5-phase1a-session-ports.patch"
+          gzip -dc "$archive" > "$patch"
+          test -s "$patch"
+          git apply --check "$patch"
+          git apply "$patch"
+          # Phase 1a is behavior-preserving: enforce formatting without rewriting the pinned source.
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck --rerun-tasks
+          # Keep a diagnostic copy even if the strict canonical fingerprint below rejects the candidate.
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5.5-diagnostic-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path.cwd()
+          ignored = {".git", ".gradle", "build", "__pycache__"}
+          files = sorted(
+              p for p in root.rglob("*")
+              if p.is_file()
+              and not ignored.intersection(p.relative_to(root).parts)
+              and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml"
+          )
+          digest = sha256()
+          for path in files:
+              relative = path.relative_to(root).as_posix()
+              content = path.read_bytes()
+              if relative == "app/src/main/java/com/mcarplay/app/SessionController.kt":
+                  content = content.replace(
+                      b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
+                      b"if (!isDisconnecting() && !connectCancelled &&",
+                  )
+              digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.5.5 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 850 or actual != "09a1f0a21ee76ec3dcf357b8a36359cb15db1b883d224be21b660a5cab014a63":
+              raise SystemExit("R58.5.5 canonical source fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
+
       - name: Verify pinned Gradle dependency checksums before Android build
         id: dependency_checksums
-        if: ${{ steps.r5854.outcome == 'success' }}
+        if: ${{ steps.r5855.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -655,6 +705,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.5-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.5.4-diagnostic-source.zip
+            ${{ runner.temp }}/mcarplay-R58.5.5-diagnostic-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/Android-17-*.txt
             ${{ runner.temp }}/Android-17-emulator.log
