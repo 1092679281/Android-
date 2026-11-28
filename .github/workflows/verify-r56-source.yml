@@ -210,9 +210,23 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.1-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
+      - name: Install pinned Gradle dependency checksums before formatting
+        id: dependency_checksums_early
+        if: ${{ steps.r58delta.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2"
+          echo "f04d83373aedfecd2622595767180b39f9920deaca426285089580b1ad88e3ef  $archive" | sha256sum --check
+          metadata=gradle/verification-metadata.xml
+          test ! -e "$metadata"
+          bzip2 -dc "$archive" > "$metadata"
+          echo "cff60d48679cbf36629fe4ecba826204a067de75520c3bd6b4cd589646beb984  $metadata" | sha256sum --check
+
       - name: Apply R58.2 compile fix and canonical Kotlin formatting
         id: r582
-        if: ${{ steps.r58delta.outcome == 'success' }}
+        if: ${{ steps.dependency_checksums_early.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -234,12 +248,12 @@ jobs:
           python3 "$GITHUB_WORKSPACE/kit/r56-build/maintenance/normalize-r58-formatting.py"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain --rerun-tasks spotlessCheck
           zip -qr "${RUNNER_TEMP}/mcarplay-R58.2-0.1.45-candidate-source.zip" . \
-            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
           python3 - <<'PY'
           from pathlib import Path
           from hashlib import sha256
           root = Path(".").resolve()
-          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
@@ -265,7 +279,7 @@ jobs:
           from pathlib import Path
           from hashlib import sha256
           root = Path(".").resolve()
-          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
@@ -274,7 +288,7 @@ jobs:
           print("R58.3 fingerprint recorded; pin after clean formatter run")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.3-0.1.45-candidate-source.zip" . \
-            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
       - name: Apply R58.4 CBR-first encoder selection
         id: r584
@@ -303,14 +317,14 @@ jobs:
           from pathlib import Path
           from hashlib import sha256
           root = Path(".").resolve()
-          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts)
+          files = sorted(p for p in root.rglob("*") if p.is_file() and ".git" not in p.relative_to(root).parts and ".gradle" not in p.parts and "build" not in p.parts and "__pycache__" not in p.parts and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           print(f"R58.4 formatted candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.4-0.1.45-candidate-source.zip" . \
-            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
       - name: Apply and verify R58.5 lifecycle and identity fixes
         id: r585
@@ -332,7 +346,7 @@ jobs:
           from pathlib import Path
           root = Path.cwd()
           ignored = {".git", ".gradle", "build", "__pycache__"}
-          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts))
+          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
@@ -342,7 +356,7 @@ jobs:
               raise SystemExit("R58.5 candidate fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
-            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
       - name: Apply R58.5.1 terminal MFi failure handling
         id: r5851
@@ -365,7 +379,7 @@ jobs:
           from hashlib import sha256
           root = Path.cwd()
           ignored = {".git", ".gradle", "build", "__pycache__"}
-          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts))
+          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
@@ -375,20 +389,17 @@ jobs:
               raise SystemExit("R58.5.1 candidate file count mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
-            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
-      - name: Install pinned Gradle dependency checksums
+      - name: Verify pinned Gradle dependency checksums before Android build
         id: dependency_checksums
         if: ${{ steps.r5851.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
           set -euo pipefail
-          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2"
-          echo "f04d83373aedfecd2622595767180b39f9920deaca426285089580b1ad88e3ef  $archive" | sha256sum --check
           metadata=gradle/verification-metadata.xml
-          test ! -e "$metadata"
-          bzip2 -dc "$archive" > "$metadata"
+          test -f "$metadata"
           echo "cff60d48679cbf36629fe4ecba826204a067de75520c3bd6b4cd589646beb984  $metadata" | sha256sum --check
 
       - name: Run Android tests, lint and build debug APKs (all gates attempted)
