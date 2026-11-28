@@ -344,8 +344,8 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
-      - name: Apply MFi verifier failure handling
-        id: mfi_failure_handling
+      - name: Apply Bluetooth handshake and diagnostics fixes
+        id: bluetooth_fixes
         if: ${{ steps.r585.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
@@ -358,13 +358,20 @@ jobs:
           echo "35418aa67d99c932bf81cf2eaa0b3bf20000bcfe4d2f880331dd14f06149cc7e  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-bluetooth-handshake.patch.bz2"
+          echo "8f768ed76241af1bd812e8b78cccaeab8ad1ddcafa5d070a9bb58929bb7d0f48  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5-bluetooth-handshake.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "5f4a18f4a74389378e43b9c6bf6b139524c8b48ef2d899e05bd5299e2ebb907b  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
-          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-mfi-verifier-failure-source.zip" . \
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-bluetooth-handshake-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
       - name: Install pinned Gradle dependency checksums
         id: dependency_checksums
-        if: ${{ steps.mfi_failure_handling.outcome == 'success' }}
+        if: ${{ steps.bluetooth_fixes.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -489,7 +496,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.3-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.5-0.1.45-candidate-source.zip
-            ${{ runner.temp }}/mcarplay-R58.5-mfi-verifier-failure-source.zip
+            ${{ runner.temp }}/mcarplay-R58.5-bluetooth-handshake-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/Android-17-*.txt
             ${{ runner.temp }}/Android-17-emulator.log

@@ -7,6 +7,7 @@ on:
       - ".github/workflows/publish-lacrosse-ota.yml"
       - "r56-build/maintenance/ota-release.*"
       - "r56-build/maintenance/R58.5-mfi-verifier-failure.patch.bz2"
+      - "r56-build/maintenance/R58.5-bluetooth-handshake.patch.bz2"
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -74,6 +75,13 @@ jobs:
           patch="$RUNNER_TEMP/R58.5-mfi-verifier-failure.patch"
           bzip2 -dc "$archive" > "$patch"
           echo "35418aa67d99c932bf81cf2eaa0b3bf20000bcfe4d2f880331dd14f06149cc7e  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-bluetooth-handshake.patch.bz2"
+          echo "8f768ed76241af1bd812e8b78cccaeab8ad1ddcafa5d070a9bb58929bb7d0f48  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5-bluetooth-handshake.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "5f4a18f4a74389378e43b9c6bf6b139524c8b48ef2d899e05bd5299e2ebb907b  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
           bzip2 -dc "$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-gradle-verification-metadata.xml.bz2" > gradle/verification-metadata.xml
