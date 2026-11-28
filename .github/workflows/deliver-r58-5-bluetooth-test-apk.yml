@@ -1,0 +1,36 @@
+name: Deliver verified R58.5 Bluetooth test APK
+
+on:
+  push:
+    branches: [delivery/r58.5-bluetooth-test-apk]
+    paths:
+      - ".github/workflows/deliver-r58-5-bluetooth-test-apk.yml"
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retrieve the verified Bluetooth test package
+        uses: actions/download-artifact@v4
+        with:
+          name: mcarplay-r58.5-bluetooth-review-test-apk
+          run-id: '46109444048'
+          github-token: ${{ github.token }}
+          path: verified-package
+      - name: Extract and verify the APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 verified-package/r44-baseline/app/build/outputs/apk/remote/debug/app-remote-debug.apk app-remote-debug.apk
+          echo '4cee95768a7631f75fa6156a28493365449ba80facde13790129a6a7a10cff41  app-remote-debug.apk' | sha256sum --check
+      - name: Upload the APK as a single file
+        uses: actions/upload-artifact@v7
+        with:
+          path: app-remote-debug.apk
+          archive: false
+          if-no-files-found: error
