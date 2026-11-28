@@ -480,7 +480,7 @@ jobs:
               digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.3 full-audit candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 843 or actual != "d549c473818a134d705f647fb47dd62876b771c7e64365527f997b4bf19deae6":
+          if len(files) != 843 or actual != "17e35cfc2b2f8f0315b368bb9f66bee5c710d1f7589fb5f06e27ff4bafabba31":
               raise SystemExit("R58.5.3 canonical source fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
