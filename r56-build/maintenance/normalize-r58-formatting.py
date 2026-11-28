@@ -70,6 +70,20 @@ replace_once(
                     (!renderRecent || lastRenderDurationNs < renderBudget * 3 / 4)""",
 )
 
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/airplay/VirtualIap2Link.kt",
+    """                if (!response.valid || response.value == null || certificate == null || receiverIdentification == null ||
+                    challenge == null
+                ) {""",
+    """                if (!response.valid ||
+                    response.value == null ||
+                    certificate == null ||
+                    receiverIdentification == null ||
+                    challenge == null
+                ) {""",
+)
+
 replace_once(
     "app/src/main/java/com/mcarplay/app/MainActivity.kt",
     """            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) !=
