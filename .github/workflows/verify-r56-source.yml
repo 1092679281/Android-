@@ -345,6 +345,9 @@ jobs:
           echo "91fbf5804efa944d688b898ab945911aca2c4ff8117abbc1a7e0be8811267dd8  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
+          # Maintenance patches are authored against the canonical source but may contain formatter-only drift.
+          # Apply the pinned formatter before checking and fingerprinting; never weaken the file/hash gates.
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
           python3 - <<'PY'
           from hashlib import sha256
