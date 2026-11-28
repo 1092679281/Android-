@@ -2,7 +2,7 @@ name: Reconstruct and validate R56 plus maintenance candidates
 
 on:
   push:
-    branches: [maintenance/r56-source-of-truth]
+    branches: [maintenance/r56-source-of-truth, fix/r58.5-bluetooth-review]
     paths:
       - "r56-build/**"
       - ".github/workflows/verify-r56-source.yml"
@@ -365,8 +365,15 @@ jobs:
           echo "5f4a18f4a74389378e43b9c6bf6b139524c8b48ef2d899e05bd5299e2ebb907b  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5-bluetooth-session-cleanup.patch.bz2"
+          echo "d5b54e980ff5229eb1abc0e03efd4b27565d8dac646db02daa5eb3dd6bb2c3a5  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5-bluetooth-session-cleanup.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "bcf6a9d4f821fd5627497cf8baf3444eef121a1cd7a72d3fd70154c785b2daab  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
-          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-bluetooth-handshake-source.zip" . \
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-bluetooth-review-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**'
 
       - name: Install pinned Gradle dependency checksums
@@ -423,6 +430,16 @@ jobs:
           }
           verify_apk "${standard[0]}" com.mcarplay.app StandardDebug
           verify_apk "${remote[0]}" com.mcarplay.app.rd RemoteDebug
+
+      - name: Upload side-by-side Bluetooth test APK
+        if: github.ref == 'refs/heads/fix/r58.5-bluetooth-review'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcarplay-r58.5-bluetooth-review-test-apk
+          path: |
+            ${{ runner.temp }}/r44-baseline/app/build/outputs/apk/remote/debug/*.apk
+            ${{ runner.temp }}/r58-apk-verification.txt
+          if-no-files-found: error
 
       - name: Build both optimized Release variants and verify R8 outputs
         id: r8
@@ -496,7 +513,7 @@ jobs:
             ${{ runner.temp }}/mcarplay-R58.3-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.4-0.1.45-candidate-source.zip
             ${{ runner.temp }}/mcarplay-R58.5-0.1.45-candidate-source.zip
-            ${{ runner.temp }}/mcarplay-R58.5-bluetooth-handshake-source.zip
+            ${{ runner.temp }}/mcarplay-R58.5-bluetooth-review-source.zip
             ${{ runner.temp }}/r58-apk-verification.txt
             ${{ runner.temp }}/Android-17-*.txt
             ${{ runner.temp }}/Android-17-emulator.log
