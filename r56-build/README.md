@@ -48,6 +48,21 @@ R58.5.1 不伪造 MFi 成功，也不实现未经授权的密码学验证。它�
 
 该补丁不会解除当前 MFi 认证阻塞；在获得授权验证器和真车证据前，仍不得将候选标记为已完成 CarPlay 真车验收。
 
+## Android APK 签名长期规则
+
+签名权威记录位于 [docs/ANDROID_SIGNING.md](../docs/ANDROID_SIGNING.md)。每次新聊天窗口、
+CI 修改或 APK 发布前，都必须先读取该文件。正式包统一使用固定签名的 StandardRelease；
+Debug APK 仅用于开发和测试，不得作为长期 OTA 包。
+
+已知用户旧 R58.5 Standard Debug APK 的证书 SHA-256 为
+`24abcd283ba26f3d92c7d1d2d683ac02abc4791c52dc10f55e4f3217e46a6176`，
+其原始 debug.keystore 未保存。新 Release 签名不能直接覆盖该旧 Debug 安装；
+第一次切换需要单独制定一次性迁移/重装方案。不要承诺无缝覆盖，也不要在未备份和
+用户确认前要求卸载。之后所有 StandardRelease 必须始终使用同一正式 keystore。
+
+GitHub Actions Secrets 的实际值无法从仓库源码读取。不要因为看不到 Secret 值就重新生成密钥；
+先由仓库所有者在 Settings → Secrets and variables → Actions 中核对已有配置。
+
 ## R58.5 标准版在线更新
 
 应用首页的「检查更新」读取本仓库的 GitHub Releases。发布流程使用维护分支重建并通过 CI 的源码，
