@@ -404,10 +404,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2"
-          echo "d725dc4a9f4cfc2cf25bb2ca1744cafca9dee314353c468633cddc9483a7b737  $archive" | sha256sum --check
+          echo "3b278079205a88525fe6852c546bcaa931ae525ac765f3bf184845192b299fb9  $archive" | sha256sum --check
           patch="$RUNNER_TEMP/R58.5.2-logbot-mfi-diagnostic-advice.patch"
           bzip2 -dc "$archive" > "$patch"
-          echo "3719068a8fa27ef2b8d01712fdf996c598dd54117a812afd108c2f03a0c53852  $patch" | sha256sum --check
+          echo "f7d54a9409f66156514c143f10a0b16666250d7076b22280d13fcb3a80244ebe  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
           PYTHONPATH=tools python3 -m unittest tools.logbot.test_diagnose -v
@@ -422,7 +422,7 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.2 candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 838 or actual != "bd865a2a7247829f3da64ba86b6ed15785c65943c5dcb3b8d5e6dd34f4594fdc":
+          if len(files) != 838 or actual != "84c953fa8c72caded48f42f9437380484adfe0210f355254dda7e93fe8e775d8":
               raise SystemExit("R58.5.2 candidate fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \

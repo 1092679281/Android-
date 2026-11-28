@@ -178,10 +178,10 @@ Patch: `r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2`
 
 Patch: `r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2`
 
-- Compressed patch SHA-256: `d725dc4a9f4cfc2cf25bb2ca1744cafca9dee314353c468633cddc9483a7b737`.
-- Uncompressed patch SHA-256: `3719068a8fa27ef2b8d01712fdf996c598dd54117a812afd108c2f03a0c53852`.
+- Compressed patch SHA-256: `3b278079205a88525fe6852c546bcaa931ae525ac765f3bf184845192b299fb9`.
+- Uncompressed patch SHA-256: `f7d54a9409f66156514c143f10a0b16666250d7076b22280d13fcb3a80244ebe`.
 - Adds explicit Chinese diagnosis and remediation guidance for `MFI_AUTH_UNAVAILABLE` and `MFI_AUTH_FAILED` to `tools/logbot/rules.py`, preserving the fail-closed policy and explicitly forbidding authentication bypass.
 - Updates the diagnostic code reference table and adds Python regression tests asserting both MFi failure codes return terminal, non-bypass guidance.
 - Local Python logbot suite: 16/16 tests passed.
-- Candidate source fingerprint: 838 files, `bd865a2a7247829f3da64ba86b6ed15785c65943c5dcb3b8d5e6dd34f4594fdc`.
-- R58.5.2 GitHub Actions Android test, lint, Debug/Release APK, R8, and Android 17 smoke-test verification: pending.
+- Candidate source fingerprint: 838 files, `84c953fa8c72caded48f42f9437380484adfe0210f355254dda7e93fe8e775d8`.
+- The first R58.5.2 CI attempt `46116628534` stopped before Android tests because the compressed patch archive checksum did not match the stored file. The patch archive and both blocking checksums were regenerated from the exact R58.5.1 formatted source; the next CI run must pass patch checksum, `git apply --check`, the 16-test logbot suite, and the 838-file candidate fingerprint before Android gates can start.
