@@ -74,7 +74,7 @@ jobs:
                       b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
                       b"if (!isDisconnecting() && !connectCancelled &&",
                   )
-              digest.update(relative.encode() + b"\\0" + sha256(content).digest() + b"\\n")
+              digest.update(relative.encode() + b"\0" + sha256(content).digest() + b"\n")
           actual = digest.hexdigest()
           print(f"Verified OTA source: files={len(files)} tree_sha256={actual}")
           if len(files) != 845 or actual != "5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d":
