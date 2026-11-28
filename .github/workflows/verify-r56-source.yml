@@ -500,11 +500,12 @@ jobs:
           echo "339a10fc92765f8b0660dce82355ba378b9f3bd0f83097b205c4c832b433af56  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
-          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
-          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
-          # Keep a diagnostic snapshot even when the strict fingerprint gate rejects the candidate.
+          # Force formatter tasks to rerun after the patch; Gradle's up-to-date cache can otherwise leave stale layout.
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply --rerun-tasks
+          # Preserve the post-format source even if the subsequent strict formatter check fails.
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5.4-diagnostic-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck --rerun-tasks
           python3 - <<'PY'
           from pathlib import Path
           from hashlib import sha256
