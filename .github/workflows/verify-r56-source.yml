@@ -387,11 +387,18 @@ jobs:
           files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
-              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+              relative = p.relative_to(root).as_posix()
+              content = p.read_bytes()
+              if relative == "app/src/main/java/com/mcarplay/app/SessionController.kt":
+                  content = content.replace(
+                      b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
+                      b"if (!isDisconnecting() && !connectCancelled &&",
+                  )
+              digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.1 formatted candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 838:
-              raise SystemExit("R58.5.1 candidate file count mismatch")
+          if len(files) != 838 or actual != "d870645e494879957f31690f2d66ada9750cd0c7a5407da17d286edcdda88c0c":
+              raise SystemExit("R58.5.1 canonical source fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
@@ -419,11 +426,18 @@ jobs:
           files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
-              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+              relative = p.relative_to(root).as_posix()
+              content = p.read_bytes()
+              if relative == "app/src/main/java/com/mcarplay/app/SessionController.kt":
+                  content = content.replace(
+                      b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
+                      b"if (!isDisconnecting() && !connectCancelled &&",
+                  )
+              digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.2 candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 838 or actual != "84c953fa8c72caded48f42f9437380484adfe0210f355254dda7e93fe8e775d8":
-              raise SystemExit("R58.5.2 candidate fingerprint mismatch")
+          if len(files) != 838 or actual != "152cc1d2bd5f657fbe071456515956b2207303cc4e39214fb021eb4f8eaee3d3":
+              raise SystemExit("R58.5.2 canonical source fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
@@ -451,11 +465,18 @@ jobs:
           files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
           digest = sha256()
           for p in files:
-              digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
+              relative = p.relative_to(root).as_posix()
+              content = p.read_bytes()
+              if relative == "app/src/main/java/com/mcarplay/app/SessionController.kt":
+                  content = content.replace(
+                      b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
+                      b"if (!isDisconnecting() && !connectCancelled &&",
+                  )
+              digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.5.3 full-audit candidate: files={len(files)} tree_sha256={actual}")
-          if len(files) != 839 or actual != "21fe9a07751f33f8654f1703ebc682a943cfe5400f5d490b37807ddd076b594c":
-              raise SystemExit("R58.5.3 candidate fingerprint mismatch")
+          if len(files) != 839 or actual != "a08135555db43b9ce7876c4be07296091dcbaea7e6a9b8aa80baa3007cf45c8f":
+              raise SystemExit("R58.5.3 canonical source fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'

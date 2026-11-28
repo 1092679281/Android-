@@ -183,7 +183,7 @@ Patch: `r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2`
 - Adds explicit Chinese diagnosis and remediation guidance for `MFI_AUTH_UNAVAILABLE` and `MFI_AUTH_FAILED` to `tools/logbot/rules.py`, preserving the fail-closed policy and explicitly forbidding authentication bypass.
 - Updates the diagnostic code reference table and adds Python regression tests asserting both MFi failure codes return terminal, non-bypass guidance.
 - Local Python logbot suite: 16/16 tests passed.
-- Candidate source fingerprint: 838 files, `84c953fa8c72caded48f42f9437380484adfe0210f355254dda7e93fe8e775d8`.
+- Canonical source fingerprint: 838 files, `152cc1d2bd5f657fbe071456515956b2207303cc4e39214fb021eb4f8eaee3d3`. Raw formatter variants differ only in one line wrap in `SessionController.kt`; CI normalizes that exact whitespace-only variation before hashing.
 - The first R58.5.2 CI attempt `46116628534` stopped before Android tests because the compressed patch archive checksum did not match the stored file. The patch archive and both blocking checksums were regenerated from the exact R58.5.1 formatted source; the next CI run must pass patch checksum, `git apply --check`, the 16-test logbot suite, and the 838-file candidate fingerprint before Android gates can start.
 
 
@@ -197,5 +197,12 @@ Patch: `r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2`
 - Fixes the `TimingServer.start()/stop()` socket ownership race; adds concurrent-start, start-vs-stop, real UDP timesync and restart regression tests.
 - Corrects the stale `AirPlayClient` timing-server lifecycle comment.
 - Local Kotlin compile and live UDP/concurrency smoke test passed. Local logbot suite: 16/16 passed.
-- Candidate fingerprint: 839 files, `21fe9a07751f33f8654f1703ebc682a943cfe5400f5d490b37807ddd076b594c`.
+- Canonical source fingerprint: 839 files, `a08135555db43b9ce7876c4be07296091dcbaea7e6a9b8aa80baa3007cf45c8f`. CI normalizes only the known Spotless line-wrap variation in `SessionController.kt`; all other source bytes remain covered by the fingerprint.
 - GitHub Spotless, Standard/Remote Android tests, lint, Debug/Release/R8 and Android 17 smoke verification: pending.
+
+
+## CI formatter fingerprint determinism correction (2026-11-28)
+
+- Repeated CI runs showed two Spotless-accepted layouts for one boolean condition in `SessionController.kt`: a line break before `!connectCancelled` or the same expression on one line. No executable token or behavior changes.
+- R58.5.1/R58.5.2/R58.5.3 fingerprint gates now normalize only that exact whitespace-only line-wrap before hashing. The expected canonical hashes remain strict for every other file and byte.
+- This avoids a false source-integrity failure without weakening patch SHA-256 checks, source file counts, `spotlessCheck`, or Android test/build gates.
