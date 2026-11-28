@@ -191,13 +191,13 @@ Patch: `r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2`
 
 Patch: `r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2`
 
-- Compressed patch SHA-256: `173773b6970ec5a67028cb31af98879a7c627a9b9e42f95b99c2bbd4854cd64a`.
-- Uncompressed patch SHA-256: `54b85f7551c588ba0282b5c394a3a28bca5b7c19c660c3bc6c2915b75147c46b`.
+- Compressed patch SHA-256: `8204b22c744e518e87c223bf01fae9647901e297d84fecc5bca65859df4cbefc`.
+- Uncompressed patch SHA-256: `1bc45cf4cd273f6dabf2c40f31c5cda52d5644486b0fadaf0e85e9333dc9b711`.
 - Adds `docs/MAINTENANCE-AUDIT-2026-11-28.md` with measured whole-source risks and evidence. It separates confirmed defects from static-risk candidates.
-- Fixes the `TimingServer.start()/stop()` socket ownership race; adds concurrent-start, start-vs-stop, real UDP timesync and restart regression tests.
+- Fixes the `TimingServer.start()/stop()` socket ownership race; adds concurrent-start, start-vs-stop, real UDP timesync and restart regression tests. Also fixes target-row layout-param inflation, gates LE Audio to Android 13+, removes duplicate snackbar lookup and a dead API branch, localizes the display-scale percentage, and uses AppCompat drawable loading.
 - Corrects the stale `AirPlayClient` timing-server lifecycle comment.
-- Local Kotlin compile and live UDP/concurrency smoke test passed. Local logbot suite: 16/16 passed.
-- Canonical source fingerprint: 839 files, `a08135555db43b9ce7876c4be07296091dcbaea7e6a9b8aa80baa3007cf45c8f`. CI normalizes only the known Spotless line-wrap variation in `SessionController.kt`; all other source bytes remain covered by the fingerprint.
+- Local Kotlin compile and live UDP/concurrency smoke tests passed; fatal-error policy smoke test passed; local logbot suite: 16/16 passed. `Bg.run()` now catches ordinary exceptions only; process-level handling delegates fatal `Error` types to Android's original handler, covered by a new unit test.
+- Canonical source fingerprint: 841 files, `507c12cf200d8ffd4785e5afdb065d9f3cf44d383f7a70994358de7c272407e6`. CI normalizes only the known Spotless line-wrap variation in `SessionController.kt`; all other source bytes remain covered by the fingerprint.
 - GitHub Spotless, Standard/Remote Android tests, lint, Debug/Release/R8 and Android 17 smoke verification: pending.
 
 
