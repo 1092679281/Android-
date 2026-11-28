@@ -41,3 +41,40 @@ The R44 Actions artifact expires on 2026-12-25. The validation workflow archives
 - R56 is a source candidate only. Do not tag it as a stable release before complete Android CI and E2LB vehicle acceptance.
 - Do not commit signing keys, keystore passwords, `local.properties`, APKs, raw diagnostic logs, or personal data.
 - MFi cryptographic verification, E2LB 0x4300 acknowledgement, 0x4301/Wi-Fi handoff and AirPlay vehicle acceptance remain unresolved or unverified.
+
+## R58.5.1 MFi 失败收敛
+
+R58.5.1 不伪造 MFi 成功，也不实现未经授权的密码学验证。它将缺少信任材料和明确密码学拒绝标记为终止性认证阻塞，停止同一车机的自动重连，并在 Bluetooth 与 AirPlay 虚拟 iAP2 两条路径上统一上报失败。只有接入获授权的验证器/信任材料后，手动重试才有意义。
+
+该补丁不会解除当前 MFi 认证阻塞；在获得授权验证器和真车证据前，仍不得将候选标记为已完成 CarPlay 真车验收。
+
+## Android APK 签名长期规则
+
+签名权威记录位于 [docs/ANDROID_SIGNING.md](../docs/ANDROID_SIGNING.md)。每次新聊天窗口、
+CI 修改或 APK 发布前，都必须先读取该文件。正式包统一使用固定签名的 StandardRelease；
+Debug APK 仅用于开发和测试，不得作为长期 OTA 包。
+
+已知用户旧 R58.5 Standard Debug APK 的证书 SHA-256 为
+`24abcd283ba26f3d92c7d1d2d683ac02abc4791c52dc10f55e4f3217e46a6176`，
+其原始 debug.keystore 未保存。新 Release 签名不能直接覆盖该旧 Debug 安装；
+第一次切换需要单独制定一次性迁移/重装方案。不要承诺无缝覆盖，也不要在未备份和
+用户确认前要求卸载。之后所有 StandardRelease 必须始终使用同一正式 keystore。
+
+GitHub Actions Secrets 的实际值无法从仓库源码读取。不要因为看不到 Secret 值就重新生成密钥；
+先由仓库所有者在 Settings → Secrets and variables → Actions 中核对已有配置。
+
+## R58.5 标准版在线更新
+
+应用首页的「检查更新」读取本仓库的 GitHub Releases。发布流程使用维护分支重建并通过 CI 的源码，
+按发行标签写入 APK 版本，使用固定证书签名，再生成标准 APK 与 `SHA256SUMS.txt`。
+`remote` 是另一包名，继续通过自己的诊断产物分发。
+
+- 在 GitHub Actions 配置已有的 `RELEASE_KEYSTORE_B64`、`RELEASE_STORE_PASSWORD`、
+  `RELEASE_KEY_ALIAS`、`RELEASE_KEY_PASSWORD`，并将签名证书公开指纹配置为变量
+  `OTA_SIGNER_SHA256`。已有正式安装应继续使用其原签名密钥。可以从原 APK 的
+  `apksigner verify --print-certs` 输出读取证书 SHA-256。密钥和密码应存放在仓库 Secrets。
+- 在已审查的维护提交上推送递增标签，例如 `v0.1.46-test.1`。工作流通过证书、
+  版本和 SHA-256 检查后创建本仓库的 Release 草稿；审核说明和验证范围后再公开。
+  应用只会发现已公开、有匹配 APK 的发行项。签名不匹配、版本退回和重复标签都会阻止发布。
+- PR 演练使用单次测试密钥签发两个版本，在 Android 17 模拟器覆盖安装，检查版本、
+  安装记录和已有通知授权。测试证书只用于该次演练。

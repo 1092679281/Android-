@@ -127,3 +127,94 @@ The three failures have the same sequence:
 ## Important interaction with MFi gate
 
 The historical R44 trace shows an unverified 0xAA03 response followed by a compatibility 0xAA05. R58 intentionally removed that unsafe behavior. In R58.2/R58.3 production construction, both Bluetooth Iap2SenderSession and AirPlay VirtualIap2Link still use MfiAuthenticationVerifier.UNAVAILABLE. Consequently the current candidate correctly aborts before sending 0xAA05 and will not reach 0x4300 on a real vehicle until an authorized MFi verifier and trust/profile material are integrated. Do not use test doubles or an authentication bypass to test around this blocker.
+
+## R58.5 maintenance candidate
+
+R58.5 applies after the formatted R58.4 source from commit
+`2a24ebcd2d1b39f650aca767b7b7edbf4301a469`.
+The R58.4 CI source has 834 files and tree SHA-256
+`506c6b7ca9fd2f668730b88782245df9f1cf249903d380e76aa41da4c3d5a4dd`.
+Replaying the R58.5 patch on that source produced 837 files and tree SHA-256
+`ee63699431fde032169ee3bc33cdf6aa6dfa16c0bc7097766c0fbb3e26dc5173`.
+
+- Network discovery releases its multicast lock after resolution, stop or failure. Network loss stops the old discovery and releases the
+  video sender's streaming Wi-Fi lock. The streaming lock follows actual video output and is released on suspension or teardown.
+- Audio sockets, recorder and codec have an idempotent shutdown path. A stopped negotiated stream cannot restart with the same key and
+  counter. Projection revocation stops only its matching audio capture.
+- Shizuku touch gestures are serialized and can send CANCEL on failure, replacement or display teardown. The new Binder transaction is appended.
+- Projection grants are passed directly to the foreground service. Service teardown clears and stops the owned projection.
+- The AirPlay controller's Ed25519 seed migrates to Android Keystore-backed AES-GCM storage while preserving the pairing ID. SRP server
+  proofs use a timing-resistant comparison.
+- The session's serial RTSP control worker bounds its pending queue and times out when idle. Decoder rate hints use a supported nominal
+  frame rate with a fallback to the base configuration.
+- CI builds both R8 Release variants as a separate verification gate and checks the Shizuku service name in the mapping. The application
+  keeps R8 opt-in pending device verification. The build rejects dynamic or changing Release runtime versions when this gate is enabled.
+  Linux CI pins and checks SHA-256 for 685 artifacts and metadata files across 388 resolved Gradle components.
+  The checked-in manifest covers Debug tests and lint, APK packaging, and the optimized Release builds.
+
+A local JVM run passed 46 focused audio and AirPlay tests, including the identity envelope and retired audio stream regressions.
+Android Keystore migration on an actual device, Android 17 runtime behavior, real-vehicle 0x4300 ACK and renewed SYN timing, mDNS
+reliability, and decoder behavior still require device or vehicle evidence. The production MFi trust material and verifier are still
+required before this candidate can reach the authenticated 0x4300 exchange on the vehicle.
+
+
+## R58.5.1 terminal MFi failure handling (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2`
+
+- Compressed patch SHA-256: `8a74bbcc23918d82a216d3dfacb4b597663f50b12a345304c0e892db82dc0f1a`.
+- Uncompressed patch SHA-256: `69abb67dc45b6808bc5639f3b6fc8f527e8784465e99805f344044c78e9e0e34`.
+- Candidate adds one Kotlin test file and updates sender-session and auto-reconnect tests (838 files before formatter normalization).
+- Bluetooth startup now classifies `RESPONSE_UNVERIFIED` and `CRYPTOGRAPHICALLY_REJECTED` as terminal MFi blockers, reports a dedicated diagnostic, and stops automatic Bluetooth reconnect for that receiver. Manual connection remains available after the missing authorized verifier is supplied.
+- The AirPlay virtual iAP2 path now forwards malformed, rejected, timed-out, and unverifiable MFi outcomes to the owning session. The owner tears down the failed attempt instead of silently waiting for a never-authenticated tunnel.
+- Regression tests cover stable blocker classification and the virtual-link callback. Both paths remain fail-closed: no unverified `0xAA05`, no authenticated milestone, and no MIB3 burst.
+- This patch does **not** implement the production MFi verifier. `Iap2SenderSession` and `VirtualIap2Link` still use `MfiAuthenticationVerifier.UNAVAILABLE` until the project receives authorized MFi trust anchors/certificate profile, licensed signature and canonicalization specification, and known-good/known-bad vectors. Do not add guessed roots, bypasses, or private keys.
+- CI determinism finding: the pinned Gradle verification metadata was previously installed only after the Spotless/KtLint formatting steps. That allowed an unpinned formatter dependency to change a single Kotlin line between runs and invalidate the R58.4/R58.5 tree fingerprint. The workflow now installs the pinned metadata before the first formatter invocation and excludes that build-only file from candidate fingerprints and source archives.
+- R58.5.1 CI run `46115158849` completed. R56–R58.5.1 reconstruction, patch application, source fingerprints, Debug APK packaging, optimized Release builds, R8 mapping checks, Android 17 install/launch smoke tests, and artifact upload succeeded. The aggregate test gate failed because `LogContractTest.codeAdviceCoversEveryDiagnosticCode` found that `tools/logbot/rules.py` omitted `MFI_AUTH_UNAVAILABLE` and `MFI_AUTH_FAILED`; the standard and remote variants each reported this same single assertion failure. R58.5.2 below adds the missing fail-closed advice and regression coverage.
+- 0x4300/0x4301, Wi-Fi, AirPlay SETUP/RECORD, and video/audio/touch still require the authorized MFi gate to be cleared before the complete chain can be exercised on the E2LB vehicle. Existing synthetic tests are not real-vehicle acceptance.
+
+
+## R58.5.2 MFi diagnostic advice coverage (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.2-logbot-mfi-diagnostic-advice.patch.bz2`
+
+- Compressed patch SHA-256: `3b278079205a88525fe6852c546bcaa931ae525ac765f3bf184845192b299fb9`.
+- Uncompressed patch SHA-256: `f7d54a9409f66156514c143f10a0b16666250d7076b22280d13fcb3a80244ebe`.
+- Adds explicit Chinese diagnosis and remediation guidance for `MFI_AUTH_UNAVAILABLE` and `MFI_AUTH_FAILED` to `tools/logbot/rules.py`, preserving the fail-closed policy and explicitly forbidding authentication bypass.
+- Updates the diagnostic code reference table and adds Python regression tests asserting both MFi failure codes return terminal, non-bypass guidance.
+- Local Python logbot suite: 16/16 tests passed.
+- Canonical source fingerprint: 838 files, `152cc1d2bd5f657fbe071456515956b2207303cc4e39214fb021eb4f8eaee3d3`. Raw formatter variants differ only in one line wrap in `SessionController.kt`; CI normalizes that exact whitespace-only variation before hashing.
+- The first R58.5.2 CI attempt `46116628534` stopped before Android tests because the compressed patch archive checksum did not match the stored file. The patch archive and both blocking checksums were regenerated from the exact R58.5.1 formatted source; the next CI run must pass patch checksum, `git apply --check`, the 16-test logbot suite, and the 838-file candidate fingerprint before Android gates can start.
+
+
+## R58.5.3 full maintenance audit and TimingServer lifecycle fix (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.3-full-maintenance-audit.patch.bz2`
+
+- Compressed patch SHA-256: `708b2c31d7edcd77a92fe95f7f9a19a16ff187631611b64faa568e79f9d4582d`.
+- Uncompressed patch SHA-256: `8021209128e9e4d167951f9e401f9aa29e69a69b6471df20f607ad94efa9110c`.
+- Adds `docs/MAINTENANCE-AUDIT-2026-11-28.md` with measured whole-source risks and evidence. It separates confirmed defects from static-risk candidates.
+- Fixes the `TimingServer.start()/stop()` socket ownership race; adds concurrent-start, start-vs-stop, real UDP timesync and restart regression tests. Also fixes target-row layout-param inflation, gates LE Audio to Android 13+, removes duplicate snackbar lookup and a dead API branch, localizes the display-scale percentage, and uses AppCompat drawable loading. Fixes the ReceiverDetectionRuntime check-then-set race: epoch changes and monotonic observation claims are serialized, rejected downstream attaches no longer become owners, and collecting requires exact observation equality.
+- Corrects the stale `AirPlayClient` timing-server lifecycle comment.
+- Local Kotlin compile and live UDP/concurrency smoke tests passed; fatal-error policy and receiver-observation ownership smoke tests passed; local logbot suite: 16/16 passed. `Bg.run()` now catches ordinary exceptions only; process-level handling delegates fatal `Error` types to Android's original handler, covered by a new unit test.
+- Canonical source fingerprint after pinned Spotless formatting: 843 files, `17e35cfc2b2f8f0315b368bb9f66bee5c710d1f7589fb5f06e27ff4bafabba31`. The R58.5.3 patch is formatted with `spotlessApply` before `spotlessCheck` and fingerprinting; the earlier `d549...` value described the pre-format patch. Strict compressed/uncompressed patch SHA-256 checks and the canonical whole-source fingerprint remain enabled.
+- GitHub Spotless, Standard/Remote Android tests, lint, Debug/Release/R8 and Android 17 smoke verification: pending.
+
+
+## CI formatter fingerprint determinism correction (2026-11-28)
+
+- Repeated CI runs showed two Spotless-accepted layouts for one boolean condition in `SessionController.kt`: a line break before `!connectCancelled` or the same expression on one line. No executable token or behavior changes.
+- R58.5.1/R58.5.2/R58.5.3 fingerprint gates now normalize only that exact whitespace-only line-wrap before hashing. The expected canonical hashes remain strict for every other file and byte.
+- This avoids a false source-integrity failure without weakening patch SHA-256 checks, source file counts, `spotlessCheck`, or Android test/build gates.
+
+
+## R58.5.4 terminal MFi peer block and Bluetooth retry stop (2026-11-28)
+
+Patch: `r56-build/maintenance/R58.5.4-terminal-mfi-autoconnect-block.patch.bz2`
+
+- Compressed patch SHA-256: `e86ef9ddd7c07d1c786704dcd0c04c2094c569216ef58ffb8fd8a940ecbffa28`.
+- Uncompressed patch SHA-256: `339a10fc92765f8b0660dce82355ba378b9f3bd0f83097b205c4c832b433af56`.
+- Adds a terminal per-peer MFi authentication block so a known terminal authentication failure does not keep re-entering the Bluetooth automatic retry loop. It does not bypass MFi verification or manufacture authentication success.
+- Canonical source fingerprint after pinned Spotless formatting: 845 files, `5a7eaa91031ef446662d3ec7887df088854db84e6e0b7daf03a731a73f07436d`.
+- The R58.5.4 CI gate is ordered after R58.5.3 and the pinned dependency-checksum gate now depends on R58.5.4 success. A diagnostic source snapshot is retained if the strict fingerprint gate fails.
+- Current CI established the compressed/uncompressed patch checksums and apply-check. A rerun exposed a stale Gradle Spotless task result: `spotlessApply` reported success but the following `spotlessCheck` still saw the pre-format line layout in `SessionController.kt`. The R58.5.4 step now forces both formatter tasks to rerun and captures the post-format source before the check, so the discrepancy can be inspected without weakening the formatting or fingerprint gates. Android tests/build remain pending.

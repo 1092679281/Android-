@@ -69,3 +69,42 @@ replace_once(
                     thermal < 2 &&
                     (!renderRecent || lastRenderDurationNs < renderBudget * 3 / 4)""",
 )
+
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/airplay/VirtualIap2Link.kt",
+    """                if (!response.valid || response.value == null || certificate == null || receiverIdentification == null ||
+                    challenge == null
+                ) {""",
+    """                if (!response.valid ||
+                    response.value == null ||
+                    certificate == null ||
+                    receiverIdentification == null ||
+                    challenge == null
+                ) {""",
+)
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/MainActivity.kt",
+    """            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) !=
+                PackageManager.PERMISSION_GRANTED && !prefs.getBoolean("r12_wifi_ssid_permission_asked", false)
+            ) {""",
+    """            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) !=
+                PackageManager.PERMISSION_GRANTED &&
+                !prefs.getBoolean("r12_wifi_ssid_permission_asked", false)
+            ) {""",
+)
+
+replace_once(
+    "app/src/main/java/com/mcarplay/app/MainActivity.kt",
+    """                if (!isFinishing && !isDestroyed && hero.parent === contentArea && hero.isShown &&
+                    contentArea.height > 0 && hero.height >= contentArea.height
+                ) {""",
+    """                if (!isFinishing &&
+                    !isDestroyed &&
+                    hero.parent === contentArea &&
+                    hero.isShown &&
+                    contentArea.height > 0 &&
+                    hero.height >= contentArea.height
+                ) {""",
+)
