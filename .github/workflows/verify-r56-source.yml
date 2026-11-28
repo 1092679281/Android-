@@ -486,6 +486,46 @@ jobs:
           zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
 
+      - name: Apply R58.5.4 terminal MFi peer block and stop retry loop
+        id: r5854
+        if: ${{ steps.r5854.outcome == 'success' }}
+        working-directory: ${{ runner.temp }}/r44-baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.4-terminal-mfi-autoconnect-block.patch.bz2"
+          echo "e86ef9ddd7c07d1c786704dcd0c04c2094c569216ef58ffb8fd8a940ecbffa28  $archive" | sha256sum --check
+          patch="$RUNNER_TEMP/R58.5.4-terminal-mfi-autoconnect-block.patch"
+          bzip2 -dc "$archive" > "$patch"
+          echo "339a10fc92765f8b0660dce82355ba378b9f3bd0f83097b205c4c832b433af56  $patch" | sha256sum --check
+          git apply --check "$patch"
+          git apply "$patch"
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
+          ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessCheck
+          python3 - <<'PY'
+          from pathlib import Path
+          from hashlib import sha256
+          root = Path.cwd()
+          ignored = {".git", ".gradle", "build", "__pycache__"}
+          files = sorted(p for p in root.rglob("*") if p.is_file() and not ignored.intersection(p.relative_to(root).parts) and p.relative_to(root).as_posix() != "gradle/verification-metadata.xml")
+          digest = sha256()
+          for p in files:
+              relative = p.relative_to(root).as_posix()
+              content = p.read_bytes()
+              if relative == "app/src/main/java/com/mcarplay/app/SessionController.kt":
+                  content = content.replace(
+                      b"if (!isDisconnecting() &&\n                                        !connectCancelled &&",
+                      b"if (!isDisconnecting() && !connectCancelled &&",
+                  )
+              digest.update(relative.encode("utf-8") + bytes([0]) + sha256(content).digest() + bytes([10]))
+          actual = digest.hexdigest()
+          print(f"R58.5.4 candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 845 or actual != "0000000000000000000000000000000000000000000000000000000000000000":
+              raise SystemExit("R58.5.4 canonical source fingerprint mismatch")
+          PY
+          zip -qr "$RUNNER_TEMP/mcarplay-R58.5-0.1.45-candidate-source.zip" . \
+            -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
+
       - name: Verify pinned Gradle dependency checksums before Android build
         id: dependency_checksums
         if: ${{ steps.r5853.outcome == 'success' }}
