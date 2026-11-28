@@ -162,13 +162,13 @@ required before this candidate can reach the authenticated 0x4300 exchange on th
 
 Patch: `r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2`
 
-- Compressed patch SHA-256: `bde7d4d392d6b80814c040eb7f5f0bdc23b17b09ece4e0fb30227c683139710c`.
-- Uncompressed patch SHA-256: `975dbaeb648e394dc9b1699133b5da7a74eb810ec7ff1db6c212aae73a1f2862`.
-- Candidate adds one Kotlin test file and updates the existing sender-session tests (838 files before formatter normalization).
+- Compressed patch SHA-256: `8a74bbcc23918d82a216d3dfacb4b597663f50b12a345304c0e892db82dc0f1a`.
+- Uncompressed patch SHA-256: `69abb67dc45b6808bc5639f3b6fc8f527e8784465e99805f344044c78e9e0e34`.
+- Candidate adds one Kotlin test file and updates sender-session and auto-reconnect tests (838 files before formatter normalization).
 - Bluetooth startup now classifies `RESPONSE_UNVERIFIED` and `CRYPTOGRAPHICALLY_REJECTED` as terminal MFi blockers, reports a dedicated diagnostic, and stops automatic Bluetooth reconnect for that receiver. Manual connection remains available after the missing authorized verifier is supplied.
 - The AirPlay virtual iAP2 path now forwards malformed, rejected, timed-out, and unverifiable MFi outcomes to the owning session. The owner tears down the failed attempt instead of silently waiting for a never-authenticated tunnel.
 - Regression tests cover stable blocker classification and the virtual-link callback. Both paths remain fail-closed: no unverified `0xAA05`, no authenticated milestone, and no MIB3 burst.
 - This patch does **not** implement the production MFi verifier. `Iap2SenderSession` and `VirtualIap2Link` still use `MfiAuthenticationVerifier.UNAVAILABLE` until the project receives authorized MFi trust anchors/certificate profile, licensed signature and canonicalization specification, and known-good/known-bad vectors. Do not add guessed roots, bypasses, or private keys.
 - CI determinism finding: the pinned Gradle verification metadata was previously installed only after the Spotless/KtLint formatting steps. That allowed an unpinned formatter dependency to change a single Kotlin line between runs and invalidate the R58.4/R58.5 tree fingerprint. The workflow now installs the pinned metadata before the first formatter invocation and excludes that build-only file from candidate fingerprints and source archives.
-- R58.5.1 Android CI and formatter fingerprint: pending this commit's GitHub Actions run.
+- R58.5.1 Android CI and formatter fingerprint: pending this commit's GitHub Actions run. The R58.2/R58.3/R58.4 fingerprints are now blocking checks using the pinned formatter metadata.
 - 0x4300/0x4301, Wi-Fi, AirPlay SETUP/RECORD, and video/audio/touch still require the authorized MFi gate to be cleared before the complete chain can be exercised on the E2LB vehicle. Existing synthetic tests are not real-vehicle acceptance.

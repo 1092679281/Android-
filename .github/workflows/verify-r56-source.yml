@@ -259,7 +259,8 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.2 candidate: files={len(files)} tree_sha256={actual}")
-          print("R58.2 fingerprint recorded after forced, non-incremental Spotless run")
+          print("if len(files) != 832 or actual != "c857aed40a119e5821cd5566040191d5b91ef15c466b81bfd27ee2083991741f":
+    raise SystemExit("R58.2 candidate fingerprint mismatch")")
           PY
       - name: Apply R58.3 E2LB startup probe suppression
         id: r583
@@ -285,7 +286,8 @@ jobs:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
           actual = digest.hexdigest()
           print(f"R58.3 candidate: files={len(files)} tree_sha256={actual}")
-          print("R58.3 fingerprint recorded; pin after clean formatter run")
+          print("if len(files) != 832 or actual != "970e295435c6d02da87a79389c5c8d7e904541ca93badbd6d1cb5c69078b4479":
+    raise SystemExit("R58.3 candidate fingerprint mismatch")")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.3-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
@@ -321,7 +323,10 @@ jobs:
           digest = sha256()
           for p in files:
               digest.update(p.relative_to(root).as_posix().encode("utf-8") + bytes([0]) + sha256(p.read_bytes()).digest() + bytes([10]))
-          print(f"R58.4 formatted candidate: files={len(files)} tree_sha256={digest.hexdigest()}")
+          actual = digest.hexdigest()
+          print(f"R58.4 formatted candidate: files={len(files)} tree_sha256={actual}")
+          if len(files) != 834 or actual != "506c6b7ca9fd2f668730b88782245df9f1cf249903d380e76aa41da4c3d5a4dd":
+              raise SystemExit("R58.4 candidate fingerprint mismatch")
           PY
           zip -qr "$RUNNER_TEMP/mcarplay-R58.4-0.1.45-candidate-source.zip" . \
             -x '.git/**' '.gradle/**' 'build/**' '*/build/**' 'local.properties' '*/__pycache__/**' 'gradle/verification-metadata.xml'
@@ -366,10 +371,10 @@ jobs:
         run: |
           set -euo pipefail
           archive="$GITHUB_WORKSPACE/kit/r56-build/maintenance/R58.5.1-mfi-auth-failure-stop.patch.bz2"
-          echo "bde7d4d392d6b80814c040eb7f5f0bdc23b17b09ece4e0fb30227c683139710c  $archive" | sha256sum --check
+          echo "8a74bbcc23918d82a216d3dfacb4b597663f50b12a345304c0e892db82dc0f1a  $archive" | sha256sum --check
           patch="$RUNNER_TEMP/R58.5.1-mfi-auth-failure-stop.patch"
           bzip2 -dc "$archive" > "$patch"
-          echo "975dbaeb648e394dc9b1699133b5da7a74eb810ec7ff1db6c212aae73a1f2862  $patch" | sha256sum --check
+          echo "69abb67dc45b6808bc5639f3b6fc8f527e8784465e99805f344044c78e9e0e34  $patch" | sha256sum --check
           git apply --check "$patch"
           git apply "$patch"
           ./gradlew -Pmcarplay.releaseTag= --no-daemon --console=plain spotlessApply
