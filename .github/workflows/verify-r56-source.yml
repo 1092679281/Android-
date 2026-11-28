@@ -444,7 +444,7 @@ jobs:
 
       - name: Apply R58.5.3 full maintenance audit and TimingServer lifecycle fix
         id: r5853
-        if: ${{ steps.r5853.outcome == 'success' }}
+        if: ${{ steps.r5852.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
@@ -483,7 +483,7 @@ jobs:
 
       - name: Verify pinned Gradle dependency checksums before Android build
         id: dependency_checksums
-        if: ${{ steps.r5852.outcome == 'success' }}
+        if: ${{ steps.r5853.outcome == 'success' }}
         working-directory: ${{ runner.temp }}/r44-baseline
         shell: bash
         run: |
